@@ -11,12 +11,13 @@ fallbacks.
 
 ## Status
 
-This repository contains project conventions, the domain glossary, and accepted
-architecture decisions. The Rust CLI, service, bootstrap, skill package, and
-panel integrations are not implemented yet. No installable binary or skill
-package is available from this repository.
+The first Rust slice provides `wgates serve`, `wgates status`, and version
+inspection through a local Unix socket. It reports control-service readiness.
+See [service operation and the local API](docs/service.md).
 
-The user-facing command will be `wgates`.
+VPN routing, connection management, bootstrap, the skill package, and panel
+integrations remain planned. There is no published binary release or skill
+package yet.
 
 ## Planned routing model
 
@@ -52,8 +53,8 @@ Xray restarts is not guaranteed.
 
 ## Planned operation and installation
 
-The Rust binary will provide a CLI and local systemd service connected through
-a Unix socket. Configuration changes require a preview and an explicit apply.
+The Rust binary provides a CLI and local systemd service connected through
+a Unix socket. Future routing changes require a preview and an explicit apply.
 
 Bootstrap will install Want Gates beside an existing compatible 3x-ui, starting
 with MHSanaei/3x-ui 3.8.5. It will preserve unrelated panel settings and check
@@ -82,6 +83,7 @@ been published yet, and it will not replace installation of the server binary.
 ## Project documentation
 
 - [Glossary](GLOSSARY.md)
+- [Control service and local API](docs/service.md)
 - [Architecture decisions](docs/adr/)
 - [Project conventions](AGENTS.md)
 - [Issue tracker](docs/agents/issue-tracker.md)

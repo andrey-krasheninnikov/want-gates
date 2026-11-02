@@ -1,6 +1,6 @@
 # ADR 0001: Rust CLI and local control service
 
-Status: accepted design; implementation is planned.
+Status: accepted; the local readiness service is implemented. VPN management remains planned.
 
 ## Context
 
@@ -37,5 +37,6 @@ The service is the common boundary for management operations. Its local socket
 and secret storage require access controls. Systemd installation, restart
 behavior, and dependency detection need disposable Linux tests.
 
-The current repository contains planning documentation. No binary, installer,
-service, or release is provided by this decision.
+The current binary provides local readiness and version inspection with an empty
+state directory. Connection management, routing, bootstrap, and integrations
+remain planned. No binary release has been published.

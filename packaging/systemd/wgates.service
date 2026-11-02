@@ -1,0 +1,25 @@
+[Unit]
+Description=Want Gates control service
+
+[Service]
+Type=simple
+User=wgates
+Group=wgates
+ExecStart=/usr/local/bin/wgates serve --socket /run/wgates/control.sock --state-dir /var/lib/wgates
+RuntimeDirectory=wgates
+RuntimeDirectoryMode=0750
+StateDirectory=wgates
+StateDirectoryMode=0700
+UMask=0007
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=5s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

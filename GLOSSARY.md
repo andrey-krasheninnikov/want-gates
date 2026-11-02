@@ -1,6 +1,7 @@
 # Want Gates glossary
 
-These terms describe the agreed design. Runtime support is not implemented yet.
+These terms describe the agreed design. The local control service is implemented;
+VPN routing remains planned.
 
 | Term | Meaning |
 | --- | --- |
@@ -26,5 +27,6 @@ These terms describe the agreed design. Runtime support is not implemented yet.
 | Managed settings | The 3x-ui objects owned by Want Gates. Unrelated panel settings remain under the operator's control. |
 | Bootstrap | Installation of Want Gates and required dependencies beside an existing compatible 3x-ui deployment. It does not install 3x-ui on a clean VPS. |
 | wgates | The user-facing CLI command and the command used by service, SSH, skill, and terminal integrations. |
+| Control-service readiness | Confirmation that the local service initialized its state directory and control socket. It does not establish VPN, DNS, or panel health. |
 | Want Gates skill | A portable instruction package distributed through the existing skills CLI and used locally to call wgates on a chosen VPS over SSH. |
 | Warp Terminal integration | Workflows, a Tab Config, and MCP tools for operating Want Gates from Warp Terminal. |
