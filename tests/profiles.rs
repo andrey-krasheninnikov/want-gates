@@ -670,3 +670,25 @@ fn input_size_limits_and_duplicate_names_fail_without_partial_state() {
     );
     assert_eq!(saved_profiles(&service), vec![input]);
 }
+
+#[test]
+fn a_valid_profile_at_the_source_limit_fits_the_import_frame() {
+    let service = Service::start();
+    let group = ok(&service, &["group", "create", "--name", "Boundary"]);
+    let mut source = r#"{"protocol":"vless","settings":{"address":"127.0.0.1","port":443,"id":"example","encryption":"none"}}"#.to_owned();
+    source.extend(std::iter::repeat_n('\n', 1024 * 1024 - source.len()));
+    assert_eq!(source.len(), 1024 * 1024);
+    let output = import_text(&service, group["id"].as_str().unwrap(), "Boundary", &source);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        ok(&service, &["connection", "list"])
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}

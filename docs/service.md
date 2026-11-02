@@ -139,8 +139,10 @@ are rejected. Socket access permits management operations, but responses never
 include the stored profile. Existing empty state is accepted without migration.
 
 A replacement profile is written to a new private file and synced before an
-atomic configuration rename. The service then removes unreferenced profile
-files. Startup validates saved references and profiles before removing orphaned
+atomic configuration rename. Unreferenced profiles are removed only after
+configuration-directory durability is confirmed. A post-rename sync failure
+retains both profile versions. Startup validates saved references and profiles
+and confirms directory durability before removing orphaned
 files from its reserved profile namespace. Unknown filenames are retained.
 Corrupt configuration or missing profiles cause startup to fail; data is never
 silently reset. Make offline backups of the complete state directory together.
@@ -166,7 +168,7 @@ A successful response is:
 ```
 
 Error responses contain `api_version` and an `error` string. Requests and
-responses are limited to 2 MiB, excluding the terminating newline. Reads have a two-second total deadline.
+responses are limited to 4 MiB, excluding the terminating newline. Reads have a two-second total deadline.
 The CLI rejects incompatible versions, malformed or incomplete messages, and
 not-ready responses.
 

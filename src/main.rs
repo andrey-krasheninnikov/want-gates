@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 
 const API_VERSION: u64 = 1;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_MESSAGE: usize = 2 * 1024 * 1024;
+// Include JSON escaping of a 1 MiB profile and request metadata.
+const MAX_MESSAGE: usize = 4 * 1024 * 1024;
 const HELP: &str = "Want Gates local control service
 
 Usage:
@@ -256,7 +257,7 @@ fn read_message(stream: &mut UnixStream) -> io::Result<Value> {
         let end = buffer[..count].iter().position(|byte| *byte == b'\n');
         let length = end.unwrap_or(count);
         if message.len() + length > MAX_MESSAGE {
-            return Err(invalid("local API message exceeds 2 MiB"));
+            return Err(invalid("local API message exceeds 4 MiB"));
         }
         message.extend_from_slice(&buffer[..length]);
         if let Some(end) = end {
@@ -280,7 +281,7 @@ fn write_message(stream: &mut UnixStream, value: &Value) -> io::Result<()> {
         })?;
     let bytes = serde_json::to_vec(value)?;
     if bytes.len() > MAX_MESSAGE {
-        return Err(invalid("local API message exceeds 2 MiB"));
+        return Err(invalid("local API message exceeds 4 MiB"));
     }
     stream.write_all(&bytes)?;
     stream.write_all(b"\n")

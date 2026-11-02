@@ -438,10 +438,14 @@ impl Store {
                 return Err(error);
             }
         }
-        let saved = self.commit(config);
-        let cleanup = self.clean_profiles();
-        saved?;
-        cleanup.map_err(|_| {
+        let previous_revision = self.config.revision;
+        if let Err(error) = self.commit(config) {
+            if self.config.revision == previous_revision {
+                let _ = self.clean_profiles();
+            }
+            return Err(error);
+        }
+        self.clean_profiles().map_err(|_| {
             io::Error::other(
                 "configuration saved; unused profile cleanup failed; inspect state before retrying",
             )
@@ -450,6 +454,8 @@ impl Store {
     }
 
     fn clean_profiles(&self) -> io::Result<()> {
+        // Keep preceding profiles until the current metadata is confirmed durable, including after restart.
+        File::open(&self.root)?.sync_all()?;
         let directory = self.root.join("secrets");
         let entries = match fs::read_dir(&directory) {
             Ok(e) => e,
