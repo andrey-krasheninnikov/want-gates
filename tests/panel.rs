@@ -439,3 +439,38 @@ fn interrupted_apply_requires_reconciliation_after_service_restart() {
     );
     assert_eq!(*p.template.lock().unwrap(), base);
 }
+
+#[test]
+fn preview_rejects_balancer_references_and_overlapping_selectors() {
+    let s = Service::start();
+    let p = Panel::start();
+    configured_rule(&s, &p);
+    let writes = *p.writes.lock().unwrap();
+    for balancer in [
+        json!({"tag":"retained", "selector":["wgates-out-c2"]}),
+        json!({"tag":"retained", "selector":["wgates-"]}),
+        json!({"tag":"retained", "selector":["wgates"]}),
+        json!({"tag":"retained", "selector":"direct,wgates-out-c2"}),
+        json!({"tag":"retained", "selector":"direct,wgates"}),
+        json!({"tag":"retained", "selector":[""]}),
+        json!({"tag":"retained", "selector":["direct"], "fallbackTag":"wgates-direct"}),
+    ] {
+        p.template.lock().unwrap()["routing"]["balancers"] = json!([balancer]);
+        let result = command(&s, &["routing", "preview"], None);
+        assert!(
+            !result.status.success(),
+            "accepted managed balancer reference"
+        );
+        assert!(String::from_utf8_lossy(&result.stderr).contains("reference reserved"));
+        assert_eq!(*p.writes.lock().unwrap(), writes);
+    }
+    p.template.lock().unwrap()["routing"]["balancers"] =
+        json!([{"tag":"retained", "selector":["direct"]}]);
+    ok(&s, &["routing", "preview"], None);
+    p.template.lock().unwrap()["routing"]["rules"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"field", "inboundTag":"other,wgates-probe", "outboundTag":"direct"}));
+    assert!(!command(&s, &["routing", "preview"], None).status.success());
+    assert_eq!(*p.writes.lock().unwrap(), writes);
+}

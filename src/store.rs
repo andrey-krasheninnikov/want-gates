@@ -324,7 +324,7 @@ impl Store {
                         || config.rules.iter().any(|r| r.group_id == id)
                     {
                         return Err(invalid(
-                            "group is referenced by connections; move or remove them first",
+                            "group is referenced by connections or rules; move or remove them first",
                         ));
                     }
                     json!(config.groups.remove(index))

@@ -90,6 +90,11 @@ fn rules_and_primary_keep_references_and_survive_restart() {
         cid
     );
     assert_eq!(ok(&s, &["rule", "show", rid], None)["data"], rule);
+    ok(&s, &["group", "update", gid, "--primary", "-"], None);
+    ok(&s, &["connection", "delete", cid], None);
+    let result = run(&s, &["group", "delete", gid], None);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("rules"));
     assert_eq!(
         ok(&s, &["rule", "list"], None)["data"]
             .as_array()

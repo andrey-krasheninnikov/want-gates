@@ -183,13 +183,19 @@ fn validate(input: &Input, base: &Snapshot, working: Option<&Working>) -> io::Re
         }
         match value {
             Value::Object(fields) => fields.iter().any(|(key, value)| {
-                (matches!(key.as_str(), "outboundTag" | "balancerTag" | "dialerProxy")
-                    && value.as_str().is_some_and(|s| s.starts_with(PREFIX)))
-                    || (key == "inboundTag"
-                        && value.as_array().is_some_and(|a| {
-                            a.iter()
-                                .any(|v| v.as_str().is_some_and(|s| s.starts_with(PREFIX)))
-                        }))
+                let references_managed =
+                    |s: &str| s.starts_with(PREFIX) || (key == "selector" && PREFIX.starts_with(s));
+                (matches!(
+                    key.as_str(),
+                    "outboundTag" | "balancerTag" | "dialerProxy" | "fallbackTag"
+                ) && value.as_str().is_some_and(|s| s.starts_with(PREFIX)))
+                    || (matches!(key.as_str(), "selector" | "inboundTag")
+                        && (value
+                            .as_str()
+                            .is_some_and(|s| s.split(',').any(references_managed))
+                            || value.as_array().is_some_and(|a| {
+                                a.iter().filter_map(Value::as_str).any(references_managed)
+                            })))
                     || external_reference(value)
             }),
             Value::Array(items) => items.iter().any(external_reference),

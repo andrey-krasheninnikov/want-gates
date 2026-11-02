@@ -313,7 +313,11 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
             time.sleep(0.1)
         flag=work/'fault-mode'
         proxy=spawn('gateway',['python3',__file__,'--proxy',flag],'fault-proxy')
-        time.sleep(0.1)
+        deadline=time.monotonic()+10
+        while run('ip','netns','exec',names['gateway'],'python3','-c',"import socket; socket.create_connection(('127.0.0.1',20531),timeout=0.2).close()").returncode:
+            assert proxy.poll() is None,'fault proxy stopped during startup'
+            assert time.monotonic()<deadline,'fault proxy did not become ready'
+            time.sleep(0.1)
         control('panel','configure','--file','-',payload=dict(url='http://127.0.0.1:20531/',token=token))
         control('panel','preflight')
         groups,connections,rules={},{},{}
@@ -363,8 +367,22 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
         assert current['xraySetting']['log']==baseline['log']
         assert [v for v in current['xraySetting']['outbounds'] if not v['tag'].startswith('wgates-')]==baseline['outbounds']
         assert [v for v in current['xraySetting']['routing']['rules'] if not v.get('ruleTag','').startswith('wgates-')]==baseline['routing']['rules']
-        # A real panel save followed by a failed acknowledgement must restore the verified path.
+        # A balancer outside Want Gates must not depend on an outbound replaced by a primary change.
         saved_before_fault=current['xraySetting']
+        backup=control('connection','import','--group',groups['a'],'--name','reserve','--protocol','vless','--file','-',payload=json.dumps(outbound('10.213.0.2',19001,ids['a'])))['data']['id']
+        control('group','update',groups['a'],'--primary',backup)
+        with_balancer=json.loads(json.dumps(saved_before_fault))
+        with_balancer['routing'].setdefault('balancers',[]).append(dict(tag='retained-balancer',selector='direct,wgates-out-'+connections['a']))
+        api('xray/update',dict(xraySetting=json.dumps(with_balancer),outboundTestUrl=settings['outboundTestUrl']))
+        rejected=control('routing','preview',success=False)
+        assert 'reference reserved' in rejected.stderr
+        current=api('xray/',{})
+        if isinstance(current,str):current=json.loads(current)
+        assert current['xraySetting']==with_balancer,'rejected preview changed unrelated balancer'
+        api('xray/update',dict(xraySetting=json.dumps(saved_before_fault),outboundTestUrl=settings['outboundTestUrl']))
+        control('group','update',groups['a'],'--primary',connections['a'])
+        control('connection','delete',backup)
+        # A real panel save followed by a failed acknowledgement must restore the verified path.
         extra=control('rule','create','--group',groups['a'],'--destination','10.222.0.0/24')['data']['id']
         fault_plan=control('routing','preview')['data']['plan_id']
         flag.write_text('fail_after_save')
