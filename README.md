@@ -11,15 +11,17 @@ fallbacks.
 
 ## Status
 
-The Rust binary provides local readiness, group and connection management,
-and VLESS profile import through a Unix socket. Profiles are saved as desired
-state without starting VPNs or changing 3x-ui. See
-[service operation and the local API](docs/service.md).
+The Rust binary manages groups, VLESS profiles and IP/CIDR rules through a Unix
+socket. A preview and explicit apply configure 3x-ui 3.8.5 with Xray 26.9.9.
+TCP/UDP over IPv4/IPv6 are verified separately; unavailable combinations are
+blocked. See [service operation](docs/service.md) and
+[routing, verification and recovery](docs/routing.md).
 
-Both `vless://` links and Xray outbound JSON are accepted. Validation is
-structural; Xray compatibility and network behavior remain unverified.
-VPN routing, native authentication, bootstrap, the skill package, and panel
-integrations remain planned. No binary release or skill package is published.
+Both `vless://` and complete outbound JSON imports are supported. Import checks
+structure; apply checks the panel and actual traffic. The isolated local
+Linux/arm64 stand exercises two groups and the complete VLESS ingress path.
+Native authentication, domain routing, continuous health/fallback, bootstrap,
+the skill package and panel UI remain planned. No binary release is published.
 
 ## Planned routing model
 
@@ -56,7 +58,7 @@ Xray restarts is not guaranteed.
 ## Planned operation and installation
 
 The Rust binary provides a CLI and local systemd service connected through
-a Unix socket. Future routing changes require a preview and an explicit apply.
+a Unix socket. Routing changes require a preview and an explicit apply.
 
 Bootstrap will install Want Gates beside an existing compatible 3x-ui, starting
 with MHSanaei/3x-ui 3.8.5. It will preserve unrelated panel settings and check

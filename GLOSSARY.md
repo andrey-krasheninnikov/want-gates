@@ -1,7 +1,6 @@
 # Want Gates glossary
 
-These terms describe the agreed design. The local control service, group management, and
-VLESS profile storage are implemented. VPN routing remains planned.
+These terms describe the gateway, its routing policy and operator actions.
 
 | Term | Meaning |
 | --- | --- |
@@ -15,6 +14,7 @@ VLESS profile storage are implemented. VPN routing remains planned.
 | Unmatched traffic | Traffic that does not match a Want Gates routing rule. Its default path is direct from the gateway. |
 | Protected traffic | Traffic assigned to a group. It must not leave directly or through another group when the intended path is unavailable. |
 | Capability | A connection's verified support for TCP, UDP, IPv4, or IPv6. Missing support must not cause direct fallback. |
+| Capability observation | A recorded result for one connection transport and IP family. It describes the last explicit verification rather than continuous health. |
 | Connection DNS | DNS used through an individual connection for destinations assigned to its group, including private company zones. |
 | Healthcheck | A probe of a group-configured target resource through each connection, including DNS when the target uses a hostname. |
 | Failover | Selecting an eligible fallback when a preferred connection is unavailable. |

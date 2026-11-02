@@ -1,5 +1,9 @@
 mod management;
+mod panel;
+mod policy;
+mod probe;
 mod profile;
+mod routing;
 mod store;
 
 use serde_json::{Value, json};
@@ -26,11 +30,22 @@ Usage:
   wgates serve [--socket PATH] [--state-dir PATH]
   wgates status [--socket PATH]
   wgates group create --name NAME [--socket PATH]
-  wgates group list|show ID|update ID --name NAME|delete ID [--socket PATH]
+  wgates group list|show ID|delete ID [--socket PATH]
+  wgates group update ID [--name NAME] [--primary CONNECTION_ID|-] [--probe-file PATH|-]
   wgates connection import --group ID --name NAME --protocol vless --file PATH|-
   wgates connection list [--group ID] [--sort group|name]
   wgates connection show ID|update ID [--name NAME] [--group ID] [--file PATH|-]|delete ID
+  wgates rule create --group ID --destination IP_OR_CIDR
+  wgates rule list [--group ID]
+  wgates rule show ID|update ID [--group ID] [--destination IP_OR_CIDR]|delete ID
+  wgates panel configure --file PATH|-
+  wgates panel preflight
+  wgates routing preview|status
+  wgates routing apply PLAN_ID|recover PLAN_ID
   wgates --version
+
+All management commands accept --socket PATH. Saving changes desired state only.
+Routing requires 3x-ui 3.8.5 and Xray 26.9.9; apply explicitly names a reviewed plan.
 
 Defaults:
   --socket     /run/wgates/control.sock
@@ -66,7 +81,12 @@ fn run() -> io::Result<()> {
         println!("wgates {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
-    if command == "group" || command == "connection" {
+    if command == "group"
+        || command == "connection"
+        || command == "rule"
+        || command == "panel"
+        || command == "routing"
+    {
         return management::run(command.to_str().unwrap(), args);
     }
     if command != "serve" && command != "status" {
@@ -191,12 +211,14 @@ fn serve(socket: &Path, state: &Path) -> io::Result<()> {
     let stopping = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&stopping))?;
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&stopping))?;
+    let mut routing = routing::Service::new(state, Arc::clone(&stopping))?;
     eprintln!("wgates: control service ready at {}", socket.display());
-    // shortcut: serialize bounded local operations; add concurrency when operations block on VPN work.
+    // Keep configuration writes serialized while network operations use one worker.
     while !stopping.load(Ordering::Relaxed) {
+        routing.reap();
         match listener.accept() {
             Ok((mut stream, _)) => {
-                if let Err(error) = handle(&mut stream, &mut store) {
+                if let Err(error) = handle(&mut stream, &mut store, &mut routing) {
                     eprintln!("wgates: local request failed: {error}");
                 }
             }
@@ -207,12 +229,16 @@ fn serve(socket: &Path, state: &Path) -> io::Result<()> {
             Err(error) => return Err(error),
         }
     }
+    routing.finish();
     drop(listener);
     owned.cleanup()
 }
 
 fn read_message(stream: &mut UnixStream) -> io::Result<Value> {
-    let deadline = Instant::now() + IO_TIMEOUT;
+    read_message_with_timeout(stream, IO_TIMEOUT)
+}
+fn read_message_with_timeout(stream: &mut UnixStream, timeout: Duration) -> io::Result<Value> {
+    let deadline = Instant::now() + timeout;
     let mut message = Vec::new();
     let mut buffer = [0; 256];
     loop {
@@ -287,7 +313,11 @@ fn write_message(stream: &mut UnixStream, value: &Value) -> io::Result<()> {
     stream.write_all(b"\n")
 }
 
-fn handle(stream: &mut UnixStream, store: &mut store::Store) -> io::Result<()> {
+fn handle(
+    stream: &mut UnixStream,
+    store: &mut store::Store,
+    routing: &mut routing::Service,
+) -> io::Result<()> {
     stream.set_nonblocking(false)?;
     let response = match read_message(stream) {
         Err(_) => json!({"api_version": API_VERSION, "error": "invalid or incomplete request"}),
@@ -295,8 +325,29 @@ fn handle(stream: &mut UnixStream, store: &mut store::Store) -> io::Result<()> {
             json!({"api_version": API_VERSION, "error": "incompatible API version; expected 1"})
         }
         Ok(request) if request["command"].as_str() != Some("status") => {
+            let command = request["command"].as_str().unwrap_or("");
+            if command.starts_with("routing.") || command.starts_with("panel.") {
+                let response = match routing.dispatch(&request, store, stream) {
+                    Ok(Some(mut response)) => {
+                        response["api_version"] = json!(API_VERSION);
+                        response
+                    }
+                    Ok(None) => return Ok(()),
+                    Err(error) => json!({"api_version":API_VERSION,"error":error.to_string()}),
+                };
+                return write_message(stream, &response);
+            }
+            if routing.busy() && !command.ends_with(".show") && !command.ends_with(".list") {
+                return write_message(
+                    stream,
+                    &json!({"api_version":API_VERSION,"error":"routing operation in progress; configuration writes are locked"}),
+                );
+            }
             match store.dispatch(&request) {
                 Ok(mut response) => {
+                    if command.starts_with("connection.") {
+                        routing.describe_connections(&mut response, store.config());
+                    }
                     response["api_version"] = json!(API_VERSION);
                     response
                 }
