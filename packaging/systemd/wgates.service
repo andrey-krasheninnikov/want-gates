@@ -13,12 +13,12 @@ StateDirectoryMode=0700
 UMask=0007
 Restart=on-failure
 RestartSec=2s
-TimeoutStopSec=5s
+TimeoutStopSec=15s
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
-RestrictAddressFamilies=AF_UNIX
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 CapabilityBoundingSet=
 
 [Install]

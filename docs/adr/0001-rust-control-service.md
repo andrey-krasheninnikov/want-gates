@@ -1,6 +1,6 @@
 # ADR 0001: Rust CLI and local control service
 
-Status: accepted; local readiness and saved profile management are implemented. Routing remains planned.
+Status: accepted; local management and VLESS IP routing are implemented.
 
 ## Context
 
@@ -38,7 +38,8 @@ The service is the common boundary for management operations. Its local socket
 and secret storage require access controls. Systemd installation, restart
 behavior, and dependency detection need disposable Linux tests.
 
-The current binary provides local readiness, version inspection, group and
-connection management, and VLESS profile storage. Profile validation is structural;
-Xray compatibility is not established. Native authentication, routing, bootstrap,
-and integrations remain planned. No binary release has been published.
+The current binary provides local management and VLESS IP/CIDR routing with
+preview, explicit apply, traffic verification and guarded recovery. Profile
+import validation remains structural. Native authentication, domain routing,
+automatic failover, bootstrap and panel UI remain planned. No binary release
+has been published.

@@ -16,7 +16,13 @@ pub fn run(kind: &str, mut args: impl Iterator<Item = OsString>) -> io::Result<(
     }
     let action = action.to_str().ok_or_else(|| invalid("invalid action"))?;
     let allowed: &[&str] = match (kind, action) {
-        ("group", "create" | "update") => &["--name"],
+        ("group", "create") => &["--name"],
+        ("group", "update") => &["--name", "--primary", "--probe-file"],
+        ("rule", "create" | "update") => &["--group", "--destination"],
+        ("rule", "list") => &["--group"],
+        ("panel", "configure") => &["--file"],
+        ("panel", "preflight") | ("routing", "preview" | "status" | "apply" | "recover") => &[],
+        ("rule", "show" | "delete") => &[],
         ("group", "list" | "show" | "delete") => &[],
         ("connection", "import") => &["--name", "--group", "--protocol", "--file"],
         ("connection", "update") => &["--name", "--group", "--file"],
@@ -24,7 +30,7 @@ pub fn run(kind: &str, mut args: impl Iterator<Item = OsString>) -> io::Result<(
         ("connection", "show" | "delete") => &[],
         _ => return Err(invalid("unsupported management action; run wgates --help")),
     };
-    let id = if matches!(action, "show" | "update" | "delete") {
+    let id = if matches!(action, "show" | "update" | "delete" | "apply" | "recover") {
         Some(
             args.next()
                 .ok_or_else(|| invalid("object ID is required"))?,
@@ -61,13 +67,19 @@ pub fn run(kind: &str, mut args: impl Iterator<Item = OsString>) -> io::Result<(
     }
     let mut request = json!({"api_version":API_VERSION,"command":format!("{kind}.{action}")});
     if let Some(id) = id {
-        request["id"] = json!(id.to_str().ok_or_else(|| invalid("invalid object ID"))?);
+        request[if matches!(action, "apply" | "recover") {
+            "plan_id"
+        } else {
+            "id"
+        }] = json!(id.to_str().ok_or_else(|| invalid("invalid object ID"))?);
     }
     for (option, field) in [
         ("--name", "name"),
         ("--group", "group_id"),
         ("--protocol", "protocol"),
         ("--sort", "sort"),
+        ("--destination", "destination"),
+        ("--primary", "primary"),
     ] {
         if let Some(value) = options.get(option) {
             request[field] = json!(
@@ -77,8 +89,25 @@ pub fn run(kind: &str, mut args: impl Iterator<Item = OsString>) -> io::Result<(
             );
         }
     }
-    if action == "create" && request.get("name").is_none() {
+    if kind == "group" && action == "create" && request.get("name").is_none() {
         return Err(invalid("--name is required"));
+    }
+    if request["primary"] == "-" {
+        request["primary"] = Value::Null;
+    }
+    if let Some(path) = options.get("--probe-file") {
+        let source: Box<dyn Read> = if path == "-" {
+            Box::new(io::stdin())
+        } else {
+            Box::new(std::fs::File::open(path)?)
+        };
+        let mut bytes = Vec::new();
+        source.take(64 * 1024 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > 64 * 1024 {
+            return Err(invalid("probe configuration exceeds 64 KiB"));
+        }
+        request["probes"] =
+            serde_json::from_slice(&bytes).map_err(|_| invalid("invalid probe JSON"))?;
     }
     if action == "import"
         && ["--name", "--group", "--protocol", "--file"]
@@ -102,8 +131,14 @@ pub fn run(kind: &str, mut args: impl Iterator<Item = OsString>) -> io::Result<(
         if bytes.len() > crate::store::MAX_PROFILE {
             return Err(invalid("profile exceeds 1 MiB"));
         }
-        request["profile"] =
-            json!(String::from_utf8(bytes).map_err(|_| invalid("profile must be valid UTF-8"))?);
+        if kind == "panel" {
+            request["settings"] = serde_json::from_slice(&bytes)
+                .map_err(|_| invalid("invalid panel settings JSON"))?;
+        } else {
+            request["profile"] = json!(
+                String::from_utf8(bytes).map_err(|_| invalid("profile must be valid UTF-8"))?
+            );
+        }
     }
     if matches!(action, "update" | "delete") {
         let current = exchange(
@@ -162,7 +197,14 @@ fn exchange(socket: &std::path::Path, request: &Value) -> io::Result<Value> {
         )
     })?;
     write_message(&mut stream, request)?;
-    let response = read_message(&mut stream)?;
+    let response = if request["command"]
+        .as_str()
+        .is_some_and(|s| s.starts_with("routing.") || s == "panel.preflight")
+    {
+        crate::read_message_with_timeout(&mut stream, std::time::Duration::from_secs(330))?
+    } else {
+        read_message(&mut stream)?
+    };
     if response["api_version"].as_u64() != Some(API_VERSION) {
         return Err(invalid("incompatible local API version; expected 1"));
     }

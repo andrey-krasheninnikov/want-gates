@@ -71,7 +71,7 @@ impl<'de> Deserialize<'de> for Strict {
         d.deserialize_any(JsonVisitor)
     }
 }
-fn strict_json(input: &str) -> io::Result<Value> {
+pub fn strict_json(input: &str) -> io::Result<Value> {
     serde_json::from_str::<Strict>(input)
         .map(|v| v.0)
         .map_err(|_| invalid("profile must be valid JSON without duplicate keys, or a VLESS URI"))

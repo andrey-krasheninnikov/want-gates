@@ -1,3 +1,4 @@
+use crate::policy::{Network, Probes, Rule};
 use crate::{invalid, secure_directory};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -14,29 +15,35 @@ const PAGE_SIZE: usize = 100;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Group {
-    id: String,
-    name: String,
-    revision: u64,
+    pub id: String,
+    pub name: String,
+    pub revision: u64,
+    #[serde(default)]
+    pub primary: Option<String>,
+    #[serde(default)]
+    pub probes: Probes,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Connection {
-    id: String,
-    group_id: String,
-    name: String,
-    protocol: String,
-    revision: u64,
-    profile_ref: String,
+pub struct Connection {
+    pub id: String,
+    pub group_id: String,
+    pub name: String,
+    pub protocol: String,
+    pub revision: u64,
+    pub profile_ref: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Config {
+pub struct Config {
     schema_version: u64,
-    revision: u64,
-    groups: Vec<Group>,
-    connections: Vec<Connection>,
+    pub revision: u64,
+    pub groups: Vec<Group>,
+    pub connections: Vec<Connection>,
+    #[serde(default)]
+    pub rules: Vec<Rule>,
 }
 
 pub struct Store {
@@ -109,10 +116,11 @@ impl Store {
                 revision: 0,
                 groups: Vec::new(),
                 connections: Vec::new(),
+                rules: Vec::new(),
             },
             Err(error) => return Err(error),
         };
-        if config.schema_version != 1 {
+        if !matches!(config.schema_version, 1 | 2) {
             return Err(invalid("unsupported saved configuration version"));
         }
         let mut ids = std::collections::HashSet::new();
@@ -165,6 +173,32 @@ impl Store {
             let input = std::str::from_utf8(&bytes)
                 .map_err(|_| invalid("invalid saved profile; state was retained"))?;
             crate::profile::parse(input)?;
+        }
+        for group in &config.groups {
+            group.probes.validate()?;
+            if group.primary.as_ref().is_some_and(|id| {
+                !config
+                    .connections
+                    .iter()
+                    .any(|c| &c.id == id && c.group_id == group.id)
+            }) {
+                return Err(invalid(
+                    "invalid saved primary reference; state was retained",
+                ));
+            }
+        }
+        let mut destinations = std::collections::HashSet::new();
+        for rule in &config.rules {
+            if id_number(&rule.id, 'r').is_none_or(|n| n > rule.revision)
+                || rule.revision == 0
+                || rule.revision > config.revision
+                || !ids.insert(&rule.id)
+                || !destinations.insert(&rule.destination)
+                || !config.groups.iter().any(|g| g.id == rule.group_id)
+                || Network::parse(&rule.destination)?.canonical() != rule.destination
+            {
+                return Err(invalid("invalid saved routing rule; state was retained"));
+            }
         }
         let store = Self {
             root: root.to_owned(),
@@ -227,7 +261,12 @@ impl Store {
             "group.create" => &["name"],
             "group.list" => &["offset", "list_revision"],
             "group.show" | "connection.show" => &["id"],
-            "group.update" => &["id", "expected_revision", "name"],
+            "group.update" => &["id", "expected_revision", "name", "primary", "probes"],
+            "rule.create" => &["group_id", "destination"],
+            "rule.list" => &["group_id", "offset", "list_revision"],
+            "rule.show" => &["id"],
+            "rule.update" => &["id", "expected_revision", "group_id", "destination"],
+            "rule.delete" => &["id", "expected_revision"],
             "group.delete" | "connection.delete" => &["id", "expected_revision"],
             "connection.list" => &["group_id", "sort", "offset", "list_revision"],
             "connection.import" => &["name", "group_id", "protocol", "profile"],
@@ -261,6 +300,8 @@ impl Store {
                     id: format!("g{revision}"),
                     name,
                     revision,
+                    primary: None,
+                    probes: Probes::default(),
                 };
                 config.groups.push(group.clone());
                 json!(group)
@@ -279,20 +320,129 @@ impl Store {
                     return Err(invalid("revision conflict; inspect the object and retry"));
                 }
                 if command == "group.delete" {
-                    if config.connections.iter().any(|c| c.group_id == id) {
+                    if config.connections.iter().any(|c| c.group_id == id)
+                        || config.rules.iter().any(|r| r.group_id == id)
+                    {
                         return Err(invalid(
                             "group is referenced by connections; move or remove them first",
                         ));
                     }
                     json!(config.groups.remove(index))
                 } else {
-                    let name = name(&request["name"])?;
-                    if config.groups.iter().any(|g| g.name == name && g.id != id) {
-                        return Err(invalid("group name already exists"));
+                    if ["name", "primary", "probes"]
+                        .iter()
+                        .all(|k| request.get(k).is_none())
+                    {
+                        return Err(invalid("update requires name, primary or probes"));
                     }
-                    config.groups[index].name = name;
+                    if let Some(value) = request.get("name") {
+                        let name = name(value)?;
+                        if config.groups.iter().any(|g| g.name == name && g.id != id) {
+                            return Err(invalid("group name already exists"));
+                        }
+                        config.groups[index].name = name;
+                    }
+                    if let Some(value) = request.get("primary") {
+                        let primary = if value.is_null() {
+                            None
+                        } else {
+                            Some(text(value)?.to_owned())
+                        };
+                        if primary.as_ref().is_some_and(|cid| {
+                            !config
+                                .connections
+                                .iter()
+                                .any(|c| &c.id == cid && c.group_id == id)
+                        }) {
+                            return Err(invalid("primary must be a connection in this group"));
+                        }
+                        config.groups[index].primary = primary;
+                    }
+                    if let Some(value) = request.get("probes") {
+                        let probes: Probes = serde_json::from_value(value.clone())
+                            .map_err(|_| invalid("invalid probe configuration"))?;
+                        probes.validate()?;
+                        config.groups[index].probes = probes;
+                    }
                     config.groups[index].revision = revision;
                     json!(config.groups[index])
+                }
+            }
+            "rule.list" => {
+                let filter = request.get("group_id").map(text).transpose()?;
+                if filter.is_some_and(|id| !config.groups.iter().any(|g| g.id == id)) {
+                    return Err(invalid("group not found"));
+                }
+                let mut rules: Vec<_> = config
+                    .rules
+                    .iter()
+                    .filter(|r| filter.is_none_or(|id| id == r.group_id))
+                    .collect();
+                rules.sort_by(|a, b| (&a.destination, &a.id).cmp(&(&b.destination, &b.id)));
+                return self.page(request, rules.iter().map(|r| json!(r)).collect());
+            }
+            "rule.create" | "rule.show" | "rule.update" | "rule.delete" => {
+                let index = if command == "rule.create" {
+                    None
+                } else {
+                    let id = text(&request["id"])?;
+                    Some(
+                        config
+                            .rules
+                            .iter()
+                            .position(|r| r.id == id)
+                            .ok_or_else(|| invalid("rule not found"))?,
+                    )
+                };
+                if command == "rule.show" {
+                    return Ok(json!({"data": config.rules[index.unwrap()]}));
+                }
+                if let Some(index) = index
+                    && request["expected_revision"].as_u64() != Some(config.rules[index].revision)
+                {
+                    return Err(invalid("revision conflict; inspect the object and retry"));
+                }
+                if command == "rule.delete" {
+                    json!(config.rules.remove(index.unwrap()))
+                } else {
+                    let mut rule = index.map(|i| config.rules[i].clone()).unwrap_or(Rule {
+                        id: format!("r{revision}"),
+                        group_id: String::new(),
+                        destination: String::new(),
+                        revision,
+                    });
+                    if let Some(value) = request.get("group_id") {
+                        rule.group_id = text(value)?.to_owned();
+                    }
+                    if let Some(value) = request.get("destination") {
+                        rule.destination = Network::parse(text(value)?)?.canonical();
+                    }
+                    if rule.destination.is_empty()
+                        || !config.groups.iter().any(|g| g.id == rule.group_id)
+                    {
+                        return Err(invalid("rule requires a valid group and destination"));
+                    }
+                    if config
+                        .rules
+                        .iter()
+                        .any(|r| r.id != rule.id && r.destination == rule.destination)
+                    {
+                        return Err(invalid("destination rule already exists"));
+                    }
+                    if command == "rule.update"
+                        && ["group_id", "destination"]
+                            .iter()
+                            .all(|k| request.get(k).is_none())
+                    {
+                        return Err(invalid("update requires group or destination"));
+                    }
+                    rule.revision = revision;
+                    if let Some(index) = index {
+                        config.rules[index] = rule.clone();
+                    } else {
+                        config.rules.push(rule.clone());
+                    }
+                    json!(rule)
                 }
             }
             "connection.list" => {
@@ -378,6 +528,19 @@ impl Store {
                 {
                     return Err(invalid("revision conflict; inspect the object and retry"));
                 }
+                if config
+                    .groups
+                    .iter()
+                    .any(|g| g.primary.as_deref() == Some(id))
+                    && (command == "connection.delete"
+                        || request.get("group_id").is_some_and(|v| {
+                            v.as_str() != Some(config.connections[index].group_id.as_str())
+                        }))
+                {
+                    return Err(invalid(
+                        "connection is referenced as primary; clear or change the primary first",
+                    ));
+                }
                 if command == "connection.delete" {
                     summary(&config.connections.remove(index))
                 } else {
@@ -415,6 +578,7 @@ impl Store {
             _ => return Err(invalid("unsupported command")),
         };
         config.revision = revision;
+        config.schema_version = 2;
         if let Some((reference, profile)) = &new_profile {
             let directory = self.root.join("secrets");
             secure_directory(&directory, 0o700, 0o077)?;
@@ -524,11 +688,94 @@ fn protocol(value: &Value) -> io::Result<()> {
 }
 fn summary(c: &Connection) -> Value {
     json!({"id":c.id,"group_id":c.group_id,"name":c.name,"protocol":c.protocol,"revision":c.revision,
-        "validation":"structural","runtime":"unavailable","runtime_reason":"routing_not_implemented",
-        "authentication":"not_attempted","capabilities":[]})
+        "validation":"structural","authentication":"not_attempted"})
 }
 
 fn id_number(id: &str, prefix: char) -> Option<u64> {
     let n = id.strip_prefix(prefix)?.parse::<u64>().ok()?;
     (n > 0 && id == format!("{prefix}{n}")).then_some(n)
+}
+
+pub fn random_id() -> io::Result<String> {
+    let mut bytes = [0; 16];
+    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+pub fn private_write(path: &Path, value: &impl Serialize) -> io::Result<()> {
+    let bytes = serde_json::to_vec(value)?;
+    if bytes.len() > 128 * 1024 * 1024 {
+        return Err(invalid("routing state exceeds 128 MiB"));
+    }
+    match private_read(path, 128 * 1024 * 1024) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let temporary = path.with_file_name(format!(
+        ".{}-{}.tmp",
+        path.file_name().unwrap().to_string_lossy(),
+        random_id()?
+    ));
+    let result = (|| -> io::Result<()> {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        fs::rename(&temporary, path)?;
+        File::open(path.parent().unwrap())?.sync_all().map_err(|_| {
+            io::Error::other(
+                "routing state saved but durability is uncertain; inspect before retrying",
+            )
+        })
+    })();
+    if result.is_err() && temporary.exists() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+impl Store {
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+    pub fn routing_input(&self) -> io::Result<crate::routing::Input> {
+        let mut profiles = std::collections::BTreeMap::new();
+        let mut total = 0;
+        for group in self
+            .config
+            .groups
+            .iter()
+            .filter(|g| self.config.rules.iter().any(|r| r.group_id == g.id))
+        {
+            if let Some(id) = &group.primary {
+                let connection = self
+                    .config
+                    .connections
+                    .iter()
+                    .find(|c| &c.id == id)
+                    .unwrap();
+                let bytes = private_read(
+                    &self.root.join("secrets").join(&connection.profile_ref),
+                    MAX_PROFILE,
+                )?;
+                total += bytes.len();
+                if total > 10 * 1024 * 1024 {
+                    return Err(invalid(
+                        "active profiles exceed the panel update budget of 10 MiB",
+                    ));
+                }
+                profiles.insert(
+                    id.clone(),
+                    serde_json::from_slice(&bytes)
+                        .map_err(|_| invalid("invalid saved VLESS profile"))?,
+                );
+            }
+        }
+        Ok(crate::routing::Input {
+            config: self.config.clone(),
+            profiles,
+        })
+    }
 }

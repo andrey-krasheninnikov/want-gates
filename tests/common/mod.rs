@@ -47,18 +47,37 @@ impl Service {
             socket,
             state,
         };
+        service.wait_ready();
+        service
+    }
+
+    fn wait_ready(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            assert!(
-                service.child.try_wait().unwrap().is_none(),
-                "service exited"
-            );
-            if status(&service.socket).status.success() {
-                return service;
+            assert!(self.child.try_wait().unwrap().is_none(), "service exited");
+            if status(&self.socket).status.success() {
+                return;
             }
             assert!(Instant::now() < deadline, "service did not become ready");
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    pub fn start_again(&mut self) {
+        assert!(
+            self.child.try_wait().unwrap().is_some(),
+            "preceding service must be stopped"
+        );
+        self.child = Command::new(env!("CARGO_BIN_EXE_wgates"))
+            .args(["serve", "--socket"])
+            .arg(&self.socket)
+            .arg("--state-dir")
+            .arg(&self.state)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        self.wait_ready();
     }
 
     pub fn stop(&mut self) -> ExitStatus {

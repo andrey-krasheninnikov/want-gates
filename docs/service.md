@@ -1,8 +1,9 @@
 # Run the control service
 
-The service provides local readiness, group and connection management, and
-VLESS profile storage. Saving an object changes desired state only. The service
-does not authenticate, start VPNs, or change 3x-ui, routes, or DNS.
+The service manages groups, VLESS profiles and IP/CIDR rules. Saving an object
+changes desired state only. Routing requires a preview and explicit apply
+through 3x-ui. See [IP routing and recovery](routing.md). Native authentication,
+domain routing and per-connection DNS policy remain planned.
 
 ## Build and commands
 
@@ -57,8 +58,10 @@ of its group can reach the control socket. Group membership grants access to
 the control API. The service owns its persistent state; stopping the unit
 removes runtime files and preserves state.
 
-The current unit allows Unix sockets only and grants no network-management
-capabilities. It loads saved groups and profiles and does not configure VPNs or 3x-ui.
+The unit allows Unix, IPv4 and IPv6 sockets for the local control API, panel
+requests and traffic probes. It grants no network-management capabilities and
+does not alter host routes or interfaces. Shutdown has a 15-second systemd
+budget.
 
 ## Groups and connection profiles
 
@@ -87,9 +90,9 @@ characters. Group names are unique; connection names are unique within a group.
 Names and sorting are case-sensitive. IDs remain stable across renaming, moves,
 and profile replacement. The protocol cannot be changed by an update.
 
-A group with connections cannot be deleted. Move or remove its connections first.
-The current model has no routing rules or primary/fallback references. Later
-routing operations must extend these reference checks.
+A group referenced by connections or rules cannot be deleted. A primary cannot
+be deleted or moved until its group reference is cleared or changed. Automatic
+fallback is not implemented.
 
 Connection lists sort by group name, connection name, and ID by default.
 `--sort name` sorts by connection name and ID. The CLI collects service pages
@@ -119,8 +122,11 @@ that do not apply to the selected transport/security fail explicitly. Use
 outbound JSON for settings the sharing format cannot represent. URI descriptions
 are not used as connection names. Supply `--name` explicitly.
 
-Routine responses contain metadata, `validation: structural`, `runtime:
-unavailable`, `authentication: not_attempted`, and no verified capabilities.
+Routine responses contain metadata and `validation: structural`. Before apply,
+runtime is unavailable and capabilities are empty. After apply, responses expose
+the last matching capability observation; changed desired state is pending and
+incomplete operations are unknown. Native `authentication` remains
+`not_attempted`; VLESS traffic verification is reported separately.
 Other protocol adapters report unavailable. No authentication sessions are
 created in this slice; future native adapters must isolate state per connection
 outside ordinary configuration.
@@ -129,7 +135,10 @@ outside ordinary configuration.
 
 The service holds an exclusive advisory lock on its state directory, including
 when another process chooses a different socket. `config.json` uses schema
-version 1, a configuration revision, stable object IDs, and per-object revisions.
+version 2, a configuration revision, stable object IDs, and per-object revisions.
+Schema 1 loads with empty rules, primary and probes; the next saved mutation
+writes schema 2. Older binaries reject the extended configuration. Downgrading
+requires an offline migration rather than a reset.
 It contains metadata and profile references. Its limit is 16 MiB.
 
 Profiles are plaintext in separate `secrets/` files. The directory is 0700;
@@ -168,7 +177,9 @@ A successful response is:
 ```
 
 Error responses contain `api_version` and an `error` string. Requests and
-responses are limited to 4 MiB, excluding the terminating newline. Reads have a two-second total deadline.
+responses are limited to 4 MiB, excluding the terminating newline. Request reads
+and ordinary responses have a two-second total deadline. The CLI allows 330
+seconds for routing operations and panel preflight.
 The CLI rejects incompatible versions, malformed or incomplete messages, and
 not-ready responses.
 
@@ -180,21 +191,36 @@ and socket. It does not confirm VPN, DNS, or 3x-ui connectivity.
 Management uses the same one-request-per-connection framing. Commands are
 `group.create`, `group.list`, `group.show`, `group.update`, `group.delete`,
 `connection.import`, `connection.list`, `connection.show`, `connection.update`,
-and `connection.delete`.
+`connection.delete`, `rule.create`, `rule.list`, `rule.show`, `rule.update`,
+`rule.delete`, `panel.configure`, `panel.preflight`, `routing.preview`,
+`routing.apply`, `routing.status`, and `routing.recover`.
 
 Create groups with `name`. Import connections with `name`, `group_id`,
 `protocol`, and the source text in `profile`. Show uses `id`. Update and delete
 require `id` and `expected_revision`, obtained from a prior show. Updates supply
-only changed fields: group `name`, or connection `name`, `group_id`, and/or
-`profile`. Unexpected fields are rejected. Stale revisions fail without a write;
+only changed fields: group `name`, `primary` (ID or null), or `probes`; connection
+`name`, `group_id`, or `profile`; rule `group_id` or `destination`. Unexpected
+fields are rejected. Stale revisions fail without a write;
 the CLI supplies these revision preconditions automatically.
+
+Rule creation requires `group_id` and `destination`. Rule listing accepts the
+same pagination fields as other lists and an optional `group_id`.
+`panel.configure` takes a `settings` object containing `url` and `token`.
+`panel.preflight`, `routing.preview`, and `routing.status` have no extra fields.
+`routing.apply` and `routing.recover` require `plan_id`.
+
+Management responses wrap their result in `data`. Routing status includes
+`desired_revision`, `busy`, `recovery_required`, and `last_observation`. A caller
+disconnect does not cancel an accepted operation. Inspect status before retrying.
+See [routing operation](routing.md) for observation and recovery semantics.
 
 Successful management responses contain `api_version` and `data`. Lists return
 up to 100 objects, `list_revision`, and nullable `next_offset`. Continue with
 `offset: next_offset` and the same `list_revision`. Connection lists optionally
 accept `group_id` and `sort: group|name`. Changing configuration invalidates an
-in-progress listing. The service serializes all operations; clients must inspect
-state after a transport failure rather than blindly retry a mutation.
+in-progress listing. Configuration writes are serialized. One worker performs
+network operations while reads remain available. Inspect state after a transport
+failure before retrying a mutation.
 
 ## Verification
 
@@ -218,4 +244,5 @@ sudo python3 tests/systemd_smoke.py target/release/wgates
 This fixture creates a uniquely named test account, unit, binary, runtime
 directory, and state directory. It checks start/status, unauthorized access,
 graceful stop, saved group/profile persistence across restart, and cleanup. It is
-intended for the isolated CI runner.
+intended for a disposable local Linux systemd host. See
+[local network acceptance](routing.md#local-acceptance) for the real VLESS stand.
