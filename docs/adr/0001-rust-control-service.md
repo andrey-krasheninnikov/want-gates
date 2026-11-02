@@ -1,6 +1,6 @@
 # ADR 0001: Rust CLI and local control service
 
-Status: accepted; the local readiness service is implemented. VPN management remains planned.
+Status: accepted; local readiness and saved profile management are implemented. Routing remains planned.
 
 ## Context
 
@@ -19,7 +19,8 @@ permissions. Isolate authentication state for each connection. Do not expose
 credentials in ordinary command arguments, plans, diagnostics, or logs.
 
 The CLI, panel integration, and MCP tools use the same service operations.
-Configuration changes require a preview and an explicit apply. Show desired
+Saving groups and profiles changes desired state only. Runtime configuration
+changes require a preview and an explicit apply. Show desired
 and running state separately after an unsuccessful operation.
 
 Target Linux with systemd. Initial binary architectures are `x86_64` and
@@ -37,6 +38,7 @@ The service is the common boundary for management operations. Its local socket
 and secret storage require access controls. Systemd installation, restart
 behavior, and dependency detection need disposable Linux tests.
 
-The current binary provides local readiness and version inspection with an empty
-state directory. Connection management, routing, bootstrap, and integrations
-remain planned. No binary release has been published.
+The current binary provides local readiness, version inspection, group and
+connection management, and VLESS profile storage. Profile validation is structural;
+Xray compatibility is not established. Native authentication, routing, bootstrap,
+and integrations remain planned. No binary release has been published.

@@ -11,13 +11,15 @@ fallbacks.
 
 ## Status
 
-The first Rust slice provides `wgates serve`, `wgates status`, and version
-inspection through a local Unix socket. It reports control-service readiness.
-See [service operation and the local API](docs/service.md).
+The Rust binary provides local readiness, group and connection management,
+and VLESS profile import through a Unix socket. Profiles are saved as desired
+state without starting VPNs or changing 3x-ui. See
+[service operation and the local API](docs/service.md).
 
-VPN routing, connection management, bootstrap, the skill package, and panel
-integrations remain planned. There is no published binary release or skill
-package yet.
+Both `vless://` links and Xray outbound JSON are accepted. Validation is
+structural; Xray compatibility and network behavior remain unverified.
+VPN routing, native authentication, bootstrap, the skill package, and panel
+integrations remain planned. No binary release or skill package is published.
 
 ## Planned routing model
 

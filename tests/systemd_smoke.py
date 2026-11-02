@@ -90,6 +90,28 @@ def main():
         )
         assert denied.returncode != 0 and not denied.stdout
         assert "Permission denied" in denied.stderr
+        def control(*args, input=None):
+            result = subprocess.run(
+                [str(binary), *args, "--socket", str(runtime / "control.sock")],
+                input=input, capture_output=True, text=True, timeout=5, check=True,
+            )
+            assert not result.stderr
+            return json.loads(result.stdout)["data"]
+
+        group = control("group", "create", "--name", "Example company")
+        connection = control(
+            "connection", "import", "--group", group["id"], "--name", "Example VPN",
+            "--protocol", "vless", "--file", "-",
+            input="vless://test-credential@127.0.0.1:443",
+        )
+        assert connection["runtime"] == "unavailable"
+        assert "test-credential" not in json.dumps(connection)
+        assert "test-credential" not in (state / "config.json").read_text()
+        assert stat.S_IMODE((state / "config.json").stat().st_mode) == 0o600
+        assert stat.S_IMODE((state / "secrets").stat().st_mode) == 0o700
+        for profile in (state / "secrets").iterdir():
+            assert profile.stat().st_uid == uid
+            assert stat.S_IMODE(profile.stat().st_mode) == 0o600
         run("runuser", "-u", name, "--", "touch", str(state / "probe"))
         run("systemctl", "stop", unit.name)
         assert not runtime.exists()
@@ -98,8 +120,11 @@ def main():
         run("systemctl", "start", unit.name)
         ready()
         assert (state / "probe").exists()
+        assert control("group", "show", group["id"]) == group
+        assert control("connection", "show", connection["id"]) == connection
+        assert control("connection", "list") == [connection]
         run("systemctl", "stop", unit.name)
-        print("systemd start/status, access denial, graceful stop, and restart passed")
+        print("systemd start/status, access denial, graceful stop, and restart with saved profiles passed")
     except BaseException:
         diagnostic = subprocess.run(
             ["journalctl", "-u", unit.name, "--no-pager", "-n", "30"],
@@ -136,6 +161,21 @@ def main():
             probe = state / "probe"
             if probe.exists():
                 probe.unlink()
+            assert state.stat().st_uid == uid
+            allowed = {"probe", "config.json", "secrets"}
+            assert {p.name for p in state.iterdir()} <= allowed
+            config = state / "config.json"
+            if config.exists():
+                assert config.is_file() and not config.is_symlink()
+                config.unlink()
+            secrets = state / "secrets"
+            if secrets.exists():
+                assert secrets.is_dir() and not secrets.is_symlink()
+                for profile in secrets.iterdir():
+                    assert profile.is_file() and not profile.is_symlink()
+                    assert profile.stat().st_uid == uid
+                    profile.unlink()
+                secrets.rmdir()
             state.rmdir()
         if binary.exists():
             binary.unlink()

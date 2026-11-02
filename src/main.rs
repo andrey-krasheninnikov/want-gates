@@ -1,3 +1,7 @@
+mod management;
+mod profile;
+mod store;
+
 use serde_json::{Value, json};
 use std::env;
 use std::fs::{self, DirBuilder, Permissions};
@@ -14,12 +18,17 @@ use std::time::{Duration, Instant};
 
 const API_VERSION: u64 = 1;
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_MESSAGE: usize = 4096;
+const MAX_MESSAGE: usize = 2 * 1024 * 1024;
 const HELP: &str = "Want Gates local control service
 
 Usage:
   wgates serve [--socket PATH] [--state-dir PATH]
   wgates status [--socket PATH]
+  wgates group create --name NAME [--socket PATH]
+  wgates group list|show ID|update ID --name NAME|delete ID [--socket PATH]
+  wgates connection import --group ID --name NAME --protocol vless --file PATH|-
+  wgates connection list [--group ID] [--sort group|name]
+  wgates connection show ID|update ID [--name NAME] [--group ID] [--file PATH|-]|delete ID
   wgates --version
 
 Defaults:
@@ -55,6 +64,9 @@ fn run() -> io::Result<()> {
         }
         println!("wgates {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
+    }
+    if command == "group" || command == "connection" {
+        return management::run(command.to_str().unwrap(), args);
     }
     if command != "serve" && command != "status" {
         return Err(invalid("unknown command; run wgates --help"));
@@ -157,6 +169,7 @@ fn serve(socket: &Path, state: &Path) -> io::Result<()> {
         .ok_or_else(|| invalid("socket must have a parent directory"))?;
     secure_directory(parent, 0o750, 0o027)?;
     secure_directory(state, 0o700, 0o077)?;
+    let mut store = store::Store::open(state)?;
     let listener = UnixListener::bind(socket).map_err(|error| {
         io::Error::new(
             error.kind(),
@@ -178,11 +191,11 @@ fn serve(socket: &Path, state: &Path) -> io::Result<()> {
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&stopping))?;
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&stopping))?;
     eprintln!("wgates: control service ready at {}", socket.display());
-    // shortcut: serialize bounded status requests; add concurrency when operations can block on VPN work.
+    // shortcut: serialize bounded local operations; add concurrency when operations block on VPN work.
     while !stopping.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                if let Err(error) = handle(&mut stream) {
+                if let Err(error) = handle(&mut stream, &mut store) {
                     eprintln!("wgates: local request failed: {error}");
                 }
             }
@@ -243,7 +256,7 @@ fn read_message(stream: &mut UnixStream) -> io::Result<Value> {
         let end = buffer[..count].iter().position(|byte| *byte == b'\n');
         let length = end.unwrap_or(count);
         if message.len() + length > MAX_MESSAGE {
-            return Err(invalid("local API message exceeds 4096 bytes"));
+            return Err(invalid("local API message exceeds 2 MiB"));
         }
         message.extend_from_slice(&buffer[..length]);
         if let Some(end) = end {
@@ -265,11 +278,15 @@ fn write_message(stream: &mut UnixStream, value: &Value) -> io::Result<()> {
                 format!("setting local write timeout: {error}"),
             )
         })?;
-    serde_json::to_writer(&mut *stream, value)?;
+    let bytes = serde_json::to_vec(value)?;
+    if bytes.len() > MAX_MESSAGE {
+        return Err(invalid("local API message exceeds 2 MiB"));
+    }
+    stream.write_all(&bytes)?;
     stream.write_all(b"\n")
 }
 
-fn handle(stream: &mut UnixStream) -> io::Result<()> {
+fn handle(stream: &mut UnixStream, store: &mut store::Store) -> io::Result<()> {
     stream.set_nonblocking(false)?;
     let response = match read_message(stream) {
         Err(_) => json!({"api_version": API_VERSION, "error": "invalid or incomplete request"}),
@@ -277,7 +294,13 @@ fn handle(stream: &mut UnixStream) -> io::Result<()> {
             json!({"api_version": API_VERSION, "error": "incompatible API version; expected 1"})
         }
         Ok(request) if request["command"].as_str() != Some("status") => {
-            json!({"api_version": API_VERSION, "error": "unsupported command"})
+            match store.dispatch(&request) {
+                Ok(mut response) => {
+                    response["api_version"] = json!(API_VERSION);
+                    response
+                }
+                Err(error) => json!({"api_version": API_VERSION, "error": error.to_string()}),
+            }
         }
         Ok(_) => json!({
             "api_version": API_VERSION,

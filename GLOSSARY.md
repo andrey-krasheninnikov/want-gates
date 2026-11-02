@@ -1,7 +1,7 @@
 # Want Gates glossary
 
-These terms describe the agreed design. The local control service is implemented;
-VPN routing remains planned.
+These terms describe the agreed design. The local control service, group management, and
+VLESS profile storage are implemented. VPN routing remains planned.
 
 | Term | Meaning |
 | --- | --- |
@@ -20,6 +20,8 @@ VPN routing remains planned.
 | Failover | Selecting an eligible fallback when a preferred connection is unavailable. |
 | Failback | Returning new connections to the primary after the required successful healthchecks. Existing sessions may be interrupted by path changes or Xray restarts. |
 | Network namespace | An isolated Linux network environment for an individual system VPN client, with separate interfaces, routes, and DNS handling. |
+| Structural validation | Checking profile syntax and required field structure without executing Xray or proving compatibility, authentication, or connectivity. |
+| Object revision | A saved object version used to reject stale updates and deletion requests. Renaming and moving retain the object ID. |
 | Desired state | The configuration requested by the operator and saved for application. It may differ from the running state after a failed apply. |
 | Running state | The configuration and connections actually active on the gateway. |
 | Apply plan | A validated preview of proposed changes to Want Gates and its managed 3x-ui settings. |
