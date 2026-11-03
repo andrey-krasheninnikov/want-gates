@@ -46,9 +46,22 @@ fn remaining(deadline: Instant) -> io::Result<Duration> {
         .checked_duration_since(Instant::now())
         .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "probe timed out"))
 }
-fn receive(stream: &mut TcpStream, buffer: &mut [u8], deadline: Instant) -> io::Result<()> {
-    stream.set_read_timeout(Some(remaining(deadline)?))?;
-    stream.read_exact(buffer)
+fn receive(stream: &mut TcpStream, mut buffer: &mut [u8], deadline: Instant) -> io::Result<()> {
+    while !buffer.is_empty() {
+        stream.set_read_timeout(Some(remaining(deadline)?))?;
+        match stream.read(buffer) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "probe connection closed",
+                ));
+            }
+            Ok(n) => buffer = &mut buffer[n..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 fn send(stream: &mut TcpStream, buffer: &[u8], deadline: Instant) -> io::Result<()> {
     stream.set_write_timeout(Some(remaining(deadline)?))?;
@@ -392,6 +405,11 @@ pub fn check(
                 } else {
                     let resolver = crate::policy::Resolver::parse(server)?;
                     if matrix[&group.id]
+                        .get(&resolver.capability())
+                        .is_some_and(|v| v == "configured_limit")
+                    {
+                        "configured_limit".to_owned()
+                    } else if matrix[&group.id]
                         .get(&resolver.capability())
                         .is_none_or(|v| v != "verified")
                     {

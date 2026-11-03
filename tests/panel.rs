@@ -782,3 +782,55 @@ fn unreadable_verification_does_not_hide_routing_status_or_overwrite_evidence() 
     assert_eq!(status["data"]["last_observation"]["state"], "blocked");
     assert_eq!(std::fs::read(&path).unwrap(), b"invalid verification");
 }
+
+#[test]
+fn disabled_dns_transport_has_the_same_reason_after_apply_and_verify() {
+    let s = Service::start();
+    let p = Panel::start();
+    let (group, _) = configured_rule(&s, &p);
+    let id = ok(&s, &["connection", "import", "--group", &group, "--name", "Disabled", "--protocol", "vless", "--file", "-", "--capabilities", "none", "--dns", "udp://10.40.0.53:53"], Some("vless://00000000-0000-4000-8000-000000000001@127.0.0.1:443?encryption=none&security=none"))["data"]["id"].as_str().unwrap().to_owned();
+    ok(
+        &s,
+        &[
+            "group",
+            "update",
+            &group,
+            "--primary",
+            &id,
+            "--probe-file",
+            "-",
+        ],
+        Some(r#"{"dns":{"query_name":"health.corp.test","query_type":"A"}}"#),
+    );
+    ok(
+        &s,
+        &[
+            "rule",
+            "create",
+            "--group",
+            &group,
+            "--destination",
+            "corp.test",
+        ],
+        None,
+    );
+    let preview = ok(&s, &["routing", "preview"], None);
+    let applied = ok(
+        &s,
+        &[
+            "routing",
+            "apply",
+            preview["data"]["plan_id"].as_str().unwrap(),
+        ],
+        None,
+    );
+    assert_eq!(
+        applied["data"]["capabilities"][&group]["dns"],
+        "configured_limit"
+    );
+    let after_apply =
+        ok(&s, &["connection", "show", &id], None)["data"]["verification"]["dns"].clone();
+    let verified = ok(&s, &["connection", "verify", &id], None);
+    assert_eq!(verified["data"]["verification"]["dns"], after_apply);
+    assert_eq!(after_apply["state"], "unsupported");
+}

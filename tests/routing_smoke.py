@@ -119,7 +119,13 @@ def resource(events):
                                         head=receive(connection,2)
                                         query=receive(connection,struct.unpack('!H',head)[0])
                                         result=dns_reply(query,peer,'dns-tcp')
-                                        if result:connection.sendall(struct.pack('!H',len(result))+result)
+                                        if result:
+                                            connection.sendall(struct.pack('!H',len(result)))
+                                            if b'\x04slow\x04corp\x04test' in query:
+                                                # A steady trickle must not reset the probe's total deadline.
+                                                for byte in result:
+                                                    connection.sendall(bytes([byte]));time.sleep(0.2)
+                                            else:connection.sendall(result)
                                 except (OSError,EOFError):pass
                         threading.Thread(target=exchange,daemon=True).start()
             threading.Thread(target=answer,daemon=True).start()
@@ -634,6 +640,17 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
         assert all(e['peer']=='10.212.0.1' for e in evidence),evidence
         recorded=[json.loads(line) for line in events.read_text().splitlines()]
         assert not any(e['marker'] in blocked_capabilities+[denied] for e in recorded),'unsupported traffic or DNS escaped'
+        control('group','update',groups['a'],'--probe-file','-',payload=probes(220,'slow.corp.test'))
+        preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+        started=time.monotonic();slow=control('connection','verify',reserve)['data']['verification']
+        assert time.monotonic()-started<8,'TCP DNS exceeded its total deadline'
+        assert slow['capabilities']['tcp_ipv4']['state']=='verified' and slow['dns']['reason']=='probe_failed',slow
+        deadline=time.monotonic()+2
+        while control('routing','status')['data']['busy']:
+            assert time.monotonic()<deadline,'verification worker remained busy';time.sleep(0.01)
+        control('group','update',groups['a'],'--probe-file','-',payload=probes(220,'health.corp.test'))
+        assert control('connection','show',reserve)['data']['verification']['stale'] is True
+        print('slow TCP DNS respects the total deadline and releases the verification worker')
         control('connection','update',reserve,'--capabilities','all','--dns','udp://[fd42:220::10]:15353')
         preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
         print('per-connection verification, credential failure, TCP-only and IPv4-only routing, DNS transport requirements and blocked packet evidence passed')
