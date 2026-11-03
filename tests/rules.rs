@@ -110,7 +110,7 @@ fn invalid_rules_and_probe_changes_do_not_save_partial_state() {
     let group = ok(&s, &["group", "create", "--name", "Company"], None)["data"].clone();
     let id = group["id"].as_str().unwrap();
     for destination in [
-        "example.org",
+        "https://example.org",
         "10.0.0.1/33",
         "fd00::1/129",
         "::ffff:10.0.0.1",
@@ -190,4 +190,134 @@ fn unsafe_routing_directory_is_rejected_without_removing_it() {
     }
     assert!(routing.is_symlink());
     assert!(target.is_dir());
+}
+
+#[test]
+fn connection_dns_is_explicit_and_survives_restart() {
+    let mut s = Service::start();
+    let group = ok(&s, &["group", "create", "--name", "DNS company"], None)["data"].clone();
+    let id = group["id"].as_str().unwrap();
+    let connection = ok(&s, &["connection", "import", "--group", id, "--name", "Primary", "--protocol", "vless", "--file", "-", "--dns", "tcp://[fd42::53]:5353"], Some("vless://00000000-0000-4000-8000-000000000001@127.0.0.1:443?encryption=none&security=none"))["data"].clone();
+    let cid = connection["id"].as_str().unwrap();
+    assert_eq!(connection["dns"], "tcp://[fd42::53]:5353");
+    assert!(s.stop().success());
+    s.start_again();
+    assert_eq!(
+        ok(&s, &["connection", "show", cid], None)["data"]["dns"],
+        connection["dns"]
+    );
+    for server in [
+        "https://1.1.1.1/dns-query",
+        "udp://dns.example:53",
+        "udp://10.0.0.1:0",
+        "tcp://user:secret@10.0.0.1:53",
+        "udp://10.0.0.1:53/path",
+    ] {
+        assert!(
+            !run(&s, &["connection", "update", cid, "--dns", server], None)
+                .status
+                .success()
+        );
+        assert_eq!(
+            ok(&s, &["connection", "show", cid], None)["data"]["dns"],
+            connection["dns"]
+        );
+    }
+    assert!(ok(&s, &["connection", "update", cid, "--dns", "-"], None)["data"]["dns"].is_null());
+}
+
+#[test]
+fn domain_rules_are_canonical_and_conflicts_identify_both_groups() {
+    let mut s = Service::start();
+    let a = ok(&s, &["group", "create", "--name", "Company A"], None)["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let b = ok(&s, &["group", "create", "--name", "Company B"], None)["data"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let rule = ok(
+        &s,
+        &[
+            "rule",
+            "create",
+            "--group",
+            &a,
+            "--destination",
+            "BÜCHER.Example.",
+        ],
+        None,
+    )["data"]
+        .clone();
+    assert_eq!(rule["destination"], "xn--bcher-kva.example");
+    let conflict = run(
+        &s,
+        &[
+            "rule",
+            "create",
+            "--group",
+            &b,
+            "--destination",
+            "xn--bcher-kva.example",
+        ],
+        None,
+    );
+    assert!(!conflict.status.success());
+    let error = String::from_utf8_lossy(&conflict.stderr);
+    for expected in [&a, &b, "Company A", "Company B"] {
+        assert!(error.contains(expected), "{error}");
+    }
+    ok(
+        &s,
+        &[
+            "rule",
+            "create",
+            "--group",
+            &b,
+            "--destination",
+            "full:xn--bcher-kva.example",
+        ],
+        None,
+    );
+    ok(
+        &s,
+        &[
+            "rule",
+            "create",
+            "--group",
+            &b,
+            "--destination",
+            "dev.xn--bcher-kva.example",
+        ],
+        None,
+    );
+    for invalid in [
+        "*.example.com",
+        "a..example",
+        "-a.example",
+        "https://example.com",
+        "full:127.0.0.1",
+        "a%2eb.example",
+        "regex:.*",
+        "example.com/path",
+        "example.com ",
+    ] {
+        assert!(
+            !run(
+                &s,
+                &["rule", "create", "--group", &a, "--destination", invalid],
+                None
+            )
+            .status
+            .success(),
+            "{invalid}"
+        );
+    }
+    assert!(s.stop().success());
+    s.start_again();
+    assert_eq!(
+        ok(&s, &["rule", "show", rule["id"].as_str().unwrap()], None)["data"],
+        rule
+    );
 }

@@ -226,12 +226,25 @@ impl Client {
         Ok(())
     }
     pub fn route(&self, inbound: &str, ip: &str, network: &str, port: u16) -> io::Result<String> {
+        self.route_context(inbound, ip, None, None, network, port)
+    }
+    pub fn route_context(
+        &self,
+        inbound: &str,
+        ip: &str,
+        domain: Option<&str>,
+        email: Option<&str>,
+        network: &str,
+        port: u16,
+    ) -> io::Result<String> {
         let port = port.to_string();
         let result = self.request(
             "xray/routeTest",
             Some(&[
                 ("inboundTag", inbound),
                 ("ip", ip),
+                ("domain", domain.unwrap_or("")),
+                ("email", email.unwrap_or("")),
                 ("network", network),
                 ("port", &port),
             ]),

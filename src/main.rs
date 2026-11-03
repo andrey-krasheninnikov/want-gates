@@ -1,3 +1,4 @@
+mod domain;
 mod management;
 mod panel;
 mod policy;
@@ -32,12 +33,12 @@ Usage:
   wgates group create --name NAME [--socket PATH]
   wgates group list|show ID|delete ID [--socket PATH]
   wgates group update ID [--name NAME] [--primary CONNECTION_ID|-] [--probe-file PATH|-]
-  wgates connection import --group ID --name NAME --protocol vless --file PATH|-
+  wgates connection import --group ID --name NAME --protocol vless --file PATH|- [--dns URI]
   wgates connection list [--group ID] [--sort group|name]
-  wgates connection show ID|update ID [--name NAME] [--group ID] [--file PATH|-]|delete ID
-  wgates rule create --group ID --destination IP_OR_CIDR
+  wgates connection show ID|update ID [--name NAME] [--group ID] [--file PATH|-] [--dns URI|-]|delete ID
+  wgates rule create --group ID --destination DOMAIN_OR_IP_OR_CIDR
   wgates rule list [--group ID]
-  wgates rule show ID|update ID [--group ID] [--destination IP_OR_CIDR]|delete ID
+  wgates rule show ID|update ID [--group ID] [--destination DOMAIN_OR_IP_OR_CIDR]|delete ID
   wgates panel configure --file PATH|-
   wgates panel preflight
   wgates routing preview|status

@@ -4,14 +4,15 @@
 
 Network routing and tunnel management for an existing 3x-ui gateway.
 
-Want Gates is planned to route traffic from VLESS clients through outgoing
-VPN connections selected by destination domains, IP addresses, and CIDR ranges.
-Connections are organized into company groups with a primary and ordered
-fallbacks.
+Want Gates routes traffic from VLESS clients through outgoing VLESS connections
+selected by destination domains, IP addresses, and CIDR ranges. Connections
+are organized into company groups with an explicit primary. Ordered fallbacks
+remain planned.
 
 ## Status
 
-The Rust binary manages groups, VLESS profiles and IP/CIDR rules through a Unix
+The Rust binary manages groups, VLESS profiles, domain/IP rules and connection
+DNS through a Unix
 socket. A preview and explicit apply configure 3x-ui 3.8.5 with Xray 26.9.9.
 TCP/UDP over IPv4/IPv6 are verified separately; unavailable combinations are
 blocked. See [service operation](docs/service.md) and
@@ -20,7 +21,7 @@ blocked. See [service operation](docs/service.md) and
 Both `vless://` and complete outbound JSON imports are supported. Import checks
 structure; apply checks the panel and actual traffic. The isolated local
 Linux/arm64 stand exercises two groups and the complete VLESS ingress path.
-Native authentication, domain routing, continuous health/fallback, bootstrap,
+Native authentication, continuous health/fallback, bootstrap,
 the skill package and panel UI remain planned. No binary release is published.
 
 ## Planned routing model
@@ -43,7 +44,6 @@ capabilities. Ambiguous rules of equal specificity are rejected.
 - OpenVPN, Forti through openfortivpn, and WireGuard.
 - NetBird private-network routes and exit nodes.
 - Profile import and native authentication, including supported MFA/SSO flows.
-- Connection-specific DNS for public and private destinations.
 - Target-resource healthchecks, ordered failover, and automatic failback.
 
 Default healthchecks run every 30 seconds with a 5-second timeout. Three

@@ -1,4 +1,4 @@
-use crate::policy::{Network, Probes, Rule};
+use crate::policy::{Probes, Resolver, Rule, destination};
 use crate::{invalid, secure_directory};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -33,6 +33,8 @@ pub struct Connection {
     pub protocol: String,
     pub revision: u64,
     pub profile_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -169,6 +171,11 @@ impl Store {
                     "invalid saved connection references; state was retained",
                 ));
             }
+            if let Some(dns) = &connection.dns
+                && Resolver::parse(dns)?.canonical() != *dns
+            {
+                return Err(invalid("invalid saved connection DNS; state was retained"));
+            }
             let bytes = private_read(&secrets.join(&connection.profile_ref), MAX_PROFILE)?;
             let input = std::str::from_utf8(&bytes)
                 .map_err(|_| invalid("invalid saved profile; state was retained"))?;
@@ -195,7 +202,7 @@ impl Store {
                 || !ids.insert(&rule.id)
                 || !destinations.insert(&rule.destination)
                 || !config.groups.iter().any(|g| g.id == rule.group_id)
-                || Network::parse(&rule.destination)?.canonical() != rule.destination
+                || destination(&rule.destination)? != rule.destination
             {
                 return Err(invalid("invalid saved routing rule; state was retained"));
             }
@@ -269,8 +276,15 @@ impl Store {
             "rule.delete" => &["id", "expected_revision"],
             "group.delete" | "connection.delete" => &["id", "expected_revision"],
             "connection.list" => &["group_id", "sort", "offset", "list_revision"],
-            "connection.import" => &["name", "group_id", "protocol", "profile"],
-            "connection.update" => &["id", "expected_revision", "name", "group_id", "profile"],
+            "connection.import" => &["name", "group_id", "protocol", "profile", "dns"],
+            "connection.update" => &[
+                "id",
+                "expected_revision",
+                "name",
+                "group_id",
+                "profile",
+                "dns",
+            ],
             _ => return Err(invalid("unsupported command")),
         };
         if request.as_object().is_none_or(|m| {
@@ -415,19 +429,25 @@ impl Store {
                         rule.group_id = text(value)?.to_owned();
                     }
                     if let Some(value) = request.get("destination") {
-                        rule.destination = Network::parse(text(value)?)?.canonical();
+                        rule.destination = destination(text(value)?)?;
                     }
                     if rule.destination.is_empty()
                         || !config.groups.iter().any(|g| g.id == rule.group_id)
                     {
                         return Err(invalid("rule requires a valid group and destination"));
                     }
-                    if config
+                    if let Some(other) = config
                         .rules
                         .iter()
-                        .any(|r| r.id != rule.id && r.destination == rule.destination)
+                        .find(|r| r.id != rule.id && r.destination == rule.destination)
                     {
-                        return Err(invalid("destination rule already exists"));
+                        let group = |id: &str| config.groups.iter().find(|g| g.id == id).unwrap();
+                        let a = group(&other.group_id);
+                        let b = group(&rule.group_id);
+                        return Err(invalid(&format!(
+                            "destination rule already exists: {} ({}) conflicts with {} ({})",
+                            a.name, a.id, b.name, b.id
+                        )));
                     }
                     if command == "rule.update"
                         && ["group_id", "destination"]
@@ -509,6 +529,7 @@ impl Store {
                     protocol: "vless".to_owned(),
                     revision,
                     profile_ref: format!("c{revision}-r{revision}.json"),
+                    dns: dns_setting(request.get("dns"))?,
                 };
                 new_profile = Some((connection.profile_ref.clone(), profile));
                 config.connections.push(connection.clone());
@@ -544,7 +565,7 @@ impl Store {
                 if command == "connection.delete" {
                     summary(&config.connections.remove(index))
                 } else {
-                    if ["name", "group_id", "profile"]
+                    if ["name", "group_id", "profile", "dns"]
                         .iter()
                         .all(|k| request.get(k).is_none())
                     {
@@ -569,6 +590,9 @@ impl Store {
                         let profile = crate::profile::parse(text(value)?)?;
                         connection.profile_ref = format!("{id}-r{revision}.json");
                         new_profile = Some((connection.profile_ref.clone(), profile));
+                    }
+                    if request.get("dns").is_some() {
+                        connection.dns = dns_setting(request.get("dns"))?;
                     }
                     connection.revision = revision;
                     config.connections[index] = connection.clone();
@@ -677,6 +701,13 @@ fn profile_filename(name: &str) -> bool {
         .iter()
         .all(|s| s.is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())))
 }
+fn dns_setting(value: Option<&Value>) -> io::Result<Option<String>> {
+    value
+        .filter(|v| !v.is_null())
+        .map(|v| Resolver::parse(text(v)?).map(|r| r.canonical()))
+        .transpose()
+}
+
 fn protocol(value: &Value) -> io::Result<()> {
     match text(value)? {
         "vless" => Ok(()),
@@ -688,7 +719,7 @@ fn protocol(value: &Value) -> io::Result<()> {
 }
 fn summary(c: &Connection) -> Value {
     json!({"id":c.id,"group_id":c.group_id,"name":c.name,"protocol":c.protocol,"revision":c.revision,
-        "validation":"structural","authentication":"not_attempted"})
+        "dns":c.dns,"validation":"structural","authentication":"not_attempted"})
 }
 
 fn id_number(id: &str, prefix: char) -> Option<u64> {
