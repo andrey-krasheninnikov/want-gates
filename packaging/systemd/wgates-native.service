@@ -1,0 +1,31 @@
+[Unit]
+Description=Want Gates native connection runtime
+BindsTo=wgates.service
+PartOf=wgates.service
+Before=wgates.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=root
+Group=wgates
+ExecStart=/usr/local/bin/wgates native-runtime --socket /run/wgates-native/control.sock --state-dir /var/lib/wgates-native --service-user wgates
+ExecStopPost=/usr/local/bin/wgates native-cleanup --socket /run/wgates-native/control.sock --state-dir /var/lib/wgates-native --service-user wgates
+RuntimeDirectory=wgates-native
+RuntimeDirectoryMode=0750
+StateDirectory=wgates-native
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=120s
+TimeoutStopSec=30s
+KillMode=control-group
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN CAP_SETUID CAP_SETGID CAP_SETPCAP CAP_CHOWN CAP_KILL
+AmbientCapabilities=CAP_SETUID
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LimitCORE=0
+
+[Install]
+WantedBy=wgates.service

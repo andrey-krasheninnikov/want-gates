@@ -142,6 +142,20 @@ pub fn validate(input: &Input, base: &Snapshot) -> io::Result<()> {
                 ));
             }
         }
+        if profile["protocol"] == "openvpn"
+            && let Some(options) = profile["options"].as_array()
+        {
+            for option in options.iter().filter(|o| o[0] == "remote") {
+                if let Some(address) = option[1].as_str()
+                    && let Ok(name) = domain_name(address)
+                    && winner(&input.config, &name).is_some()
+                {
+                    return Err(invalid(
+                        "OpenVPN server name overlaps a protected domain; avoid a DNS bootstrap cycle",
+                    ));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -191,7 +205,7 @@ pub fn render(
             let v4 = allowed(matrix, &group.id, &format!("{protocol}_ipv4"));
             let v6 = allowed(matrix, &group.id, &format!("{protocol}_ipv6"));
             if usable(&input.config, group, matrix) && (v4 || v6) {
-                let mut outbound = input.profiles[&connection.id].clone();
+                let mut outbound = crate::routing::outbound(input, &connection.id, false);
                 outbound["tag"] = json!(format!("wgates-domain-{}-{protocol}", connection.id));
                 outbound["targetStrategy"] = json!(match (v4, v6) {
                     (true, true) => "ForceIP",

@@ -4,14 +4,14 @@
 
 Network routing and tunnel management for an existing 3x-ui gateway.
 
-Want Gates routes traffic from VLESS clients through outgoing VLESS connections
+Want Gates routes traffic from VLESS clients through outgoing VLESS or isolated OpenVPN connections
 selected by destination domains, IP addresses, and CIDR ranges. Connections
 are organized into company groups with an explicit primary and ordered fallbacks.
 Optional target-resource checks switch data and DNS together within a group.
 
 ## Status
 
-The Rust binary manages groups, VLESS profiles, domain/IP rules and connection
+The Rust binary manages groups, VLESS/OpenVPN profiles, domain/IP rules and connection
 DNS through a Unix
 socket. A preview and explicit apply configure 3x-ui 3.8.5 with Xray 26.9.9.
 TCP/UDP over IPv4/IPv6 are verified separately; unavailable combinations are
@@ -22,8 +22,9 @@ without changing primary. See [service operation](docs/service.md) and
 Both `vless://` and complete outbound JSON imports are supported. Import checks
 structure; apply checks the panel and actual traffic. The isolated local
 Linux/arm64 stand exercises two groups and the complete VLESS ingress path.
-Native authentication, bootstrap,
-the skill package and panel UI remain planned. No binary release is published.
+OpenVPN uses an optional privileged helper for isolated native authentication and
+routing. See [OpenVPN operation](docs/openvpn.md). Bootstrap, the skill package
+and panel UI remain planned. No binary release is published.
 
 ## Routing model
 
@@ -42,10 +43,10 @@ capabilities. Ambiguous rules of equal specificity are rejected.
 ## Connections and checks
 
 - Outgoing VLESS through Xray.
-- OpenVPN, Forti through openfortivpn, and WireGuard.
-- NetBird private-network routes and exit nodes.
+- Isolated OpenVPN with certificate, password and supported native MFA/SSO authentication.
+- Planned: Forti through openfortivpn, WireGuard and NetBird.
 - Profile import and native authentication, including supported MFA/SSO flows.
-- TCP, HTTP and HTTPS target checks, ordered failover, and stable failback for VLESS.
+- TCP, HTTP and HTTPS target checks, ordered failover, and stable failback within a group.
 
 Default healthchecks run every 30 seconds with a 5-second timeout. Three
 consecutive failures mark a connection unavailable; five consecutive successes

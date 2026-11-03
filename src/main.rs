@@ -2,6 +2,12 @@ mod capability;
 mod domain;
 mod health;
 mod management;
+mod native;
+#[cfg(target_os = "linux")]
+mod native_runtime;
+mod openvpn;
+#[cfg(target_os = "linux")]
+mod openvpn_auth;
 mod panel;
 mod policy;
 mod probe;
@@ -30,13 +36,15 @@ const MAX_MESSAGE: usize = 4 * 1024 * 1024;
 const HELP: &str = "Want Gates local control service
 
 Usage:
-  wgates serve [--socket PATH] [--state-dir PATH]
+  wgates serve [--socket PATH] [--state-dir PATH] [--native-socket PATH]
   wgates status [--socket PATH]
   wgates group create --name NAME [--socket PATH]
   wgates group list|show ID|delete ID [--socket PATH]
   wgates group update ID [--name NAME] [--primary CONNECTION_ID|-] [--probe-file PATH|-] [--fallbacks ID,...|-] [--healthcheck-file PATH|-]
-  wgates connection import --group ID --name NAME --protocol vless --file PATH|- [--dns URI] [--capabilities LIST|all|none]
+  wgates connection import --group ID --name NAME --protocol vless|openvpn --file PATH|- [--dns URI] [--capabilities LIST|all|none]
   wgates connection verify ID
+  wgates connection login ID [--file PATH|-] [--remember]
+  wgates connection logout ID|restart ID|forget-auth ID
   wgates connection list [--group ID] [--sort group|name]
   wgates connection show ID|update ID [--name NAME] [--group ID] [--file PATH|-] [--dns URI|-] [--capabilities LIST|all|none]|delete ID
   wgates rule create --group ID --destination DOMAIN_OR_IP_OR_CIDR
@@ -54,6 +62,7 @@ Routing requires 3x-ui 3.8.5 and Xray 26.9.9; apply explicitly names a reviewed 
 Defaults:
   --socket     /run/wgates/control.sock
   --state-dir  /var/lib/wgates
+  --native-socket /run/wgates-native/control.sock
 
 Paths must be absolute. Status reports control-service readiness, not VPN health.
 ";
@@ -85,6 +94,16 @@ fn run() -> io::Result<()> {
         println!("wgates {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    if command == "native-runtime" || command == "native-cleanup" {
+        #[cfg(target_os = "linux")]
+        {
+            return native_runtime::run(args, command == "native-cleanup");
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(invalid("native runtime requires Linux"));
+        }
+    }
     if command == "group"
         || command == "connection"
         || command == "rule"
@@ -98,6 +117,7 @@ fn run() -> io::Result<()> {
     }
     let mut socket = PathBuf::from("/run/wgates/control.sock");
     let mut state = PathBuf::from("/var/lib/wgates");
+    let mut native_socket = PathBuf::from(native::DEFAULT_SOCKET);
     while let Some(option) = args.next() {
         if option == "--help" || option == "-h" {
             print!("{HELP}");
@@ -107,6 +127,8 @@ fn run() -> io::Result<()> {
             &mut socket
         } else if option == "--state-dir" && command == "serve" {
             &mut state
+        } else if option == "--native-socket" && command == "serve" {
+            &mut native_socket
         } else {
             return Err(invalid("unknown option; run wgates --help"));
         };
@@ -119,7 +141,7 @@ fn run() -> io::Result<()> {
         }
     }
     if command == "serve" {
-        serve(&socket, &state)
+        serve(&socket, &state, &native_socket)
     } else {
         status(&socket)
     }
@@ -187,7 +209,7 @@ impl Drop for OwnedSocket {
     }
 }
 
-fn serve(socket: &Path, state: &Path) -> io::Result<()> {
+fn serve(socket: &Path, state: &Path, native_socket: &Path) -> io::Result<()> {
     let parent = socket
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -215,7 +237,7 @@ fn serve(socket: &Path, state: &Path) -> io::Result<()> {
     let stopping = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&stopping))?;
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&stopping))?;
-    let mut routing = routing::Service::new(state, Arc::clone(&stopping))?;
+    let mut routing = routing::Service::new(state, Arc::clone(&stopping), native_socket)?;
     eprintln!("wgates: control service ready at {}", socket.display());
     // Keep configuration writes serialized while network operations use one worker.
     while !stopping.load(Ordering::Relaxed) {
@@ -334,6 +356,13 @@ fn handle(
             if command.starts_with("routing.")
                 || command.starts_with("panel.")
                 || command == "connection.verify"
+                || matches!(
+                    command,
+                    "connection.login"
+                        | "connection.logout"
+                        | "connection.restart"
+                        | "connection.forget-auth"
+                )
             {
                 let response = match routing.dispatch(&request, store, stream) {
                     Ok(Some(mut response)) => {

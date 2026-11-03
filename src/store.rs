@@ -154,7 +154,7 @@ impl Store {
         }
         let mut names = std::collections::HashSet::new();
         for connection in &config.connections {
-            if connection.protocol != "vless"
+            if !matches!(connection.protocol.as_str(), "vless" | "openvpn")
                 || id_number(&connection.id, 'c').is_none_or(|n| n > connection.revision)
                 || connection.revision == 0
                 || connection.revision > config.revision
@@ -186,7 +186,7 @@ impl Store {
             let bytes = private_read(&secrets.join(&connection.profile_ref), MAX_PROFILE)?;
             let input = std::str::from_utf8(&bytes)
                 .map_err(|_| invalid("invalid saved profile; state was retained"))?;
-            crate::profile::parse(input)?;
+            crate::profile::parse_for(&connection.protocol, input)?;
         }
         for group in &config.groups {
             group.probes.validate()?;
@@ -555,12 +555,13 @@ impl Store {
                 {
                     return Err(invalid("connection name already exists in group"));
                 }
-                let profile = crate::profile::parse(text(&request["profile"])?)?;
+                let protocol = text(&request["protocol"])?;
+                let profile = crate::profile::parse_for(protocol, text(&request["profile"])?)?;
                 let connection = Connection {
                     id: format!("c{revision}"),
                     group_id: group_id.to_owned(),
                     name,
-                    protocol: "vless".to_owned(),
+                    protocol: protocol.to_owned(),
                     revision,
                     profile_ref: format!("c{revision}-r{revision}.json"),
                     dns: dns_setting(request.get("dns"))?,
@@ -620,7 +621,8 @@ impl Store {
                         return Err(invalid("connection name already exists in group"));
                     }
                     if let Some(value) = request.get("profile") {
-                        let profile = crate::profile::parse(text(value)?)?;
+                        let profile =
+                            crate::profile::parse_for(&connection.protocol, text(value)?)?;
                         connection.profile_ref = format!("{id}-r{revision}.json");
                         new_profile = Some((connection.profile_ref.clone(), profile));
                     }
@@ -774,9 +776,9 @@ fn dns_setting(value: Option<&Value>) -> io::Result<Option<String>> {
 
 fn protocol(value: &Value) -> io::Result<()> {
     match text(value)? {
-        "vless" => Ok(()),
-        "openvpn" | "forti" | "wireguard" | "netbird" => Err(invalid(
-            "protocol adapter unavailable; only VLESS profile import is implemented",
+        "vless" | "openvpn" => Ok(()),
+        "forti" | "wireguard" | "netbird" => Err(invalid(
+            "protocol adapter unavailable; only VLESS and OpenVPN profile import are implemented",
         )),
         _ => Err(invalid("unsupported protocol")),
     }
@@ -858,6 +860,7 @@ impl Store {
         Ok(crate::routing::Input {
             config: self.config.clone(),
             profiles,
+            native: Default::default(),
         })
     }
 }

@@ -9,6 +9,14 @@ use std::fmt;
 use std::io;
 use url::Url;
 
+pub fn parse_for(protocol: &str, input: &str) -> io::Result<Value> {
+    match protocol {
+        "vless" => parse(input),
+        "openvpn" => crate::openvpn::parse(input),
+        _ => Err(invalid("protocol adapter unavailable")),
+    }
+}
+
 pub fn parse(input: &str) -> io::Result<Value> {
     if input.len() > MAX_PROFILE {
         return Err(invalid("profile exceeds 1 MiB"));
