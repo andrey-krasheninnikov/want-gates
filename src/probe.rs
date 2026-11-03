@@ -9,7 +9,7 @@ use std::io::{self, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
-fn http(probe: &HttpProbe, proxy: &Proxy) -> io::Result<()> {
+fn http(probe: &HttpProbe, proxy: &Proxy, deadline: Instant) -> io::Result<()> {
     let socks = ureq::Proxy::new(&format!(
         "socks5://{}:{}@127.0.0.1:{}",
         proxy.user, proxy.password, proxy.port
@@ -19,7 +19,7 @@ fn http(probe: &HttpProbe, proxy: &Proxy) -> io::Result<()> {
         .proxy(Some(socks))
         .max_redirects(0)
         .http_status_as_error(false)
-        .timeout_global(Some(Duration::from_secs(5)))
+        .timeout_global(Some(remaining(deadline)?))
         .build()
         .into();
     let mut response = client
@@ -137,11 +137,25 @@ fn socks_reply(stream: &mut TcpStream, deadline: Instant) -> io::Result<SocketAd
     receive(stream, &mut reply[1..], deadline)?;
     Ok(address(&reply)?.0)
 }
+
 fn dns(probe: &DnsProbe, proxy: &Proxy) -> io::Result<()> {
     dns_over(probe, proxy, "udp")
 }
 fn dns_over(probe: &DnsProbe, proxy: &Proxy, network: &str) -> io::Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    dns_at(
+        probe,
+        proxy,
+        network,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .and_then(|(a, q, t)| dns_answer(&a, &q, t))
+}
+fn dns_at(
+    probe: &DnsProbe,
+    proxy: &Proxy,
+    network: &str,
+    deadline: Instant,
+) -> io::Result<(Vec<u8>, Vec<u8>, u16)> {
     let server = probe.address()?;
     let (query, query_type) = dns_query(probe)?;
     let mut stream = socks(proxy, deadline)?;
@@ -202,9 +216,10 @@ fn dns_over(probe: &DnsProbe, proxy: &Proxy, network: &str) -> io::Result<()> {
         }
         buffer[3 + offset..n].to_vec()
     };
-    dns_answer(&answer, &query, query_type)
+    dns_header(&answer, &query)?;
+    Ok((answer, query, query_type))
 }
-fn dns_answer(answer: &[u8], query: &[u8], query_type: u16) -> io::Result<()> {
+fn dns_header(answer: &[u8], query: &[u8]) -> io::Result<()> {
     // shortcut: require an uncompressed echoed question; extend for resolvers that compress it.
     if answer.len() < query.len()
         || answer[..2] != query[..2]
@@ -216,6 +231,10 @@ fn dns_answer(answer: &[u8], query: &[u8], query_type: u16) -> io::Result<()> {
     {
         return Err(invalid("DNS probe received no valid successful answer"));
     }
+    Ok(())
+}
+fn dns_answer(answer: &[u8], query: &[u8], query_type: u16) -> io::Result<()> {
+    dns_header(answer, query)?;
     let count = u16::from_be_bytes([answer[6], answer[7]]);
     let mut position = query.len();
     for _ in 0..count {
@@ -268,6 +287,16 @@ pub fn transport(
     proxy: &Proxy,
     only_verified: Option<&std::collections::BTreeMap<String, String>>,
 ) -> io::Result<std::collections::BTreeMap<String, String>> {
+    transport_at(client, connection, group, proxy, only_verified, None)
+}
+fn transport_at(
+    client: &Client,
+    connection: &crate::store::Connection,
+    group: &crate::store::Group,
+    proxy: &Proxy,
+    only_verified: Option<&std::collections::BTreeMap<String, String>>,
+    deadline: Option<Instant>,
+) -> io::Result<std::collections::BTreeMap<String, String>> {
     let group_proxy = proxy.for_connection(&connection.id, &group.id);
     let email = proxy
         .connection_users
@@ -307,7 +336,11 @@ pub fn transport(
                             {
                                 return Err(invalid("runtime route does not select primary"));
                             }
-                            http(p, &group_proxy)
+                            http(
+                                p,
+                                &group_proxy,
+                                deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(5)),
+                            )
                         })()
                     })
                 }
@@ -331,7 +364,13 @@ pub fn transport(
                             {
                                 return Err(invalid("runtime route does not select primary"));
                             }
-                            dns(p, &group_proxy)
+                            dns_at(
+                                p,
+                                &group_proxy,
+                                "udp",
+                                deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(5)),
+                            )
+                            .and_then(|(a, q, t)| dns_answer(&a, &q, t))
                         })()
                     })
                 }
@@ -461,12 +500,21 @@ pub fn connection(
     connection: &crate::store::Connection,
     proxy: &Proxy,
 ) -> io::Result<std::collections::BTreeMap<String, String>> {
+    connection_at(client, config, connection, proxy, None)
+}
+fn connection_at(
+    client: &Client,
+    config: &Config,
+    connection: &crate::store::Connection,
+    proxy: &Proxy,
+    deadline: Option<Instant>,
+) -> io::Result<std::collections::BTreeMap<String, String>> {
     let group = config
         .groups
         .iter()
         .find(|g| g.id == connection.group_id)
         .ok_or_else(|| invalid("connection group missing"))?;
-    let mut results = transport(client, connection, group, proxy, None)?;
+    let mut results = transport_at(client, connection, group, proxy, None, deadline)?;
     let reason = match (&connection.dns, &group.probes.dns) {
         (None, _) => "dns_missing".to_owned(),
         (_, None) => "probe_missing".to_owned(),
@@ -497,7 +545,7 @@ pub fn connection(
                     {
                         return Err(invalid("DNS diagnostic route does not select connection"));
                     }
-                    dns_over(
+                    dns_at(
                         &DnsProbe {
                             server: resolver.address.to_string(),
                             query_name: crate::policy::domain_name(&probe.query_name)?,
@@ -505,7 +553,9 @@ pub fn connection(
                         },
                         &proxy.for_connection(&connection.id, &group.id),
                         resolver.network,
+                        deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(5)),
                     )
+                    .and_then(|(a, q, t)| dns_answer(&a, &q, t))
                 })();
                 match result {
                     Ok(()) => "verified".into(),
@@ -515,5 +565,487 @@ pub fn connection(
         }
     };
     results.insert("dns".into(), reason);
+    Ok(results)
+}
+
+fn dns_name(bytes: &[u8], position: &mut usize) -> io::Result<String> {
+    let mut offset = *position;
+    let mut jumped = false;
+    let mut labels = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    loop {
+        if !seen.insert(offset) || seen.len() > 128 {
+            return Err(invalid("cyclic DNS name"));
+        }
+        let size = *bytes
+            .get(offset)
+            .ok_or_else(|| invalid("truncated DNS name"))?;
+        if size & 0xc0 == 0xc0 {
+            let low = *bytes
+                .get(offset + 1)
+                .ok_or_else(|| invalid("truncated DNS pointer"))?;
+            if !jumped {
+                *position = offset + 2;
+                jumped = true;
+            }
+            offset = ((size as usize & 0x3f) << 8) | low as usize;
+            continue;
+        }
+        if size & 0xc0 != 0 {
+            return Err(invalid("invalid DNS label"));
+        }
+        offset += 1;
+        if size == 0 {
+            if !jumped {
+                *position = offset;
+            }
+            break;
+        }
+        let label = bytes
+            .get(offset..offset + size as usize)
+            .ok_or_else(|| invalid("truncated DNS label"))?;
+        labels.push(
+            std::str::from_utf8(label)
+                .map_err(|_| invalid("invalid DNS name"))?
+                .to_ascii_lowercase(),
+        );
+        offset += size as usize;
+        if labels.len() > 127 {
+            return Err(invalid("DNS name exceeds limit"));
+        }
+    }
+    crate::policy::domain_name(&labels.join("."))
+}
+fn lookup(
+    name: &str,
+    kind: &str,
+    resolver: &crate::policy::Resolver,
+    proxy: &Proxy,
+    deadline: Instant,
+) -> io::Result<Vec<IpAddr>> {
+    let mut name = crate::policy::domain_name(name)?;
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..8 {
+        if !seen.insert(name.clone()) {
+            return Err(invalid("cyclic DNS alias"));
+        }
+        let (answer, query, typ) = dns_at(
+            &DnsProbe {
+                server: resolver.address.to_string(),
+                query_name: name.clone(),
+                query_type: kind.into(),
+            },
+            proxy,
+            resolver.network,
+            deadline,
+        )?;
+        let mut offset = query.len();
+        let mut aliases = std::collections::BTreeMap::new();
+        let mut records = Vec::new();
+        for _ in 0..u16::from_be_bytes([answer[6], answer[7]]) {
+            let owner = dns_name(&answer, &mut offset)?;
+            let header = answer
+                .get(offset..offset + 10)
+                .ok_or_else(|| invalid("truncated DNS record"))?;
+            let record_type = u16::from_be_bytes([header[0], header[1]]);
+            let size = u16::from_be_bytes([header[8], header[9]]) as usize;
+            offset += 10;
+            let data = answer
+                .get(offset..offset + size)
+                .ok_or_else(|| invalid("truncated DNS record"))?;
+            if header[2..4] == [0, 1] {
+                if record_type == 5 {
+                    let mut p = offset;
+                    let canonical = dns_name(&answer, &mut p)?;
+                    if p != offset + size {
+                        return Err(invalid("invalid CNAME data"));
+                    }
+                    aliases.insert(owner, canonical);
+                } else if record_type == typ {
+                    let ip = match (typ, size) {
+                        (1, 4) => Some(IpAddr::from(<[u8; 4]>::try_from(data).unwrap())),
+                        (28, 16) => Some(IpAddr::from(<[u8; 16]>::try_from(data).unwrap())),
+                        _ => None,
+                    };
+                    if let Some(ip) = ip {
+                        records.push((owner, ip));
+                    }
+                }
+            }
+            offset += size;
+        }
+        let mut canonical = name.clone();
+        let mut chain = std::collections::BTreeSet::new();
+        while let Some(next) = aliases.get(&canonical) {
+            if !chain.insert(canonical.clone()) || chain.len() > 8 {
+                return Err(invalid("cyclic DNS alias"));
+            }
+            canonical = next.clone();
+        }
+        let ips: Vec<_> = records
+            .into_iter()
+            .filter(|(owner, ip)| {
+                owner == &canonical
+                    && !ip.is_unspecified()
+                    && !ip.is_multicast()
+                    && !matches!(ip,IpAddr::V6(a) if a.to_ipv4_mapped().is_some())
+            })
+            .map(|(_, ip)| ip)
+            .take(16)
+            .collect();
+        if !ips.is_empty() {
+            return Ok(ips);
+        }
+        if canonical == name {
+            return Err(invalid("DNS returned no address for target"));
+        }
+        name = canonical;
+    }
+    Err(invalid("DNS alias limit exceeded"))
+}
+#[derive(Debug, Clone)]
+struct PinnedResolver {
+    host: String,
+    addresses: Vec<SocketAddr>,
+}
+impl ureq::unversioned::resolver::Resolver for PinnedResolver {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        _: &ureq::config::Config,
+        _: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        let host = uri
+            .host()
+            .ok_or(ureq::Error::HostNotFound)?
+            .trim_matches(['[', ']']);
+        let port = uri
+            .port_u16()
+            .or_else(|| match uri.scheme_str() {
+                Some("http") => Some(80),
+                Some("https") => Some(443),
+                _ => None,
+            })
+            .ok_or(ureq::Error::HostNotFound)?;
+        let mut addresses = self.empty();
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            addresses.push(SocketAddr::new(ip, port));
+        } else if host.eq_ignore_ascii_case(&self.host) {
+            for address in &self.addresses {
+                addresses.push(*address);
+            }
+        }
+        if addresses.is_empty() {
+            Err(ureq::Error::HostNotFound)
+        } else {
+            Ok(addresses)
+        }
+    }
+}
+fn tls_cause(error: &ureq::Error) -> Option<&rustls::Error> {
+    match error {
+        ureq::Error::Rustls(error) => Some(error),
+        ureq::Error::Io(error) => error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<rustls::Error>()),
+        _ => None,
+    }
+}
+fn target_http(
+    check: &crate::health::Healthcheck,
+    proxy: &Proxy,
+    addresses: &[SocketAddr],
+    deadline: Instant,
+) -> io::Result<()> {
+    let url = url::Url::parse(&check.target).map_err(|_| invalid("invalid target"))?;
+    let pinned = PinnedResolver {
+        host: url.host_str().unwrap().into(),
+        addresses: addresses.to_vec(),
+    };
+    let mut extra_roots = check.ca_pem.is_some();
+    loop {
+        let mut config = ureq::Agent::config_builder()
+            .proxy(Some(
+                ureq::Proxy::new(&format!(
+                    "socks5://{}:{}@127.0.0.1:{}",
+                    proxy.user, proxy.password, proxy.port
+                ))
+                .map_err(|_| invalid("invalid probe proxy"))?,
+            ))
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .timeout_global(Some(remaining(deadline)?));
+        if extra_roots {
+            config = config.tls_config(
+                ureq::tls::TlsConfig::builder()
+                    .root_certs(crate::health::certificates(check.ca_pem.as_ref().unwrap())?.into())
+                    .build(),
+            );
+        }
+        let client = ureq::Agent::with_parts(
+            config.build(),
+            ureq::unversioned::transport::DefaultConnector::default(),
+            pinned.clone(),
+        );
+        let response = client.get(&check.target).call();
+        let mut response = match response {
+            Err(ref error)
+                if extra_roots
+                    && matches!(
+                        tls_cause(error),
+                        Some(rustls::Error::InvalidCertificate(
+                            rustls::CertificateError::UnknownIssuer
+                        ))
+                    ) =>
+            {
+                extra_roots = false;
+                continue;
+            }
+            Err(ref error)
+                if matches!(error, ureq::Error::Tls(_)) || tls_cause(error).is_some() =>
+            {
+                return Err(io::Error::other("tls_failed"));
+            }
+            Err(ureq::Error::Timeout(_)) => return Err(io::Error::other("probe_timed_out")),
+            Err(_) => return Err(io::Error::other("target_failed")),
+            Ok(response) => response,
+        };
+        if response.status().as_u16() != check.expected_status.unwrap_or(200) {
+            return Err(io::Error::other("target_status_failed"));
+        }
+        let mut bytes = Vec::new();
+        response
+            .body_mut()
+            .as_reader()
+            .take(64 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| io::Error::other("target_failed"))?;
+        if bytes.len() > 64 * 1024 {
+            return Err(invalid("target_response_too_large"));
+        }
+        return Ok(());
+    }
+}
+pub fn health(
+    client: &Client,
+    config: &Config,
+    connection: &crate::store::Connection,
+    proxy: &Proxy,
+) -> io::Result<std::collections::BTreeMap<String, String>> {
+    let group = config
+        .groups
+        .iter()
+        .find(|g| g.id == connection.group_id)
+        .ok_or_else(|| invalid("group missing"))?;
+    let check = group
+        .healthcheck
+        .as_ref()
+        .ok_or_else(|| invalid("healthcheck missing"))?;
+    let deadline = Instant::now() + Duration::from_secs(check.timeout_seconds);
+    match health_at(client, config, connection, proxy, deadline) {
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => Ok(
+            std::collections::BTreeMap::from([("health".into(), "probe_timed_out".into())]),
+        ),
+        result => result,
+    }
+}
+fn health_at(
+    client: &Client,
+    config: &Config,
+    connection: &crate::store::Connection,
+    proxy: &Proxy,
+    deadline: Instant,
+) -> io::Result<std::collections::BTreeMap<String, String>> {
+    let group = config
+        .groups
+        .iter()
+        .find(|g| g.id == connection.group_id)
+        .ok_or_else(|| invalid("group missing"))?;
+    let check = group
+        .healthcheck
+        .as_ref()
+        .ok_or_else(|| invalid("healthcheck missing"))?;
+    let bounded = client.until(deadline);
+    let client = &bounded;
+    let user = proxy
+        .connection_users
+        .get(&connection.id)
+        .ok_or_else(|| invalid("connection requires prepared diagnostic routes"))?;
+    let local = proxy.for_connection(&connection.id, &group.id);
+    let url = url::Url::parse(&check.target).map_err(|_| invalid("invalid target"))?;
+    let port = url.port_or_known_default().unwrap();
+    let host = url.host_str().unwrap().trim_matches(['[', ']']);
+    let mut results = std::collections::BTreeMap::new();
+    let literal = host.parse::<IpAddr>().ok();
+    let resolver = if literal.is_none() {
+        let Some(server) = &connection.dns else {
+            results.insert("health".into(), "dns_missing".into());
+            return Ok(results);
+        };
+        let resolver = crate::policy::Resolver::parse(server)?;
+        if !crate::capability::permits(&connection.allowed_capabilities, &resolver.capability()) {
+            results.insert("health".into(), "dns_capability_missing".into());
+            return Ok(results);
+        }
+        if client.route_context(
+            PROBE_TAG,
+            &resolver.address.ip().to_string(),
+            None,
+            Some(user),
+            resolver.network,
+            resolver.address.port(),
+        )? != format!("wgates-out-{}", connection.id)
+        {
+            return Err(invalid("healthcheck DNS route changed"));
+        }
+        Some(resolver)
+    } else {
+        None
+    };
+    let mut target_error = if literal.is_some()
+        || !["tcp_ipv4", "tcp_ipv6"]
+            .into_iter()
+            .any(|c| crate::capability::permits(&connection.allowed_capabilities, c))
+    {
+        "capability_missing".to_owned()
+    } else {
+        "dns_failed".to_owned()
+    };
+    let mut target_ok = false;
+    for (kind, capability) in [("A", "tcp_ipv4"), ("AAAA", "tcp_ipv6")] {
+        if Instant::now() >= deadline
+            || !crate::capability::permits(&connection.allowed_capabilities, capability)
+        {
+            continue;
+        }
+        let ips = if let Some(ip) = literal {
+            if ip.is_ipv4() != (kind == "A") {
+                continue;
+            }
+            vec![ip]
+        } else {
+            lookup(host, kind, resolver.as_ref().unwrap(), &local, deadline).unwrap_or_default()
+        };
+        let addresses = ips
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect::<Vec<_>>();
+        if addresses.is_empty() {
+            continue;
+        }
+        for address in &addresses {
+            client.check()?;
+            if client.route_context(
+                PROBE_TAG,
+                &address.ip().to_string(),
+                None,
+                proxy
+                    .connection_users
+                    .get(&connection.id)
+                    .map(String::as_str),
+                "tcp",
+                port,
+            )? != format!("wgates-out-{}", connection.id)
+            {
+                return Err(invalid("healthcheck diagnostic route changed"));
+            }
+        }
+        let target = if url.scheme() == "tcp" {
+            let mut result = Err(io::Error::other("target_failed"));
+            for address in &addresses {
+                result = (|| {
+                    let mut stream = socks(&local, deadline)?;
+                    let mut request = vec![5, 1, 0];
+                    match address.ip() {
+                        IpAddr::V4(ip) => {
+                            request.push(1);
+                            request.extend(ip.octets());
+                        }
+                        IpAddr::V6(ip) => {
+                            request.push(4);
+                            request.extend(ip.octets());
+                        }
+                    }
+                    request.extend(port.to_be_bytes());
+                    send(&mut stream, &request, deadline)?;
+                    socks_reply(&mut stream, deadline)?;
+                    let (message, expected) = check.tcp_exchange()?;
+                    send(&mut stream, &message, deadline)?;
+                    let mut answer = vec![0; expected.len()];
+                    receive(&mut stream, &mut answer, deadline)?;
+                    if answer != expected {
+                        return Err(invalid("target_response_mismatch"));
+                    }
+                    Ok(())
+                })();
+                if result.is_ok() {
+                    break;
+                }
+            }
+            result.map_err(|_| io::Error::other("target_failed"))
+        } else {
+            let mut result = Err(io::Error::other("target_failed"));
+            for address in &addresses {
+                result = target_http(check, &local, std::slice::from_ref(address), deadline);
+                if result.is_ok() {
+                    break;
+                }
+            }
+            result
+        };
+        match target {
+            Ok(()) => {
+                target_ok = true;
+                break;
+            }
+            Err(error) => target_error = error.to_string(),
+        }
+    }
+    if !target_ok {
+        results.insert("health".into(), target_error);
+        return Ok(results);
+    }
+    let mut scoped = config.clone();
+    let g = scoped.groups.iter_mut().find(|g| g.id == group.id).unwrap();
+    let mut required = check.required_capabilities.clone();
+    if let Some(server) = &connection.dns {
+        required.push(crate::policy::Resolver::parse(server)?.capability());
+    }
+    if !required.iter().any(|c| c == "tcp_ipv4") {
+        g.probes.tcp_ipv4 = None;
+    }
+    if !required.iter().any(|c| c == "tcp_ipv6") {
+        g.probes.tcp_ipv6 = None;
+    }
+    if !required.iter().any(|c| c == "udp_ipv4") {
+        g.probes.udp_ipv4 = None;
+    }
+    if !required.iter().any(|c| c == "udp_ipv6") {
+        g.probes.udp_ipv6 = None;
+    }
+    match connection_at(client, &scoped, connection, proxy, Some(deadline)) {
+        Ok(sample) => results.extend(sample),
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+            results.insert("health".into(), "probe_timed_out".into());
+            return Ok(results);
+        }
+        Err(error) => return Err(error),
+    }
+    let reason = if check
+        .required_capabilities
+        .iter()
+        .any(|c| results.get(c).is_none_or(|r| r != "verified"))
+    {
+        "capability_missing"
+    } else if crate::domain::rules(config)
+        .iter()
+        .any(|(_, r)| r.group_id == group.id)
+        && results.get("dns").is_none_or(|v| v != "verified")
+    {
+        "dns_failed"
+    } else {
+        "verified"
+    };
+    results.insert("health".into(), reason.into());
     Ok(results)
 }

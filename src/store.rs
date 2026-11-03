@@ -22,6 +22,10 @@ pub struct Group {
     pub primary: Option<String>,
     #[serde(default)]
     pub probes: Probes,
+    #[serde(default)]
+    pub fallbacks: Vec<String>,
+    #[serde(default)]
+    pub healthcheck: Option<crate::health::Healthcheck>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -197,6 +201,7 @@ impl Store {
                 ));
             }
         }
+        crate::health::validate_groups(&config)?;
         let mut destinations = std::collections::HashSet::new();
         for rule in &config.rules {
             if id_number(&rule.id, 'r').is_none_or(|n| n > rule.revision)
@@ -271,7 +276,15 @@ impl Store {
             "group.create" => &["name"],
             "group.list" => &["offset", "list_revision"],
             "group.show" | "connection.show" => &["id"],
-            "group.update" => &["id", "expected_revision", "name", "primary", "probes"],
+            "group.update" => &[
+                "id",
+                "expected_revision",
+                "name",
+                "primary",
+                "probes",
+                "fallbacks",
+                "healthcheck",
+            ],
             "rule.create" => &["group_id", "destination"],
             "rule.list" => &["group_id", "offset", "list_revision"],
             "rule.show" => &["id"],
@@ -327,6 +340,8 @@ impl Store {
                     revision,
                     primary: None,
                     probes: Probes::default(),
+                    fallbacks: Vec::new(),
+                    healthcheck: None,
                 };
                 config.groups.push(group.clone());
                 json!(group)
@@ -354,7 +369,7 @@ impl Store {
                     }
                     json!(config.groups.remove(index))
                 } else {
-                    if ["name", "primary", "probes"]
+                    if ["name", "primary", "probes", "fallbacks", "healthcheck"]
                         .iter()
                         .all(|k| request.get(k).is_none())
                     {
@@ -388,6 +403,14 @@ impl Store {
                             .map_err(|_| invalid("invalid probe configuration"))?;
                         probes.validate()?;
                         config.groups[index].probes = probes;
+                    }
+                    if let Some(value) = request.get("fallbacks") {
+                        config.groups[index].fallbacks = serde_json::from_value(value.clone())
+                            .map_err(|_| invalid("fallbacks must be an array of connection IDs"))?;
+                    }
+                    if let Some(value) = request.get("healthcheck") {
+                        config.groups[index].healthcheck = serde_json::from_value(value.clone())
+                            .map_err(|_| invalid("invalid healthcheck configuration"))?;
                     }
                     config.groups[index].revision = revision;
                     json!(config.groups[index])
@@ -561,17 +584,15 @@ impl Store {
                 {
                     return Err(invalid("revision conflict; inspect the object and retry"));
                 }
-                if config
-                    .groups
-                    .iter()
-                    .any(|g| g.primary.as_deref() == Some(id))
-                    && (command == "connection.delete"
-                        || request.get("group_id").is_some_and(|v| {
-                            v.as_str() != Some(config.connections[index].group_id.as_str())
-                        }))
+                if config.groups.iter().any(|g| {
+                    g.primary.as_deref() == Some(id) || g.fallbacks.iter().any(|c| c == id)
+                }) && (command == "connection.delete"
+                    || request.get("group_id").is_some_and(|v| {
+                        v.as_str() != Some(config.connections[index].group_id.as_str())
+                    }))
                 {
                     return Err(invalid(
-                        "connection is referenced as primary; clear or change the primary first",
+                        "connection is referenced as primary or fallback; clear or change the reference first",
                     ));
                 }
                 if command == "connection.delete" {
@@ -617,6 +638,7 @@ impl Store {
             }
             _ => return Err(invalid("unsupported command")),
         };
+        crate::health::validate_groups(&config)?;
         config.revision = revision;
         config.schema_version = 2;
         if let Some((reference, profile)) = &new_profile {
@@ -700,7 +722,20 @@ impl Store {
         if offset > items.len() {
             return Err(invalid("invalid list offset"));
         }
-        let end = offset.saturating_add(PAGE_SIZE).min(items.len());
+        let limit = offset.saturating_add(PAGE_SIZE).min(items.len());
+        let mut end = offset;
+        let mut bytes = 128;
+        while end < limit {
+            let size = serde_json::to_vec(&items[end])?.len() + 1;
+            if bytes + size > crate::MAX_MESSAGE / 2 {
+                break;
+            }
+            bytes += size;
+            end += 1;
+        }
+        if end == offset && end < items.len() {
+            return Err(invalid("list item exceeds response budget"));
+        }
         Ok(
             json!({"data":items[offset..end], "list_revision":self.config.revision,
             "next_offset":if end < items.len() {Some(end)} else {None}}),

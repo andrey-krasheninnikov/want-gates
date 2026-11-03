@@ -61,6 +61,14 @@ struct Working {
     prepared_digest: Option<String>,
     #[serde(default)]
     panel_digest: Option<String>,
+    #[serde(default)]
+    profiles: BTreeMap<String, Value>,
+    #[serde(default)]
+    selected: BTreeMap<String, Option<String>>,
+    #[serde(default)]
+    health: BTreeMap<String, crate::health::Observation>,
+    #[serde(default)]
+    health_error: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -325,6 +333,7 @@ fn validate(input: &Input, base: &Snapshot, working: Option<&Working>) -> io::Re
     for group in &input.config.groups {
         group.probes.validate()?;
     }
+    crate::health::validate_groups(&input.config)?;
     Ok(tags)
 }
 fn initial_matrix(config: &Config) -> Matrix {
@@ -389,6 +398,11 @@ fn initial_matrix(config: &Config) -> Matrix {
                     "dns_missing"
                 };
                 result.insert("dns".into(), state.into());
+            }
+            if g.healthcheck.is_some() {
+                for reason in result.values_mut() {
+                    *reason = "healthcheck_pending".into();
+                }
             }
             (g.id.clone(), result)
         })
@@ -580,6 +594,9 @@ pub struct Service {
     busy: Arc<AtomicBool>,
     stopping: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    health_due: BTreeMap<String, std::time::Instant>,
+    active_plan: Option<String>,
+    reload_health: bool,
 }
 impl Service {
     pub fn new(state: &Path, stopping: Arc<AtomicBool>) -> io::Result<Self> {
@@ -589,11 +606,33 @@ impl Service {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
         }
+        let mut health_due = BTreeMap::new();
+        let working: Option<Working> = optional(&root.join("working.json")).unwrap_or(None);
+        let active_plan = working.as_ref().map(|w| w.plan_id.clone());
+        if let Some(mut working) = working {
+            if !working.health.is_empty() {
+                for record in working.health.values_mut() {
+                    record.successes = 0;
+                    record.failures = 0;
+                    record.fresh = false;
+                    record.reason = "awaiting_probe".into();
+                }
+                private_write(&root.join("working.json"), &working)?;
+            }
+            for group in &working.config.groups {
+                if group.healthcheck.is_some() {
+                    health_due.insert(group.id.clone(), std::time::Instant::now());
+                }
+            }
+        }
         Ok(Self {
             root,
             busy: Arc::new(AtomicBool::new(false)),
             stopping,
             worker: None,
+            health_due,
+            active_plan,
+            reload_health: true,
         })
     }
     pub fn busy(&self) -> bool {
@@ -602,6 +641,7 @@ impl Service {
     pub fn reap(&mut self) {
         if self.worker.as_ref().is_some_and(|w| w.is_finished()) {
             let _ = self.worker.take().unwrap().join();
+            self.reload_health = true;
         }
     }
     pub fn finish(&mut self) {
@@ -633,7 +673,7 @@ impl Service {
             let saved: Value = optional(&self.root.join("status.json"))?
                 .unwrap_or(json!({"state":"unapplied","running_revision":null}));
             return Ok(Some(
-                json!({"data":{"desired_revision":store.config().revision,"busy":self.busy(),"recovery_required":optional::<Journal>(&self.root.join("journal.json"))?.as_ref().is_some_and(pending) && !self.busy(),"last_observation":saved,"connection_verifications":connection_reports(&self.root,store.config()).unwrap_or_else(|_|json!({"state":"unknown","reason":"observation_state_unreadable"}))}}),
+                json!({"data":{"desired_revision":store.config().revision,"busy":self.busy(),"recovery_required":optional::<Journal>(&self.root.join("journal.json"))?.as_ref().is_some_and(pending) && !self.busy(),"last_observation":saved,"health_schedule":self.health_due.iter().map(|(group,due)|json!({"group_id":group,"due_in_seconds":due.saturating_duration_since(std::time::Instant::now()).as_secs(),"overdue_seconds":std::time::Instant::now().saturating_duration_since(*due).as_secs()})).collect::<Vec<_>>(),"health":optional::<Working>(&self.root.join("working.json"))?.map(|w|w.health_report()),"connection_verifications":connection_reports(&self.root,store.config()).unwrap_or_else(|_|json!({"state":"unknown","reason":"observation_state_unreadable"}))}}),
             ));
         }
         if self.busy() {
@@ -822,7 +862,7 @@ fn execute(
         private_write(&root.join("plan.json"), &plan)?;
         return Ok(
             json!({"plan_id":plan.id,"desired_revision":plan.input.config.revision,"ingress":plan.ingress,"rules":plan.input.config.rules,
-            "dns":crate::domain::describe(&plan.input.config),"panel_dns_rules":plan.candidate.template["routing"]["rules"].as_array().map(|a|a.iter().filter(|v|v["ruleTag"]=="xui-dns-allow").collect::<Vec<_>>()),"capabilities":"conditional_on_runtime_probes","prepared_connections":plan.input.config.connections.iter().map(|c|&c.id).collect::<Vec<_>>(),"eligibility":eligibility(&plan.input.config),"unmatched":"direct","unverified":"blocked","sessions_may_interrupt":true}),
+            "dns":crate::domain::describe(&plan.input.config),"panel_dns_rules":plan.candidate.template["routing"]["rules"].as_array().map(|a|a.iter().filter(|v|v["ruleTag"]=="xui-dns-allow").collect::<Vec<_>>()),"capabilities":"conditional_on_runtime_probes","prepared_connections":plan.input.config.connections.iter().map(|c|&c.id).collect::<Vec<_>>(),"eligibility":eligibility(&plan.input.config),"automatic_groups":plan.input.config.groups.iter().filter(|g|g.healthcheck.is_some()).map(|g|json!({"group_id":g.id,"primary":g.primary,"fallbacks":g.fallbacks,"healthcheck":g.healthcheck})).collect::<Vec<_>>(),"unmatched":"direct","unverified":"blocked","sessions_may_interrupt":true}),
         );
     }
     if command == "routing.recover" {
@@ -872,10 +912,11 @@ fn execute(
         verify(
             &client,
             &w.snapshot,
-            &w.config,
+            &w.effective_config(),
             &w.proxy,
             &w.matrix,
             &plan.ingress,
+            Some(&w.health),
         )?;
         return Ok(observation(&plan.id, &w.config, &w.snapshot, &w.matrix));
     }
@@ -905,9 +946,73 @@ fn execute(
             &initial_matrix(&input.config),
             &journal.plan.ingress,
         )?;
-        let matrix = crate::probe::check(&client, &input.config, &journal.plan.proxy, None)?;
+        let mut legacy = input.config.clone();
+        legacy.rules.retain(|r| {
+            !input
+                .config
+                .groups
+                .iter()
+                .any(|g| g.id == r.group_id && g.healthcheck.is_some())
+        });
+        let mut matrix = crate::probe::check(&client, &legacy, &journal.plan.proxy, None)?;
+        let mut health = BTreeMap::new();
+        let mut verifications = BTreeMap::new();
+        for connection in &input.config.connections {
+            let group = input
+                .config
+                .groups
+                .iter()
+                .find(|g| g.id == connection.group_id)
+                .unwrap();
+            if let Some(policy) = &group.healthcheck {
+                let admitted = crate::probe::connection(
+                    &client,
+                    &input.config,
+                    connection,
+                    &journal.plan.proxy,
+                )?;
+                let results =
+                    crate::probe::health(&client, &input.config, connection, &journal.plan.proxy)?;
+                verifications.insert(connection.id.clone(), admitted.clone());
+                let mut record = crate::health::Observation {
+                    admitted: admitted.clone(),
+                    ..Default::default()
+                };
+                if let Some(previous) = &journal.previous
+                    && let Some(old_connection) = previous
+                        .config
+                        .connections
+                        .iter()
+                        .find(|c| c.id == connection.id)
+                    && let Some(old_group) =
+                        previous.config.groups.iter().find(|g| g.id == group.id)
+                    && connection_binding(&previous.config, old_connection)?
+                        == connection_binding(&input.config, connection)?
+                    && digest(&old_group.healthcheck)? == digest(&group.healthcheck)?
+                    && let Some(old) = previous.health.get(&connection.id)
+                {
+                    record = old.clone();
+                    let mut retained = policy.required_capabilities.clone();
+                    retained.push("dns".into());
+                    if let Some(server) = &connection.dns {
+                        retained.push(crate::policy::Resolver::parse(server)?.capability());
+                    }
+                    record
+                        .admitted
+                        .extend(admitted.into_iter().filter(|(c, _)| !retained.contains(c)));
+                }
+                record.record(results, policy);
+                health.insert(connection.id.clone(), record);
+            }
+        }
+        let selected = select(&input.config, &health);
+        let effective = effective_config(&input.config, &selected);
+        select_matrix(&input.config, &selected, &health, &mut matrix);
         let final_snapshot = render(
-            &input,
+            &Input {
+                config: effective.clone(),
+                profiles: input.profiles.clone(),
+            },
             &journal.plan.base,
             &journal.plan.proxy,
             &journal.plan.ingress,
@@ -919,10 +1024,11 @@ fn execute(
         verify(
             &client,
             &final_snapshot,
-            &input.config,
+            &effective,
             &journal.plan.proxy,
             &matrix,
             &journal.plan.ingress,
+            Some(&health),
         )?;
         let working = Working {
             plan_id: journal.plan.id.clone(),
@@ -932,6 +1038,10 @@ fn execute(
             matrix,
             prepared_digest: Some(digest(&input)?),
             panel_digest: Some(panel_digest.clone()),
+            profiles: input.profiles.clone(),
+            selected,
+            health,
+            health_error: None,
         };
         let report = observation(
             &working.plan_id,
@@ -939,7 +1049,13 @@ fn execute(
             &working.snapshot,
             &working.matrix,
         );
-        for group in &input.config.groups {
+        for connection in &input.config.connections {
+            if let Some(results) = verifications.get(&connection.id) {
+                record_connection(root, &input.config, connection, results.clone(), "apply")?;
+            }
+        }
+        let effective = working.effective_config();
+        for group in effective.groups.iter().filter(|g| g.healthcheck.is_none()) {
             if let Some(connection) = crate::domain::connection(&input.config, group)
                 && let Some(results) = working.matrix.get(&group.id)
             {
@@ -1021,15 +1137,32 @@ fn verify(
     proxy: &Proxy,
     matrix: &Matrix,
     ingress: &[String],
+    health: Option<&BTreeMap<String, crate::health::Observation>>,
 ) -> io::Result<()> {
-    if client.status()?["running"] != true {
-        return Err(io::Error::other("Xray is not running after apply"));
-    }
     if client.read()? != *snapshot {
         return Err(invalid("observed panel drift during verification"));
     }
     wait_routes(client, config, matrix, ingress)?;
-    crate::probe::check(client, config, proxy, Some(matrix))?;
+    let mut verified = matrix.clone();
+    for group in config.groups.iter().filter(|g| g.healthcheck.is_some()) {
+        if let Some(record) = health.and_then(|h| group.primary.as_ref().and_then(|id| h.get(id)))
+            && record.fresh
+            && record.available
+            && record.failures > 0
+            && let Some(combinations) = verified.get_mut(&group.id)
+        {
+            for (capability, reason) in combinations {
+                if record
+                    .results
+                    .get(capability)
+                    .is_none_or(|r| r != "verified")
+                {
+                    *reason = "not_rechecked".into();
+                }
+            }
+        }
+    }
+    crate::probe::check(client, config, proxy, Some(&verified))?;
     if client.read()? != *snapshot {
         return Err(invalid("observed panel drift after traffic verification"));
     }
@@ -1117,7 +1250,13 @@ fn wait_routes(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         client.check()?;
-        match verify_routes(client, config, matrix, ingress) {
+        let result = (|| {
+            if client.status()?["running"] != true {
+                return Err(io::Error::other("Xray is not running after apply"));
+            }
+            verify_routes(client, config, matrix, ingress)
+        })();
+        match result {
             Ok(()) => return Ok(()),
             Err(error) if std::time::Instant::now() >= deadline => return Err(error),
             Err(_) => std::thread::sleep(std::time::Duration::from_millis(100)),
@@ -1170,21 +1309,36 @@ fn recover(root: &Path, client: &Client, journal: &mut Journal) -> io::Result<Va
                 .unwrap_or_else(|| io::Error::other("saved restoration could not be confirmed")));
         }
     }
-    let runtime_verified = if let Some(previous) = &journal.previous {
+    let runtime_error = if let Some(previous) = &journal.previous {
         verify(
             client,
             &journal.plan.base,
-            &previous.config,
+            &previous.effective_config(),
             &previous.proxy,
             &previous.matrix,
             &journal.plan.ingress,
+            None,
         )
-        .is_ok()
+        .err()
+        .map(|error| error.to_string())
     } else {
-        false
+        Some("no previously verified snapshot".into())
     };
+    let runtime_verified = runtime_error.is_none();
     if let Some(previous) = &journal.previous {
-        private_write(&root.join("working.json"), previous)?;
+        let mut previous = previous.clone();
+        if !previous.health.is_empty() {
+            previous.health_error = Some(
+                "recovery restored previous policy; preview and apply before resuming healthchecks"
+                    .into(),
+            );
+            for record in previous.health.values_mut() {
+                record.fresh = false;
+                record.successes = 0;
+                record.failures = 0;
+            }
+        }
+        private_write(&root.join("working.json"), &previous)?;
     } else if let Some(current) = optional::<Working>(&root.join("working.json"))? {
         if current.plan_id != journal.plan.id {
             return Err(invalid(
@@ -1198,7 +1352,7 @@ fn recover(root: &Path, client: &Client, journal: &mut Journal) -> io::Result<Va
     private_write(&root.join("journal.json"), journal)?;
     let report = json!({"state":if runtime_verified{"restored"}else{"restored_runtime_unverified"},"plan_id":journal.plan.id,
         "desired_revision":journal.plan.input.config.revision,"running_revision":if runtime_verified{journal.previous.as_ref().map(|w|w.config.revision)}else{None},
-        "saved":"restored","running":if runtime_verified{"verified_previous"}else{"unverified"},"mismatch":true});
+        "runtime_verification_error":runtime_error,"saved":"restored","running":if runtime_verified{"verified_previous"}else{"unverified"},"mismatch":true});
     private_write(&root.join("status.json"), &report)?;
     Ok(report)
 }
@@ -1238,7 +1392,12 @@ impl Service {
                                 .iter()
                                 .any(|old| old.id == c.id && old.profile_ref == c.profile_ref)
                                 && w.config.groups.iter().any(|g| {
-                                    g.id == c.group_id && g.primary.as_deref() == Some(&c.id)
+                                    g.id == c.group_id
+                                        && w.selected
+                                            .get(&g.id)
+                                            .map(|v| v.as_deref())
+                                            .unwrap_or(g.primary.as_deref())
+                                            == Some(&c.id)
                                 })
                         });
                     let capabilities: Vec<_> = selected
@@ -1255,6 +1414,12 @@ impl Service {
             };
             if let Some(object) = value.as_object_mut() {
                 object.extend(fields.as_object().unwrap().clone());
+                if let Ok((_, Some(working))) = &inspected
+                    && let Some(id) = object.get("id").and_then(Value::as_str)
+                    && let Some(record) = working.health.get(id)
+                {
+                    object.insert("health".into(), record.describe());
+                }
                 if let Some(connection) = config
                     .connections
                     .iter()
@@ -1307,4 +1472,273 @@ impl Service {
             describe(&mut response["data"]);
         }
     }
+}
+
+fn effective_config(config: &Config, selected: &BTreeMap<String, Option<String>>) -> Config {
+    let mut config = config.clone();
+    for group in &mut config.groups {
+        if let Some(connection) = selected.get(&group.id) {
+            group.primary = connection.clone();
+        }
+    }
+    config
+}
+fn select(
+    config: &Config,
+    health: &BTreeMap<String, crate::health::Observation>,
+) -> BTreeMap<String, Option<String>> {
+    config
+        .groups
+        .iter()
+        .filter(|g| g.healthcheck.is_some())
+        .map(|g| {
+            let selected = g
+                .primary
+                .iter()
+                .chain(g.fallbacks.iter())
+                .find(|id| health.get(*id).is_some_and(|r| r.available && r.fresh))
+                .cloned();
+            (g.id.clone(), selected)
+        })
+        .collect()
+}
+fn select_matrix(
+    config: &Config,
+    selected: &BTreeMap<String, Option<String>>,
+    health: &BTreeMap<String, crate::health::Observation>,
+    matrix: &mut Matrix,
+) {
+    for group in config.groups.iter().filter(|g| g.healthcheck.is_some()) {
+        let result = selected
+            .get(&group.id)
+            .and_then(|v| v.as_ref())
+            .and_then(|id| health.get(id))
+            .map(|r| r.admitted.clone())
+            .unwrap_or_else(|| {
+                CAPABILITIES
+                    .into_iter()
+                    .chain(["dns"])
+                    .map(|c| (c.into(), "no_eligible_connection".into()))
+                    .collect()
+            });
+        let mut result = result;
+        if !crate::domain::rules(config)
+            .iter()
+            .any(|(_, r)| r.group_id == group.id)
+        {
+            result.remove("dns");
+        }
+        matrix.insert(group.id.clone(), result);
+    }
+}
+impl Working {
+    fn effective_config(&self) -> Config {
+        effective_config(&self.config, &self.selected)
+    }
+    fn health_report(&self) -> Value {
+        json!({"plan_id":self.plan_id,"running_revision":self.config.revision,"error":self.health_error,
+            "groups":self.config.groups.iter().filter(|g|g.healthcheck.is_some()).map(|g|{
+                let selected=self.selected.get(&g.id).and_then(|v|v.as_ref());
+                json!({"group_id":g.id,"selected_connection":selected,"reason":if selected==g.primary.as_ref(){"primary"}else if selected.is_some(){"fallback"}else{"no_eligible_connection"},"required_capabilities":g.healthcheck.as_ref().unwrap().required_capabilities,
+                "connections":self.config.connections.iter().filter(|c|c.group_id==g.id).map(|c|(c.id.clone(),self.health.get(&c.id).map(|r|r.describe()).unwrap_or(json!({"state":"unknown"})))).collect::<BTreeMap<_,_>>()})
+            }).collect::<Vec<_>>()})
+    }
+}
+impl Service {
+    pub fn tick(&mut self) {
+        if self.busy() || self.stopping.load(Ordering::Relaxed) {
+            return;
+        }
+        if !self.reload_health
+            && self
+                .health_due
+                .values()
+                .all(|due| *due > std::time::Instant::now())
+        {
+            return;
+        }
+        self.reload_health = false;
+        let ready = (|| -> io::Result<Option<(Working, Vec<String>)>> {
+            if optional::<Journal>(&self.root.join("journal.json"))?
+                .as_ref()
+                .is_some_and(pending)
+            {
+                self.health_due.clear();
+                return Ok(None);
+            }
+            let Some(working) = optional::<Working>(&self.root.join("working.json"))? else {
+                return Ok(None);
+            };
+            if working.health_error.is_some() || working.profiles.is_empty() {
+                self.health_due.clear();
+                return Ok(None);
+            }
+            let now = std::time::Instant::now();
+            if self.active_plan.as_ref() != Some(&working.plan_id) {
+                self.active_plan = Some(working.plan_id.clone());
+                self.health_due.clear();
+                for group in &working.config.groups {
+                    if let Some(check) = &group.healthcheck {
+                        self.health_due.insert(
+                            group.id.clone(),
+                            now + std::time::Duration::from_secs(check.interval_seconds),
+                        );
+                    }
+                }
+            }
+            let mut due = Vec::new();
+            for group in &working.config.groups {
+                if let Some(check) = &group.healthcheck {
+                    let next = self.health_due.entry(group.id.clone()).or_insert(now);
+                    if *next <= now {
+                        due.push(group.id.clone());
+                        *next = now + std::time::Duration::from_secs(check.interval_seconds);
+                    }
+                }
+            }
+            Ok(if due.is_empty() {
+                None
+            } else {
+                Some((working, due))
+            })
+        })();
+        let (working, due) = match ready {
+            Ok(Some(v)) => v,
+            _ => return,
+        };
+        let root = self.root.clone();
+        let busy = self.busy.clone();
+        let stopping = self.stopping.clone();
+        busy.store(true, Ordering::Relaxed);
+        match thread::Builder::new()
+            .name("healthcheck".into())
+            .spawn(move || {
+                let result = health_cycle(&root, working, due, stopping.clone());
+                if let Err(error) = result {
+                    eprintln!("wgates: healthcheck stopped: {error}");
+                    if !stopping.load(Ordering::Relaxed)
+                        && let Ok(Some(mut working)) =
+                            optional::<Working>(&root.join("working.json"))
+                    {
+                        working.health_error = Some(error.to_string());
+                        let _ = private_write(&root.join("working.json"), &working);
+                    }
+                }
+                busy.store(false, Ordering::Relaxed);
+            }) {
+            Ok(worker) => self.worker = Some(worker),
+            Err(_) => self.busy.store(false, Ordering::Relaxed),
+        }
+    }
+}
+fn health_cycle(
+    root: &Path,
+    mut working: Working,
+    due: Vec<String>,
+    stopping: Arc<AtomicBool>,
+) -> io::Result<()> {
+    let settings: Settings = read(&root.join("panel.json"))?;
+    if working.panel_digest.as_ref() != Some(&digest(&settings)?) {
+        return Err(invalid(
+            "panel identity changed; preview and apply before healthchecks",
+        ));
+    }
+    let client = Client::new(settings, stopping)?;
+    client.running()?;
+    if client.read()? != working.snapshot {
+        return Err(invalid("observed panel drift; automatic writes stopped"));
+    }
+    for connection in &working.config.connections {
+        if !due.contains(&connection.group_id) {
+            continue;
+        }
+        let group = working
+            .config
+            .groups
+            .iter()
+            .find(|g| g.id == connection.group_id)
+            .unwrap();
+        let check = group.healthcheck.as_ref().unwrap();
+        let results = crate::probe::health(&client, &working.config, connection, &working.proxy)?;
+        working
+            .health
+            .get_mut(&connection.id)
+            .ok_or_else(|| invalid("health state missing; preview and apply again"))?
+            .record(results, check);
+    }
+    if client.read()? != working.snapshot {
+        return Err(invalid(
+            "observed panel drift during healthcheck; automatic writes stopped",
+        ));
+    }
+    let selected = select(&working.config, &working.health);
+    let mut matrix = working.matrix.clone();
+    select_matrix(&working.config, &selected, &working.health, &mut matrix);
+    if selected == working.selected && matrix == working.matrix {
+        private_write(&root.join("working.json"), &working)?;
+        return Ok(());
+    }
+    let effective = effective_config(&working.config, &selected);
+    let input = Input {
+        config: effective.clone(),
+        profiles: working.profiles.clone(),
+    };
+    let ingress = ingress(&working.snapshot)?;
+    let candidate = render(&input, &working.snapshot, &working.proxy, &ingress, &matrix)?;
+    let previous: Working = read(&root.join("working.json"))?;
+    let plan = Plan {
+        id: random_id()?,
+        desired_digest: digest(&input)?,
+        panel_digest: working.panel_digest.clone().unwrap(),
+        input,
+        base: working.snapshot.clone(),
+        candidate: candidate.clone(),
+        proxy: working.proxy.clone(),
+        ingress: ingress.clone(),
+    };
+    let mut journal = Journal {
+        plan,
+        submitted: Vec::new(),
+        previous: Some(previous),
+        phase: "applying".into(),
+    };
+    private_write(&root.join("journal.json"), &journal)?;
+    let result = (|| -> io::Result<()> {
+        submit(root, &client, &mut journal, &candidate)?;
+        verify(
+            &client,
+            &candidate,
+            &effective,
+            &working.proxy,
+            &matrix,
+            &ingress,
+            Some(&working.health),
+        )?;
+        working.snapshot = candidate;
+        working.selected = selected;
+        working.matrix = matrix;
+        private_write(&root.join("working.json"), &working)?;
+        private_write(
+            &root.join("status.json"),
+            &observation(
+                &working.plan_id,
+                &effective,
+                &working.snapshot,
+                &working.matrix,
+            ),
+        )?;
+        journal.phase = "complete".into();
+        private_write(&root.join("journal.json"), &journal)
+    })();
+    if let Err(error) = result {
+        if client.cancelled() {
+            recovery_required(root, &mut journal)?;
+        } else {
+            let _ = recover(root, &client, &mut journal);
+        }
+        return Err(io::Error::other(format!(
+            "automatic switch failed: {error}; inspect routing status and recover the recorded plan if required"
+        )));
+    }
+    Ok(())
 }

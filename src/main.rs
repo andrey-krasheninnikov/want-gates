@@ -1,5 +1,6 @@
 mod capability;
 mod domain;
+mod health;
 mod management;
 mod panel;
 mod policy;
@@ -33,7 +34,7 @@ Usage:
   wgates status [--socket PATH]
   wgates group create --name NAME [--socket PATH]
   wgates group list|show ID|delete ID [--socket PATH]
-  wgates group update ID [--name NAME] [--primary CONNECTION_ID|-] [--probe-file PATH|-]
+  wgates group update ID [--name NAME] [--primary CONNECTION_ID|-] [--probe-file PATH|-] [--fallbacks ID,...|-] [--healthcheck-file PATH|-]
   wgates connection import --group ID --name NAME --protocol vless --file PATH|- [--dns URI] [--capabilities LIST|all|none]
   wgates connection verify ID
   wgates connection list [--group ID] [--sort group|name]
@@ -226,6 +227,7 @@ fn serve(socket: &Path, state: &Path) -> io::Result<()> {
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                routing.tick();
                 thread::sleep(Duration::from_millis(20));
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}

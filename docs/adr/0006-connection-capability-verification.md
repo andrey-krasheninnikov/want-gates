@@ -10,12 +10,12 @@ Prepare private per-connection diagnostic routes through the existing Xray SOCKS
 listener during preview/apply. Explicit connection verification can then probe
 an unselected connection without switching primary, adding a process, or writing
 the panel. Diagnostic access obeys configured limits. Ordinary protected traffic
-uses only the combinations verified by its explicit apply.
+uses only admitted combinations verified by apply or an active group healthcheck.
 
 Bind observations to connection settings and group probes. Keep latest
 verification separate from applied policy and continuous health. Verification
 cannot enable routes; apply repeats selected-primary checks. Native adapters and
-future fallback selection use the same capability vocabulary and admission
+automatic fallback selection use the same capability vocabulary and admission
 rules. Network failure does not establish an authentication cause.
 
 All prepared profiles enter the panel candidate and share its size and runtime

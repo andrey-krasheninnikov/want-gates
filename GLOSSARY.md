@@ -20,9 +20,11 @@ These terms describe the gateway, its routing policy and operator actions.
 | Connection verification | An explicit resource and DNS check through one prepared connection, without selecting it as primary or changing active routing. |
 | Capability observation | A recorded result for one connection transport and IP family. It describes the last explicit verification rather than continuous health. |
 | Connection DNS | DNS used through an individual connection for destinations assigned to its group, including private company zones. |
+| Required capabilities | The explicit set of traffic combinations that one connection must support to serve an automatically managed group. |
+| Health state | A connection's target-resource availability after the group's failure and recovery thresholds. It is separate from explicit capability verification. |
 | Healthcheck | A probe of a group-configured target resource through each connection, including DNS when the target uses a hostname. |
 | Failover | Selecting an eligible fallback when a preferred connection is unavailable. |
-| Failback | Returning new connections to the primary after the required successful healthchecks. Existing sessions may be interrupted by path changes or Xray restarts. |
+| Failback | Returning new connections to a recovered connection with higher priority after the required successful healthchecks. Existing sessions may be interrupted by path changes or Xray restarts. |
 | Network namespace | An isolated Linux network environment for an individual system VPN client, with separate interfaces, routes, and DNS handling. |
 | Structural validation | Checking profile syntax and required field structure without executing Xray or proving compatibility, authentication, or connectivity. |
 | Object revision | A saved object version used to reject stale updates and deletion requests. Renaming and moving retain the object ID. |

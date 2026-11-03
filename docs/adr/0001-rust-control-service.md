@@ -41,5 +41,6 @@ behavior, and dependency detection need disposable Linux tests.
 The current binary provides local management and VLESS domain/IP routing and connection DNS with
 preview, explicit apply, traffic verification and guarded recovery. Profile
 import validation remains structural. Native authentication,
-automatic failover, bootstrap and panel UI remain planned. No binary release
+bootstrap and panel UI remain planned. Optional group healthchecks provide
+automatic VLESS failover and stable recovery. No binary release
 has been published.

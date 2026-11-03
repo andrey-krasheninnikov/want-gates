@@ -12,6 +12,8 @@ import secrets
 import shutil
 import signal
 import socket
+import socketserver
+import ssl
 import struct
 import subprocess
 import sys
@@ -42,7 +44,11 @@ def resource(events):
         def do_GET(self):
             record('tcp', self.client_address[0], self.path)
             body = json.dumps(dict(peer=self.client_address[0])).encode()
-            self.send_response(200)
+            health_file=Path(events).parent/'health-failures.json'
+            failures=json.loads(health_file.read_text()) if health_file.exists() else []
+            status=503 if self.path.startswith('/health') and self.client_address[0] in failures else 200
+            if self.path.startswith('/health'):record('http-host',self.client_address[0],self.headers.get('Host',''))
+            self.send_response(status)
             self.send_header('Content-Length', str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -60,6 +66,37 @@ def resource(events):
     for cls, address in [(ThreadingHTTPServer, '0.0.0.0'), (V6, '::')]:
         server = cls((address, 18080), Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
+    class TcpHealth(socketserver.BaseRequestHandler):
+        def handle(self):
+            self.request.settimeout(3)
+            port=self.server.server_address[1]
+            try:
+                if port==18082:
+                    message=receive(self.request,4);record('tcp-health',self.client_address[0],message.hex())
+                    self.request.sendall(b'PONG' if message==b'PING' else b'FAIL')
+                elif port==18083:
+                    for byte in b'WGATES-READY\r\n':self.request.sendall(bytes([byte]));time.sleep(.2)
+                else:
+                    record('tcp-health',self.client_address[0],'banner');self.request.sendall(b'WGATES-READY\r\n')
+            except (OSError,EOFError):pass
+    class TcpV6(socketserver.ThreadingTCPServer):
+        address_family=socket.AF_INET6
+        def server_bind(self):
+            self.socket.setsockopt(socket.IPPROTO_IPV6,socket.IPV6_V6ONLY,1);super().server_bind()
+    for port in [18081,18082,18083]:
+        for cls,address in [(socketserver.ThreadingTCPServer,'0.0.0.0'),(TcpV6,'::')]:
+            server=cls((address,port),TcpHealth);server.daemon_threads=True
+            threading.Thread(target=server.serve_forever,daemon=True).start()
+    tls=Path(events).parent/'tls'
+    if tls.exists():
+        for port,label in [(18443,'valid'),(18444,'wrong'),(18445,'expired')]:
+            for cls,address in [(ThreadingHTTPServer,'0.0.0.0'),(V6,'::')]:
+                server=cls((address,port),Handler)
+                context=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                context.load_cert_chain(tls/f'{label}.crt',tls/f'{label}.key')
+                context.set_servername_callback(lambda sock,name,_: record('tls-sni',sock.getpeername()[0],name))
+                server.socket=context.wrap_socket(server.socket,server_side=True)
+                threading.Thread(target=server.serve_forever,daemon=True).start()
     def dns_reply(query, peer, transport):
         if len(query)<17:return None
         position,labels=12,[]
@@ -75,14 +112,19 @@ def resource(events):
         source=ipaddress.ip_address(peer[0])
         company=1 if source in ipaddress.ip_network('10.211.0.0/24') or source in ipaddress.ip_network('fd42:211::/64') else 2 if source in ipaddress.ip_network('10.212.0.0/24') or source in ipaddress.ip_network('fd42:212::/64') else 0
         record(transport,peer[0],name)
+        probe_file=Path(events).parent/'probe-failures.json'
+        failures=json.loads(probe_file.read_text()) if probe_file.exists() else []
+        if transport=='udp' and kind==1 and name=='probe.example.test' and peer[0] in failures:
+            return query[:2]+struct.pack('!5H',0x8182,1,0,0,0)+question
         protected=name=='corp.test' or name.endswith('.corp.test')
         flags=0x8182 if '.failure.' in '.'+name else 0x8183 if '.nxdomain.' in '.'+name else 0x8180
         answer=b'';count=0
-        family_empty='.nodata.' in '.'+name or protected and ((kind==1 and '.v6.' in '.'+name+'.') or (kind==28 and '.v4.' in '.'+name+'.'))
+        family_empty='.nodata.' in '.'+name or name=='mapped.corp.test' and kind==1 or protected and ((kind==1 and '.v6.' in '.'+name+'.') or (kind==28 and '.v4.' in '.'+name+'.'))
         if kind in (1,28) and flags==0x8180 and not family_empty:
             if protected:
                 address=(f'10.{219+company}.0.10' if company and '.public.' not in '.'+name else '1.1.1.1') if kind==1 else (f'fd42:{219+company}::10' if company else '2606:4700::1111')
             else:address=f'198.18.{company}.1' if kind==1 else f'fd43::{company+1}'
+            if name=='mapped.corp.test' and kind==28:address='::ffff:10.220.0.10'
             result=socket.inet_pton(socket.AF_INET if kind==1 else socket.AF_INET6,address)
             owner=b'\xc0\x0c';ttl=300 if protected else 0
             if '.alias.' in '.'+name+'.':
@@ -287,6 +329,12 @@ def main(binary, panel_root):
         for name,transit in [('gateway',210),('a',211),('b',212)]:ns(name,'ip','route','add','1.1.1.1/32','via',f'10.{transit}.0.2')
         ns('gateway','ip','-6','route','add','2606:4700::1111/128','via','fd42:210::2')
 
+        tls=work/'tls';tls.mkdir(mode=0o700)
+        checked('openssl','req','-x509','-newkey','rsa:2048','-nodes','-days','1','-subj','/CN=Routing test CA','-keyout',str(tls/'ca.key'),'-out',str(tls/'ca.crt'))
+        for label,host,days in [('valid','health.corp.test','1'),('wrong','wrong.corp.test','1'),('expired','health.corp.test','-1')]:
+            checked('openssl','req','-new','-newkey','rsa:2048','-nodes','-subj',f'/CN={host}','-keyout',str(tls/f'{label}.key'),'-out',str(tls/f'{label}.csr'))
+            (tls/'extensions').write_text(f'subjectAltName=DNS:{host}\nextendedKeyUsage=serverAuth\n')
+            checked('openssl','x509','-req','-in',str(tls/f'{label}.csr'),'-CA',str(tls/'ca.crt'),'-CAkey',str(tls/'ca.key'),'-CAcreateserial','-days',days,'-extfile',str(tls/'extensions'),'-out',str(tls/f'{label}.crt'))
         events = work / 'events.jsonl'
         resource_process = spawn('resource', ['python3', __file__, '--resource', events], 'resources')
         capture = spawn('resource',['tcpdump','-ni','any','-l','tcp port 18080 or port 15353 or port 53'],'resource-packets')
@@ -371,7 +419,12 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
         checked('systemctl','start',unit.name)
 
         def control(*args, payload=None, success=True):
-            result=run(str(installed),*args,'--socket',str(runtime/'control.sock'),input=json.dumps(payload) if isinstance(payload,(dict,list)) else payload,timeout=330)
+            deadline=time.monotonic()+60
+            while True:
+                result=run(str(installed),*args,'--socket',str(runtime/'control.sock'),input=json.dumps(payload) if isinstance(payload,(dict,list)) else payload,timeout=330)
+                if 'routing operation in progress; configuration writes are locked' not in result.stderr:break
+                assert time.monotonic()<deadline,'health worker did not release configuration writes'
+                time.sleep(0.05)
             if success and result.returncode:raise RuntimeError(result.stderr[:1000])
             if not success:
                 assert result.returncode!=0,'operation unexpectedly succeeded'
@@ -474,7 +527,7 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
         control('routing','preview',success=False)
         control('routing','recover',fault_plan,success=False)
         api('xray/update',dict(xraySetting=json.dumps(saved_before_fault),outboundTestUrl=settings['outboundTestUrl']))
-        assert control('routing','recover',fault_plan)['data']['state']=='restored'
+        restored=control('routing','recover',fault_plan)['data'];assert restored['state']=='restored',restored
         control('rule','delete',extra)
         # Drift after preview must be rejected before any managed write.
         drift_plan=control('routing','preview')['data']['plan_id']
@@ -508,9 +561,13 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
         for incompatible in [dict(foreign_dns,disableFallback=True),dict(foreign_dns,servers=[dict(address='1.1.1.1',domains=['full:retained-dns.example.test'],skipFallback=True)]),dict(foreign_dns,servers=['1.1.1.1',dict(address='tcp://[::ffff:192.168.1.53]:5353',skipFallback=True)])]:
             changed=json.loads(json.dumps(dns_baseline));changed['dns']=incompatible
             api('xray/update',dict(xraySetting=json.dumps(changed),outboundTestUrl=settings['outboundTestUrl']))
+            deadline=time.monotonic()+10
+            while api('server/status')['xray']['state']!='running':
+                assert time.monotonic()<deadline,'Xray did not settle before DNS validation'
+                time.sleep(.1)
             before=api('xray/',{})
             rejected=control('routing','preview',success=False)
-            assert 'DNS' in rejected.stderr
+            assert 'DNS' in rejected.stderr,rejected.stderr
             assert api('xray/',{})==before,'rejected DNS preview changed panel settings'
         api('xray/update',dict(xraySetting=json.dumps(dns_baseline),outboundTestUrl=settings['outboundTestUrl']))
         preview=control('routing','preview')['data'];result=control('routing','apply',preview['plan_id'])['data']
@@ -690,6 +747,141 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
             assert time.monotonic()<deadline;time.sleep(0.1)
         lookup(cached,expected='10.220.0.10')
         print('domain-only groups, exact/suffix priority, sniffed names, A/AAAA/CNAME, TCP/UDP DNS, resolver isolation, DNS recovery, primary switch, restart and no DNS leaks passed')
+        # Explicit apply activates one shared path for data and protected DNS.
+        reserves=[]
+        for label,limit in [('Limited reserve','tcp_ipv4'),('First reserve','all'),('Second reserve','all')]:
+            reserves.append(control('connection','import','--group',groups['a'],'--name',label,'--protocol','vless','--file','-','--dns','tcp://10.220.0.10:15353','--capabilities',limit,payload=json.dumps(outbound('10.214.0.2',19002,ids['b'])))['data']['id'])
+        policy=dict(target='https://health.corp.test:18443/health',required_capabilities=['tcp_ipv4','udp_ipv4'],interval_seconds=1,timeout_seconds=1,failure_threshold=3,recovery_threshold=5,ca_pem=(tls/'ca.crt').read_text())
+        control('group','update',groups['a'],'--fallbacks',','.join(reserves),'--healthcheck-file','-',payload=policy)
+        # Desired changes alone cannot enable monitoring.
+        assert not control('routing','status')['data']['health']['groups']
+        preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+        def health():
+            report=control('routing','status')['data']['health']
+            assert not report['error'],report
+            return next(g for g in report['groups'] if g['group_id']==groups['a'])
+        def await_health(predicate,seconds=45):
+            deadline=time.monotonic()+seconds
+            while True:
+                group=health()
+                if predicate(group):return group
+                assert time.monotonic()<deadline,group
+                time.sleep(0.05)
+        group=health();assert group['selected_connection']==connections['a'],group
+        assert not group['connections'][reserves[0]]['eligible'],group
+        assert control('connection','show',reserves[2])['data']['authentication']=='traffic_verified'
+        tcp('10.220.0.10','10.211.0.1');lookup('v4.corp.test',expected='10.220.0.10')
+        # Unchanged apply retains admitted traffic before the failure threshold.
+        probe_failures=work/'probe-failures.json'
+        control('group','update',groups['a'],'--healthcheck-file','-',payload=dict(policy,interval_seconds=30))
+        preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+        probe_failures.write_text(json.dumps(['10.211.0.1']))
+        control('group','update',groups['b'],'--name','Company B transient probe')
+        preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+        group=health();assert group['selected_connection']==connections['a'] and group['connections'][connections['a']]['failures']==1,group
+        assert group['connections'][connections['a']]['state']=='suspect',group
+        udp(15354,'198.18.1.1');lookup('v4.corp.test',expected='10.220.0.10')
+        probe_failures.write_text('[]')
+        control('group','update',groups['a'],'--healthcheck-file','-',payload=policy)
+        preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+        failures=work/'health-failures.json'
+        failures.write_text(json.dumps(['10.211.0.1','fd42:211::1']))
+        group=await_health(lambda g:g['connections'][connections['a']]['failures'] in [1,2])
+        assert group['selected_connection']==connections['a'],group
+        group=await_health(lambda g:g['selected_connection']==reserves[1])
+        assert group['connections'][connections['a']]['failures']==3,group
+        tcp('10.220.0.10','10.212.0.1');udp(15354,'198.18.2.1');lookup('v4.corp.test',expected='10.221.0.10')
+        tcp('10.221.0.10','10.212.0.1');tcp('1.1.1.1','10.210.0.1')
+        # Explicit verification remains independent of both selection and health streaks.
+        before=api('xray/',{});control('connection','verify',reserves[2]);assert api('xray/',{})==before
+        assert control('group','show',groups['a'])['data']['primary']==connections['a']
+        failures.write_text(json.dumps(['10.211.0.1','fd42:211::1','10.212.0.1','fd42:212::1']))
+        group=await_health(lambda g:g['selected_connection'] is None)
+        markers=[tcp('10.220.0.10',None,False),udp(15354,None,False),named_tcp('v4.corp.test',None,positive=False)]
+        denied=secrets.token_hex(10)+'.v4.corp.test';lookup(denied,rcode=5)
+        tcp('10.221.0.10','10.212.0.1');tcp('1.1.1.1','10.210.0.1')
+        events_now=[json.loads(line) for line in events.read_text().splitlines()]
+        assert not any(e['marker'] in markers+[denied] for e in events_now),'all-down traffic or DNS leaked'
+        # Applying unrelated desired edits must retain the known-down recovery threshold.
+        control('group','update',groups['b'],'--name','Company B renamed')
+        preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+        group=health();assert group['connections'][connections['a']]['failures']==3,group
+        assert group['connections'][connections['a']]['state']=='unhealthy',group
+        failures.write_text(json.dumps(['10.212.0.1','fd42:212::1']))
+        group=await_health(lambda g:0<g['connections'][connections['a']]['successes']<5)
+        assert group['selected_connection'] is None,group
+        group=await_health(lambda g:g['selected_connection']==connections['a'])
+        assert group['connections'][connections['a']]['successes']==5,group
+        lookup('v4.corp.test',expected='10.220.0.10');tcp('10.220.0.10','10.211.0.1')
+        # Saving an invalid TLS target does not change the applied policy before apply.
+        for port,reason in [(18444,'tls_failed'),(18445,'tls_failed')]:
+            selected=health()['selected_connection']
+            changed=dict(policy,target=f'https://health.corp.test:{port}/health')
+            control('group','update',groups['a'],'--healthcheck-file','-',payload=changed)
+            assert health()['selected_connection']==selected
+            preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+            group=health();assert group['selected_connection'] is None and group['connections'][connections['a']]['reason']==reason,group
+        changed=dict(policy);changed.pop('ca_pem')
+        control('group','update',groups['a'],'--healthcheck-file','-',payload=changed)
+        preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+        assert health()['connections'][connections['a']]['reason']=='tls_failed'
+        # A slow resolver shares the target deadline, including fragmented TCP replies.
+        changed=dict(policy,target='tcp://slow.corp.test:18081',expect_hex=b'WGATES-READY\r\n'.hex())
+        control('connection','update',connections['a'],'--dns','tcp://10.220.0.10:15353')
+        control('group','update',groups['a'],'--healthcheck-file','-',payload={k:v for k,v in changed.items() if k!='ca_pem'})
+        started=time.monotonic();preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+        assert time.monotonic()-started<30,'healthcheck retained a slow TCP DNS stream beyond its deadline'
+        group=health();assert group['connections'][connections['a']]['reason']=='dns_failed',group
+        # Invalid resolver addresses fail the sample without stopping the control plane.
+        control('connection','update',connections['a'],'--dns','udp://10.220.0.10:15353')
+        control('group','update',groups['a'],'--healthcheck-file','-',payload=dict(target='tcp://mapped.corp.test:18081',expect_hex=b'WGATES-READY\r\n'.hex(),required_capabilities=['tcp_ipv6'],interval_seconds=1,timeout_seconds=1))
+        preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+        group=health();assert group['connections'][connections['a']]['reason']=='dns_failed',group
+        # TCP needs a real resource response; a local SOCKS acknowledgement is insufficient.
+        failures.write_text('[]')
+        for target,extra,positive in [
+            ('tcp://10.220.0.10:18082',dict(send_hex=b'PING'.hex(),expect_hex=b'PONG'.hex()),True),
+            ('tcp://[fd42:220::10]:18081',dict(expect_hex=b'WGATES-READY\r\n'.hex()),True),
+            ('tcp://10.220.0.10:19999',dict(expect_hex=b'PONG'.hex()),False),
+            ('tcp://10.220.0.10:18082',dict(send_hex=b'PING'.hex(),expect_hex=b'WRONG'.hex()),False),
+            ('tcp://10.220.0.10:18083',dict(expect_hex=b'WGATES-READY\r\n'.hex()),False)]:
+            changed=dict(target=target,required_capabilities=['tcp_ipv4','udp_ipv4'],interval_seconds=1,timeout_seconds=1,**extra)
+            control('group','update',groups['a'],'--healthcheck-file','-',payload=changed)
+            preview=control('routing','preview')['data'];started=time.monotonic();control('routing','apply',preview['plan_id'])
+            group=health();assert (group['selected_connection']==connections['a'])==positive,group
+            assert time.monotonic()-started<30,'TCP response fragments extended the deadline'
+        # Target address families are independent of required group traffic.
+        for target,required in [('http://10.220.0.10:18080/health','tcp_ipv6'),('http://v4.corp.test:18080/health','tcp_ipv6'),('http://v6.corp.test:18080/health','tcp_ipv4')]:
+            changed=dict(target=target,required_capabilities=[required],interval_seconds=1,timeout_seconds=1)
+            control('group','update',groups['a'],'--healthcheck-file','-',payload=changed)
+            preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+            group=health();assert group['selected_connection']==connections['a'],group
+        # Successful recovery also admits the DNS transport outside the required set.
+        probe_failures.write_text(json.dumps(['10.211.0.1']))
+        changed=dict(target='http://10.220.0.10:18080/health',required_capabilities=['tcp_ipv4'],interval_seconds=1,timeout_seconds=1)
+        control('group','update',groups['a'],'--healthcheck-file','-',payload=changed)
+        preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+        assert not health()['connections'][connections['a']]['eligible']
+        probe_failures.write_text('[]')
+        await_health(lambda g:g['selected_connection']==connections['a'] and g['connections'][connections['a']]['state']=='healthy')
+        lookup('v4.corp.test',expected='10.220.0.10');named_tcp('v4.corp.test','10.211.0.1')
+        # Restore a good policy and prove restart resumes checks without old success streaks.
+        failures.write_text('[]')
+        control('connection','update',connections['a'],'--dns','udp://10.220.0.10:15353')
+        control('group','update',groups['a'],'--healthcheck-file','-',payload=policy)
+        preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+        checked('systemctl','restart',unit.name)
+        deadline=time.monotonic()+10
+        while run(str(installed),'status','--socket',str(runtime/'control.sock')).returncode:
+            assert time.monotonic()<deadline;time.sleep(0.1)
+        await_health(lambda g:g['selected_connection']==connections['a'] and g['connections'][connections['a']]['state']=='healthy')
+        tls_events=[json.loads(line) for line in events.read_text().splitlines()]
+        assert any(e['transport']=='tls-sni' and e['marker']=='health.corp.test' for e in tls_events)
+        assert any(e['transport']=='http-host' and e['marker']=='health.corp.test:18443' for e in tls_events)
+        control('group','update',groups['a'],'--fallbacks','-','--healthcheck-file','-',payload='null')
+        preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+        for reserve in reserves:control('connection','delete',reserve)
+        print('automatic thresholds, ordered reserves, shared data/DNS selection, all-down blocking, stable recovery, HTTPS trust/name/expiry, deadline and restart passed')
         for rule in domain_rules:control('rule','delete',rule)
         preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
         nested=control('rule','create','--group',groups['b'],'--destination','10.220.0.128/25')['data']['id']

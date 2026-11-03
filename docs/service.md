@@ -209,7 +209,8 @@ UDP/TCP resolver URI. Optional `allowed_capabilities` is an array of distinct
 `tcp_ipv4`, `udp_ipv4`, `tcp_ipv6`, `udp_ipv6` values; an empty array disables all.
 Show and verify use `id`. Update and delete
 require `id` and `expected_revision`, obtained from a prior show. Updates supply
-only changed fields: group `name`, `primary` (ID or null), or `probes`; connection
+only changed fields: group `name`, `primary` (ID or null), `probes`,
+`fallbacks` (ordered ID array), or `healthcheck` (object or null); connection
 `name`, `group_id`, `profile`, `dns` (URI or null), or `allowed_capabilities`; rule `group_id` or
 `destination`. Unexpected
 fields are rejected. Stale revisions fail without a write;
@@ -223,15 +224,20 @@ same pagination fields as other lists and an optional `group_id`.
 
 Management responses wrap their result in `data`. Routing status includes
 `desired_revision`, `busy`, `recovery_required`, `last_observation`, and
-`connection_verifications`. Private `routing/connections.json` retains the latest
+`connection_verifications`, applied `health`, and `health_schedule` with due/overdue
+seconds. Health contains per-group selection, per-connection reasons and streaks,
+and an automation error when intervention is required. Private `routing/connections.json` retains the latest
 per-connection observations. `connection.verify` returns `connection_id`,
 `verification`, and `policy_effect: observations_only`. It requires completed
 current preparation and never changes the primary or panel. A caller
 disconnect does not cancel an accepted operation. Inspect status before retrying.
-See [routing operation](routing.md) for observation and recovery semantics.
+TCP healthchecks require `expect_hex` and optionally accept `send_hex`, each
+bounded at 1024 decoded bytes. HTTP/HTTPS targets reject these TCP-only fields.
+See [routing operation](routing.md) for target settings, observation and recovery semantics.
 
 Successful management responses contain `api_version` and `data`. Lists return
-up to 100 objects, `list_revision`, and nullable `next_offset`. Continue with
+up to 100 objects within a 2 MiB data budget, `list_revision`, and nullable
+`next_offset`. Continue with
 `offset: next_offset` and the same `list_revision`. Connection lists optionally
 accept `group_id` and `sort: group|name`. Changing configuration invalidates an
 in-progress listing. Configuration writes are serialized. One worker performs
