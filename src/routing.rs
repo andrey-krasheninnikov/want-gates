@@ -136,7 +136,7 @@ fn connection_verification(
 ) -> Value {
     let stale = record.is_some_and(|r| {
         connection_binding(config, connection).is_ok_and(|b| b != r.binding)
-            || connection.protocol == "openvpn"
+            || crate::native::is_native(&connection.protocol)
                 && (native_context.is_none() || r.native_context.as_deref() != native_context)
     });
     let results = record.map(|r| &r.results);
@@ -506,7 +506,7 @@ pub(crate) fn outbound(input: &Input, id: &str, diagnostic: bool) -> Value {
         .config
         .connections
         .iter()
-        .any(|c| c.id == id && c.protocol == "openvpn")
+        .any(|c| c.id == id && crate::native::is_native(&c.protocol))
     {
         input
             .native
@@ -549,7 +549,7 @@ fn render(
             .config
             .connections
             .iter()
-            .find(|c| c.id == *id && c.protocol == "openvpn")
+            .find(|c| c.id == *id && crate::native::is_native(&c.protocol))
         {
             let mut diagnostic = outbound(input, id, true);
             diagnostic["tag"] = json!(crate::native::diagnostic_tag(connection));
@@ -758,9 +758,9 @@ impl Service {
                 .iter()
                 .find(|c| request["id"] == c.id)
                 .ok_or_else(|| invalid("connection not found"))?;
-            if connection.protocol != "openvpn" {
+            if !crate::native::is_native(&connection.protocol) {
                 return Err(invalid(
-                    "native authentication is available only for OpenVPN",
+                    "native authentication is available only for OpenVPN and Forti",
                 ));
             }
             if working.as_ref().is_none_or(|w| {
@@ -1011,7 +1011,7 @@ fn execute(
             .config
             .connections
             .iter()
-            .any(|c| c.protocol == "openvpn")
+            .any(|c| crate::native::is_native(&c.protocol))
         {
             native.call(json!({"command":"preflight"}))?;
         }
@@ -1019,7 +1019,7 @@ fn execute(
             .config
             .connections
             .iter()
-            .filter(|c| c.protocol == "openvpn")
+            .filter(|c| crate::native::is_native(&c.protocol))
         {
             let generation = previous
                 .as_ref()
@@ -1132,7 +1132,7 @@ fn execute(
             .config
             .connections
             .iter()
-            .filter(|c| c.protocol == "openvpn")
+            .filter(|c| crate::native::is_native(&c.protocol))
         {
             let generation = journal
                 .plan
@@ -1199,7 +1199,7 @@ fn execute(
                 .iter()
                 .find(|g| g.id == rule.group_id)
                 .and_then(|g| crate::domain::connection(&effective_input.config, g))
-                .is_none_or(|c| c.protocol != "openvpn")
+                .is_none_or(|c| !crate::native::is_native(&c.protocol))
         });
         let mut matrix = crate::probe::check(&client, &legacy, &journal.plan.proxy, None)?;
         for group in effective_input.config.groups.iter().filter(|g| {
@@ -1211,7 +1211,7 @@ fn execute(
                     .any(|r| r.group_id == g.id)
         }) {
             if let Some(connection) = crate::domain::connection(&effective_input.config, group)
-                && connection.protocol == "openvpn"
+                && crate::native::is_native(&connection.protocol)
             {
                 let mut results = if let Some(reason) =
                     crate::native::readiness(connection, &native_observations)
@@ -1270,7 +1270,7 @@ fn execute(
                 verifications.insert(connection.id.clone(), admitted.clone());
                 let mut record = crate::health::Observation {
                     admitted: admitted.clone(),
-                    was_down: connection.protocol == "openvpn"
+                    was_down: crate::native::is_native(&connection.protocol)
                         && journal.previous.as_ref().is_some_and(|previous| {
                             previous.native.contains_key(&connection.id)
                                 && previous
@@ -1294,7 +1294,7 @@ fn execute(
                     && connection_binding(&previous.config, old_connection)?
                         == connection_binding(&effective_input.config, connection)?
                     && digest(&old_group.healthcheck)? == digest(&group.healthcheck)?
-                    && (connection.protocol != "openvpn"
+                    && (!crate::native::is_native(&connection.protocol)
                         || previous
                             .native_observations
                             .get(&connection.id)

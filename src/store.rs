@@ -154,7 +154,7 @@ impl Store {
         }
         let mut names = std::collections::HashSet::new();
         for connection in &config.connections {
-            if !matches!(connection.protocol.as_str(), "vless" | "openvpn")
+            if !matches!(connection.protocol.as_str(), "vless" | "openvpn" | "forti")
                 || id_number(&connection.id, 'c').is_none_or(|n| n > connection.revision)
                 || connection.revision == 0
                 || connection.revision > config.revision
@@ -776,9 +776,9 @@ fn dns_setting(value: Option<&Value>) -> io::Result<Option<String>> {
 
 fn protocol(value: &Value) -> io::Result<()> {
     match text(value)? {
-        "vless" | "openvpn" => Ok(()),
-        "forti" | "wireguard" | "netbird" => Err(invalid(
-            "protocol adapter unavailable; only VLESS and OpenVPN profile import are implemented",
+        "vless" | "openvpn" | "forti" => Ok(()),
+        "wireguard" | "netbird" => Err(invalid(
+            "protocol adapter unavailable; only VLESS, OpenVPN and Forti profile import are implemented",
         )),
         _ => Err(invalid("unsupported protocol")),
     }

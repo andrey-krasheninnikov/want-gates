@@ -6,6 +6,10 @@ use std::io;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
+pub fn is_native(protocol: &str) -> bool {
+    matches!(protocol, "openvpn" | "forti")
+}
+
 pub const DEFAULT_SOCKET: &str = "/run/wgates-native/control.sock";
 
 #[derive(Clone)]
@@ -153,7 +157,7 @@ pub type Generations = BTreeMap<String, Prepared>;
 pub fn diagnostic_tag(connection: &crate::store::Connection) -> String {
     format!(
         "wgates-{}-{}",
-        if connection.protocol == "openvpn" {
+        if is_native(&connection.protocol) {
             "diagnostic"
         } else {
             "out"
@@ -229,7 +233,7 @@ pub fn effective(
 ) -> crate::store::Config {
     let mut config = config.clone();
     for connection in &mut config.connections {
-        if connection.protocol == "openvpn" && connection.dns.is_none() {
+        if is_native(&connection.protocol) && connection.dns.is_none() {
             connection.dns = observations.get(&connection.id).and_then(|v| v.dns.clone());
         }
     }
@@ -292,7 +296,7 @@ pub fn readiness(
     connection: &crate::store::Connection,
     observations: &BTreeMap<String, Observation>,
 ) -> Option<&'static str> {
-    if connection.protocol != "openvpn" {
+    if !is_native(&connection.protocol) {
         return None;
     }
     match observations
