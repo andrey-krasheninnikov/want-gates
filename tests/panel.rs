@@ -680,3 +680,105 @@ fn unsafe_dns_context_is_rejected_without_panel_writes() {
     assert!(!command(&s, &["routing", "preview"], None).status.success());
     assert_eq!(*p.writes.lock().unwrap(), 0);
 }
+
+#[test]
+fn preview_explains_limits_and_prepares_each_connection_without_panel_writes() {
+    let s = Service::start();
+    let p = Panel::start();
+    let (group, rule) = configured_rule(&s, &p);
+    let id = ok(&s, &["connection", "import", "--group", &group, "--name", "Limited", "--protocol", "vless", "--file", "-", "--capabilities", "tcp_ipv4"], Some("vless://00000000-0000-4000-8000-000000000001@127.0.0.1:443?encryption=none&security=none"))["data"]["id"].as_str().unwrap().to_owned();
+    ok(&s, &["group", "update", &group, "--primary", &id], None);
+    let writes = *p.writes.lock().unwrap();
+    let before = p.template.lock().unwrap().clone();
+    let preview = ok(&s, &["routing", "preview"], None);
+    assert_eq!(
+        preview["data"]["eligibility"][&rule]["udp_ipv4"]["reason"],
+        "configured_limit"
+    );
+    assert_eq!(
+        preview["data"]["eligibility"][&rule]["tcp_ipv4"]["reason"],
+        "probe_missing"
+    );
+    assert_eq!(preview["data"]["prepared_connections"], json!([id]));
+    assert_eq!(*p.writes.lock().unwrap(), writes);
+    assert_eq!(*p.template.lock().unwrap(), before);
+}
+
+#[test]
+fn connection_verification_requires_preparation_and_preserves_primary_and_panel() {
+    let mut s = Service::start();
+    let p = Panel::start();
+    let (group, _) = configured_rule(&s, &p);
+    let id = ok(&s, &["connection", "import", "--group", &group, "--name", "Reserve", "--protocol", "vless", "--file", "-", "--capabilities", "none"], Some("vless://00000000-0000-4000-8000-000000000001@127.0.0.1:443?encryption=none&security=none"))["data"]["id"].as_str().unwrap().to_owned();
+    let before = command(&s, &["connection", "verify", &id], None);
+    assert!(!before.status.success());
+    assert!(String::from_utf8_lossy(&before.stderr).contains("preview and apply"));
+    let preview = ok(&s, &["routing", "preview"], None);
+    ok(
+        &s,
+        &[
+            "routing",
+            "apply",
+            preview["data"]["plan_id"].as_str().unwrap(),
+        ],
+        None,
+    );
+    let writes = *p.writes.lock().unwrap();
+    let template = p.template.lock().unwrap().clone();
+    let verified = ok(&s, &["connection", "verify", &id], None);
+    assert_eq!(
+        verified["data"]["verification"]["capabilities"]["tcp_ipv4"]["state"],
+        "unsupported"
+    );
+    assert_eq!(
+        verified["data"]["verification"]["capabilities"]["tcp_ipv4"]["reason"],
+        "configured_limit"
+    );
+    assert!(ok(&s, &["group", "show", &group], None)["data"]["primary"].is_null());
+    assert_eq!(*p.writes.lock().unwrap(), writes);
+    assert_eq!(*p.template.lock().unwrap(), template);
+    assert!(s.stop().success());
+    s.start_again();
+    assert!(
+        ok(&s, &["connection", "show", &id], None)["data"]["verification"]["observed_at"].is_u64()
+    );
+    ok(
+        &s,
+        &["connection", "update", &id, "--capabilities", "tcp_ipv4"],
+        None,
+    );
+    let changed = ok(&s, &["connection", "show", &id], None);
+    assert_eq!(
+        changed["data"]["verification"]["capabilities"]["tcp_ipv4"]["state"],
+        "stale"
+    );
+    assert!(
+        !command(&s, &["connection", "verify", &id], None)
+            .status
+            .success()
+    );
+    assert_eq!(*p.writes.lock().unwrap(), writes);
+}
+
+#[test]
+fn unreadable_verification_does_not_hide_routing_status_or_overwrite_evidence() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Service::start();
+    let p = Panel::start();
+    let (group, _) = configured_rule(&s, &p);
+    let id = ok(&s, &["connection", "import", "--group", &group, "--name", "Unverified", "--protocol", "vless", "--file", "-"], Some("vless://00000000-0000-4000-8000-000000000001@127.0.0.1:443?encryption=none&security=none"))["data"]["id"].as_str().unwrap().to_owned();
+    let path = s.state.join("routing/connections.json");
+    std::fs::write(&path, b"invalid verification").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(
+        ok(&s, &["connection", "show", &id], None)["data"]["verification"]["state"],
+        "unknown"
+    );
+    let status = ok(&s, &["routing", "status"], None);
+    assert_eq!(
+        status["data"]["connection_verifications"]["state"],
+        "unknown"
+    );
+    assert_eq!(status["data"]["last_observation"]["state"], "blocked");
+    assert_eq!(std::fs::read(&path).unwrap(), b"invalid verification");
+}

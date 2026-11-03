@@ -1,3 +1,4 @@
+mod capability;
 mod domain;
 mod management;
 mod panel;
@@ -33,9 +34,10 @@ Usage:
   wgates group create --name NAME [--socket PATH]
   wgates group list|show ID|delete ID [--socket PATH]
   wgates group update ID [--name NAME] [--primary CONNECTION_ID|-] [--probe-file PATH|-]
-  wgates connection import --group ID --name NAME --protocol vless --file PATH|- [--dns URI]
+  wgates connection import --group ID --name NAME --protocol vless --file PATH|- [--dns URI] [--capabilities LIST|all|none]
+  wgates connection verify ID
   wgates connection list [--group ID] [--sort group|name]
-  wgates connection show ID|update ID [--name NAME] [--group ID] [--file PATH|-] [--dns URI|-]|delete ID
+  wgates connection show ID|update ID [--name NAME] [--group ID] [--file PATH|-] [--dns URI|-] [--capabilities LIST|all|none]|delete ID
   wgates rule create --group ID --destination DOMAIN_OR_IP_OR_CIDR
   wgates rule list [--group ID]
   wgates rule show ID|update ID [--group ID] [--destination DOMAIN_OR_IP_OR_CIDR]|delete ID
@@ -327,7 +329,10 @@ fn handle(
         }
         Ok(request) if request["command"].as_str() != Some("status") => {
             let command = request["command"].as_str().unwrap_or("");
-            if command.starts_with("routing.") || command.starts_with("panel.") {
+            if command.starts_with("routing.")
+                || command.starts_with("panel.")
+                || command == "connection.verify"
+            {
                 let response = match routing.dispatch(&request, store, stream) {
                     Ok(Some(mut response)) => {
                         response["api_version"] = json!(API_VERSION);

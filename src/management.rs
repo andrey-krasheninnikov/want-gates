@@ -24,13 +24,23 @@ pub fn run(kind: &str, mut args: impl Iterator<Item = OsString>) -> io::Result<(
         ("panel", "preflight") | ("routing", "preview" | "status" | "apply" | "recover") => &[],
         ("rule", "show" | "delete") => &[],
         ("group", "list" | "show" | "delete") => &[],
-        ("connection", "import") => &["--name", "--group", "--protocol", "--file", "--dns"],
-        ("connection", "update") => &["--name", "--group", "--file", "--dns"],
+        ("connection", "import") => &[
+            "--name",
+            "--group",
+            "--protocol",
+            "--file",
+            "--dns",
+            "--capabilities",
+        ],
+        ("connection", "update") => &["--name", "--group", "--file", "--dns", "--capabilities"],
         ("connection", "list") => &["--group", "--sort"],
-        ("connection", "show" | "delete") => &[],
+        ("connection", "show" | "delete" | "verify") => &[],
         _ => return Err(invalid("unsupported management action; run wgates --help")),
     };
-    let id = if matches!(action, "show" | "update" | "delete" | "apply" | "recover") {
+    let id = if matches!(
+        action,
+        "show" | "update" | "delete" | "apply" | "recover" | "verify"
+    ) {
         Some(
             args.next()
                 .ok_or_else(|| invalid("object ID is required"))?,
@@ -92,6 +102,13 @@ pub fn run(kind: &str, mut args: impl Iterator<Item = OsString>) -> io::Result<(
     }
     if kind == "group" && action == "create" && request.get("name").is_none() {
         return Err(invalid("--name is required"));
+    }
+    if let Some(value) = options.get("--capabilities") {
+        request["allowed_capabilities"] = json!(crate::capability::parse(
+            value
+                .to_str()
+                .ok_or_else(|| invalid("capabilities must be UTF-8"))?
+        )?);
     }
     if request["dns"] == "-" {
         request["dns"] = Value::Null;
@@ -201,10 +218,9 @@ fn exchange(socket: &std::path::Path, request: &Value) -> io::Result<Value> {
         )
     })?;
     write_message(&mut stream, request)?;
-    let response = if request["command"]
-        .as_str()
-        .is_some_and(|s| s.starts_with("routing.") || s == "panel.preflight")
-    {
+    let response = if request["command"].as_str().is_some_and(|s| {
+        s.starts_with("routing.") || s == "panel.preflight" || s == "connection.verify"
+    }) {
         crate::read_message_with_timeout(&mut stream, std::time::Duration::from_secs(330))?
     } else {
         read_message(&mut stream)?
