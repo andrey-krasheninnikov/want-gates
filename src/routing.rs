@@ -399,7 +399,7 @@ fn render(
     rules.push(json!({"type":"field","ruleTag":"wgates-unmatched","inboundTag":ingress,"outboundTag":"wgates-direct"}));
     rules.extend(previous.into_iter().skip(1));
     template["routing"]["rules"] = json!(rules);
-    crate::domain::normalise_panel_dns(template);
+    crate::domain::normalise_panel_dns(template)?;
     Ok(result)
 }
 

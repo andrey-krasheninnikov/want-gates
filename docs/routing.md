@@ -104,12 +104,18 @@ outside this policy. Configure clients to send protected lookups through VLESS.
 
 Domain preflight requires `routing.domainStrategy: AsIs` and the default or
 `UseIP` global DNS query strategy. It rejects DNS scripts, system hosts,
-protected-name hosts overrides and unbounded hosts patterns. A VLESS server
+protected-name hosts overrides and unbounded hosts patterns. Panel DNS must
+allow fallback and retain a server without `skipFallback`; an empty server list
+keeps its implicit system resolver. Otherwise Xray could select a company
+resolver for an unmatched name. A VLESS server
 name must not overlap a protected domain, which could create a bootstrap cycle.
 Reconcile incompatible settings in the panel; Want Gates does not silently
 replace them. Existing DNS servers and other DNS fields retain their values.
 The panel's automatic `xui-dns-allow` normalization is included in preview and
 saved readback. Managed DNS tag routes terminate before those direct exceptions.
+With the panel's `geoip:private` block, all private DNS endpoints must share one
+port. The pinned panel emits duplicate `xui-dns-allow` tags for different ports,
+which Xray rejects. Preview rejects that combination before changing the panel.
 
 Preview includes group/connection resolver settings and panel DNS allow-rule
 changes without exposing profiles or probe credentials. Apply and recovery

@@ -72,6 +72,20 @@ pub fn validate(input: &Input, base: &Snapshot) -> io::Result<()> {
             "domain DNS requires AsIs routing, UseIP DNS, no DNS script and no system hosts; reconcile the panel before preview",
         ));
     }
+    let servers: Vec<_> = dns["servers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|v| !crate::routing::owned(v))
+        .collect();
+    // Xray uses the first server if neither domain matching nor fallback selects one.
+    if dns["disableFallback"] == true
+        || (!servers.is_empty() && servers.iter().all(|v| v["skipFallback"] == true))
+    {
+        return Err(invalid(
+            "domain DNS requires panel DNS fallback; reconcile disableFallback and skipFallback before preview",
+        ));
+    }
     if let Some(hosts) = dns.get("hosts") {
         let hosts = hosts
             .as_object()
@@ -297,13 +311,16 @@ fn endpoint(entry: &Value) -> Option<SocketAddr> {
     Some(address)
 }
 // 3x-ui 3.8.5 normalizes this panel-owned rule on every template save.
-pub fn normalise_panel_dns(template: &mut Value) {
+pub fn normalise_panel_dns(template: &mut Value) -> io::Result<()> {
     let mut groups: BTreeMap<u16, Vec<String>> = BTreeMap::new();
     for server in template["dns"]["servers"].as_array().into_iter().flatten() {
         if let Some(a) = endpoint(server)
             && panel_private(a.ip())
         {
-            groups.entry(a.port()).or_default().push(a.ip().to_string());
+            groups
+                .entry(a.port())
+                .or_default()
+                .push(a.ip().to_canonical().to_string());
         }
     }
     for ips in groups.values_mut() {
@@ -311,7 +328,7 @@ pub fn normalise_panel_dns(template: &mut Value) {
         ips.dedup();
     }
     let Some(rules) = template["routing"]["rules"].as_array_mut() else {
-        return;
+        return Ok(());
     };
     fn ips(value: &Value) -> Vec<String> {
         if let Some(s) = value.as_str() {
@@ -353,10 +370,16 @@ pub fn normalise_panel_dns(template: &mut Value) {
                 .iter()
                 .any(|s| s.eq_ignore_ascii_case("geoip:private"))
     }) else {
-        return;
+        return Ok(());
     };
+    if groups.len() > 1 {
+        return Err(invalid(
+            "3x-ui 3.8.5 requires one private DNS port while geoip:private is blocked; reconcile panel DNS before preview",
+        ));
+    }
     let allow=groups.into_iter().map(|(port,ips)|json!({"type":"field","ruleTag":"xui-dns-allow","ip":ips,"port":port.to_string(),"outboundTag":"direct"}));
     rules.splice(index..index, allow);
+    Ok(())
 }
 
 pub fn verify_routes(

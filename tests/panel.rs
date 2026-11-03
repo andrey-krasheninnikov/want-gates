@@ -533,7 +533,7 @@ fn blocked_domains_preserve_dns_and_panel_normalization() {
         &["panel", "configure", "--file", "-"],
         Some(&json!({"url":p.url,"token":"private-panel-token"}).to_string()),
     );
-    let foreign = json!({"servers":["1.1.1.1",{"address":"tcp://192.168.1.53:5353","skipFallback":false}],"hosts":{"unrelated.example":"192.0.2.4"},"disableCache":false});
+    let foreign = json!({"servers":["1.1.1.1",{"address":"tcp://[::ffff:192.168.1.53]:53","skipFallback":false}],"hosts":{"unrelated.example":"192.0.2.4"},"disableCache":false});
     {
         let mut t = p.template.lock().unwrap();
         t["dns"] = foreign.clone();
@@ -572,8 +572,7 @@ fn blocked_domains_preserve_dns_and_panel_normalization() {
     assert_eq!(
         preview["data"]["panel_dns_rules"],
         json!([
-        {"type":"field","ruleTag":"xui-dns-allow","ip":["10.53.0.53"],"port":"53","outboundTag":"direct"},
-        {"type":"field","ruleTag":"xui-dns-allow","ip":["192.168.1.53"],"port":"5353","outboundTag":"direct"}])
+        {"type":"field","ruleTag":"xui-dns-allow","ip":["10.53.0.53","192.168.1.53"],"port":"53","outboundTag":"direct"}])
     );
     let result = ok(
         &s,
@@ -641,6 +640,9 @@ fn unsafe_dns_context_is_rejected_without_panel_writes() {
         json!({"script":"policy.lua"}),
         json!({"useSystemHosts":true}),
         json!({"queryStrategy":"UseIPv4"}),
+        json!({"disableFallback":true}),
+        json!({"disableFallback":true,"servers":["1.1.1.1"]}),
+        json!({"servers":[{"address":"1.1.1.1","domains":["full:retained.example"],"skipFallback":true}]}),
         json!({"hosts":{"full:health.corp.example":"10.0.0.1"}}),
         json!({"hosts":{"regexp:.*":"10.0.0.1"}}),
     ] {
@@ -655,6 +657,24 @@ fn unsafe_dns_context_is_rejected_without_panel_writes() {
         );
         assert_eq!(*p.template.lock().unwrap(), before);
     }
+    {
+        let mut template = p.template.lock().unwrap();
+        *template = base.clone();
+        template["dns"] = json!({"servers":["10.0.0.53",{"address":"tcp://10.0.0.54:5353"}]});
+        template["outbounds"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"tag":"blocked","protocol":"blackhole"}));
+        template["routing"]["rules"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"field","ip":["geoip:private"],"outboundTag":"blocked"}));
+    }
+    let before = p.template.lock().unwrap().clone();
+    let rejected = command(&s, &["routing", "preview"], None);
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("private DNS port"));
+    assert_eq!(*p.template.lock().unwrap(), before);
     *p.template.lock().unwrap() = base;
     p.template.lock().unwrap()["routing"]["domainStrategy"] = json!("IPOnDemand");
     assert!(!command(&s, &["routing", "preview"], None).status.success());

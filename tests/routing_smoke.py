@@ -475,7 +475,7 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
         changed=json.loads(json.dumps(saved_before_fault));changed['log']['loglevel']='error'
         api('xray/update',dict(xraySetting=json.dumps(changed),outboundTestUrl=settings['outboundTestUrl']))
         drift=control('routing','apply',drift_plan,success=False)
-        assert 'drift' in drift.stderr
+        assert 'drift' in drift.stderr,drift.stderr
         current=api('xray/',{})
         if isinstance(current,str):current=json.loads(current)
         assert current['xraySetting']==changed
@@ -485,7 +485,7 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
         current=api('xray/',{})
         if isinstance(current,str):current=json.loads(current)
         dns_baseline=current['xraySetting']
-        foreign_dns=dict(servers=['1.1.1.1'],hosts={'retained.example.test':'192.0.2.9'},disableCache=False)
+        foreign_dns=dict(servers=['1.1.1.1',dict(address='tcp://[::ffff:192.168.1.53]:15353',domains=['full:retained-dns.example.test'],skipFallback=True)],hosts={'retained.example.test':'192.0.2.9'},disableCache=False,disableFallbackIfMatch=True)
         dns_baseline['dns']=foreign_dns
         dns_baseline['routing']['domainStrategy']='AsIs'
         api('xray/update',dict(xraySetting=json.dumps(dns_baseline),outboundTestUrl=settings['outboundTestUrl']))
@@ -499,6 +499,14 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
         domain_rules=[control('rule','create','--group',groups[group],'--destination',domain)['data']['id'] for group,domain in [('a','corp.test'),('b','dev.corp.test'),('b','full:corp.test')]]
         # Domain-only groups must not need synthetic CIDR rules for their probes.
         for destination in ['10.220.0.0/24','fd42:220::/64']:control('rule','delete',rules[destination])
+        for incompatible in [dict(foreign_dns,disableFallback=True),dict(foreign_dns,servers=[dict(address='1.1.1.1',domains=['full:retained-dns.example.test'],skipFallback=True)]),dict(foreign_dns,servers=['1.1.1.1',dict(address='tcp://[::ffff:192.168.1.53]:5353',skipFallback=True)])]:
+            changed=json.loads(json.dumps(dns_baseline));changed['dns']=incompatible
+            api('xray/update',dict(xraySetting=json.dumps(changed),outboundTestUrl=settings['outboundTestUrl']))
+            before=api('xray/',{})
+            rejected=control('routing','preview',success=False)
+            assert 'DNS' in rejected.stderr
+            assert api('xray/',{})==before,'rejected DNS preview changed panel settings'
+        api('xray/update',dict(xraySetting=json.dumps(dns_baseline),outboundTestUrl=settings['outboundTestUrl']))
         preview=control('routing','preview')['data'];result=control('routing','apply',preview['plan_id'])['data']
         assert result['state']=='applied',result
         assert all(v['dns']=='verified' for v in result['capabilities'].values()),result
@@ -591,6 +599,8 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
         assert current['xraySetting']['dns']['hosts']==foreign_dns['hosts']
         assert current['xraySetting']['dns']['disableCache'] is False
         assert '1.1.1.1' in current['xraySetting']['dns']['servers']
+        assert foreign_dns['servers'][1] in current['xraySetting']['dns']['servers']
+        assert any(rule.get('ruleTag')=='xui-dns-allow' and '192.168.1.53' in rule['ip'] and rule['port']=='15353' for rule in current['xraySetting']['routing']['rules'])
         checked('systemctl','restart',unit.name)
         deadline=time.monotonic()+10
         while run(str(installed),'status','--socket',str(runtime/'control.sock')).returncode:
