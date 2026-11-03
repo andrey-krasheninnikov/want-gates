@@ -112,10 +112,14 @@ def resource(events):
         source=ipaddress.ip_address(peer[0])
         company=1 if source in ipaddress.ip_network('10.211.0.0/24') or source in ipaddress.ip_network('fd42:211::/64') else 2 if source in ipaddress.ip_network('10.212.0.0/24') or source in ipaddress.ip_network('fd42:212::/64') else 0
         record(transport,peer[0],name)
+        probe_file=Path(events).parent/'probe-failures.json'
+        failures=json.loads(probe_file.read_text()) if probe_file.exists() else []
+        if transport=='udp' and kind==1 and name=='probe.example.test' and peer[0] in failures:
+            return query[:2]+struct.pack('!5H',0x8182,1,0,0,0)+question
         protected=name=='corp.test' or name.endswith('.corp.test')
         flags=0x8182 if '.failure.' in '.'+name else 0x8183 if '.nxdomain.' in '.'+name else 0x8180
         answer=b'';count=0
-        family_empty='.nodata.' in '.'+name or protected and ((kind==1 and '.v6.' in '.'+name+'.') or (kind==28 and '.v4.' in '.'+name+'.'))
+        family_empty='.nodata.' in '.'+name or name=='mapped.corp.test' and kind==1 or protected and ((kind==1 and '.v6.' in '.'+name+'.') or (kind==28 and '.v4.' in '.'+name+'.'))
         if kind in (1,28) and flags==0x8180 and not family_empty:
             if protected:
                 address=(f'10.{219+company}.0.10' if company and '.public.' not in '.'+name else '1.1.1.1') if kind==1 else (f'fd42:{219+company}::10' if company else '2606:4700::1111')
@@ -767,6 +771,19 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
         assert not group['connections'][reserves[0]]['eligible'],group
         assert control('connection','show',reserves[2])['data']['authentication']=='traffic_verified'
         tcp('10.220.0.10','10.211.0.1');lookup('v4.corp.test',expected='10.220.0.10')
+        # Unchanged apply retains admitted traffic before the failure threshold.
+        probe_failures=work/'probe-failures.json'
+        control('group','update',groups['a'],'--healthcheck-file','-',payload=dict(policy,interval_seconds=30))
+        preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+        probe_failures.write_text(json.dumps(['10.211.0.1']))
+        control('group','update',groups['b'],'--name','Company B transient probe')
+        preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+        group=health();assert group['selected_connection']==connections['a'] and group['connections'][connections['a']]['failures']==1,group
+        assert group['connections'][connections['a']]['state']=='suspect',group
+        udp(15354,'198.18.1.1');lookup('v4.corp.test',expected='10.220.0.10')
+        probe_failures.write_text('[]')
+        control('group','update',groups['a'],'--healthcheck-file','-',payload=policy)
+        preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
         failures=work/'health-failures.json'
         failures.write_text(json.dumps(['10.211.0.1','fd42:211::1']))
         group=await_health(lambda g:g['connections'][connections['a']]['failures'] in [1,2])
@@ -814,12 +831,12 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
         control('group','update',groups['a'],'--healthcheck-file','-',payload={k:v for k,v in changed.items() if k!='ca_pem'})
         started=time.monotonic();preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
         assert time.monotonic()-started<30,'healthcheck retained a slow TCP DNS stream beyond its deadline'
-        assert health()['connections'][connections['a']]['reason']=='dns_failed'
+        group=health();assert group['connections'][connections['a']]['reason']=='dns_failed',group
         # Invalid resolver addresses fail the sample without stopping the control plane.
         control('connection','update',connections['a'],'--dns','udp://10.220.0.10:15353')
         control('group','update',groups['a'],'--healthcheck-file','-',payload=dict(target='tcp://mapped.corp.test:18081',expect_hex=b'WGATES-READY\r\n'.hex(),required_capabilities=['tcp_ipv6'],interval_seconds=1,timeout_seconds=1))
         preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
-        assert health()['connections'][connections['a']]['reason']=='dns_failed'
+        group=health();assert group['connections'][connections['a']]['reason']=='dns_failed',group
         # TCP needs a real resource response; a local SOCKS acknowledgement is insufficient.
         failures.write_text('[]')
         for target,extra,positive in [
@@ -833,6 +850,21 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
             preview=control('routing','preview')['data'];started=time.monotonic();control('routing','apply',preview['plan_id'])
             group=health();assert (group['selected_connection']==connections['a'])==positive,group
             assert time.monotonic()-started<30,'TCP response fragments extended the deadline'
+        # Target address families are independent of required group traffic.
+        for target,required in [('http://10.220.0.10:18080/health','tcp_ipv6'),('http://v4.corp.test:18080/health','tcp_ipv6'),('http://v6.corp.test:18080/health','tcp_ipv4')]:
+            changed=dict(target=target,required_capabilities=[required],interval_seconds=1,timeout_seconds=1)
+            control('group','update',groups['a'],'--healthcheck-file','-',payload=changed)
+            preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+            group=health();assert group['selected_connection']==connections['a'],group
+        # Successful recovery also admits the DNS transport outside the required set.
+        probe_failures.write_text(json.dumps(['10.211.0.1']))
+        changed=dict(target='http://10.220.0.10:18080/health',required_capabilities=['tcp_ipv4'],interval_seconds=1,timeout_seconds=1)
+        control('group','update',groups['a'],'--healthcheck-file','-',payload=changed)
+        preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+        assert not health()['connections'][connections['a']]['eligible']
+        probe_failures.write_text('[]')
+        await_health(lambda g:g['selected_connection']==connections['a'] and g['connections'][connections['a']]['state']=='healthy')
+        lookup('v4.corp.test',expected='10.220.0.10');named_tcp('v4.corp.test','10.211.0.1')
         # Restore a good policy and prove restart resumes checks without old success streaks.
         failures.write_text('[]')
         control('connection','update',connections['a'],'--dns','udp://10.220.0.10:15353')

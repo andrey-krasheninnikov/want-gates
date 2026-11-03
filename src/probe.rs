@@ -876,10 +876,17 @@ fn health_at(
     let port = url.port_or_known_default().unwrap();
     let host = url.host_str().unwrap().trim_matches(['[', ']']);
     let mut results = std::collections::BTreeMap::new();
-    let resolved = if let Ok(ip) = host.parse::<IpAddr>() {
-        Ok(vec![ip])
-    } else if let Some(server) = &connection.dns {
+    let literal = host.parse::<IpAddr>().ok();
+    let resolver = if literal.is_none() {
+        let Some(server) = &connection.dns else {
+            results.insert("health".into(), "dns_missing".into());
+            return Ok(results);
+        };
         let resolver = crate::policy::Resolver::parse(server)?;
+        if !crate::capability::permits(&connection.allowed_capabilities, &resolver.capability()) {
+            results.insert("health".into(), "dns_capability_missing".into());
+            return Ok(results);
+        }
         if client.route_context(
             PROBE_TAG,
             &resolver.address.ip().to_string(),
@@ -888,116 +895,114 @@ fn health_at(
             resolver.network,
             resolver.address.port(),
         )? != format!("wgates-out-{}", connection.id)
-            && crate::capability::permits(&connection.allowed_capabilities, &resolver.capability())
         {
             return Err(invalid("healthcheck DNS route changed"));
         }
-        if !crate::capability::permits(&connection.allowed_capabilities, &resolver.capability()) {
-            Err(invalid("dns_capability_missing"))
-        } else {
-            let mut addresses = Vec::new();
-            for (kind, capability) in [("A", "tcp_ipv4"), ("AAAA", "tcp_ipv6")] {
-                if check
-                    .required_capabilities
-                    .iter()
-                    .any(|c| c.ends_with(if kind == "A" { "ipv4" } else { "ipv6" }))
-                    && crate::capability::permits(&connection.allowed_capabilities, capability)
-                    && let Ok(ips) = lookup(host, kind, &resolver, &local, deadline)
-                {
-                    addresses.extend(ips);
-                }
-            }
-            if addresses.is_empty() {
-                Err(invalid("dns_failed"))
-            } else {
-                Ok(addresses)
-            }
-        }
+        Some(resolver)
     } else {
-        Err(invalid("dns_missing"))
+        None
     };
-    let addresses = match resolved {
-        Ok(ips) => ips
+    let mut target_error = if literal.is_some()
+        || !["tcp_ipv4", "tcp_ipv6"]
             .into_iter()
-            .filter(|ip| {
-                crate::capability::permits(
-                    &connection.allowed_capabilities,
-                    if ip.is_ipv4() { "tcp_ipv4" } else { "tcp_ipv6" },
-                )
-            })
-            .map(|ip| SocketAddr::new(ip, port))
-            .collect::<Vec<_>>(),
-        Err(e) => {
-            results.insert("health".into(), e.to_string());
-            return Ok(results);
-        }
-    };
-    if addresses.is_empty() {
-        results.insert("health".into(), "capability_missing".into());
-        return Ok(results);
-    }
-    for address in &addresses {
-        client.check()?;
-        if client.route_context(
-            PROBE_TAG,
-            &address.ip().to_string(),
-            None,
-            proxy
-                .connection_users
-                .get(&connection.id)
-                .map(String::as_str),
-            "tcp",
-            port,
-        )? != format!("wgates-out-{}", connection.id)
-        {
-            return Err(invalid("healthcheck diagnostic route changed"));
-        }
-    }
-    let target = if url.scheme() == "tcp" {
-        let mut result = Err(io::Error::other("target_failed"));
-        for address in &addresses {
-            result = (|| {
-                let mut stream = socks(&local, deadline)?;
-                let mut request = vec![5, 1, 0];
-                match address.ip() {
-                    IpAddr::V4(ip) => {
-                        request.push(1);
-                        request.extend(ip.octets());
-                    }
-                    IpAddr::V6(ip) => {
-                        request.push(4);
-                        request.extend(ip.octets());
-                    }
-                }
-                request.extend(port.to_be_bytes());
-                send(&mut stream, &request, deadline)?;
-                socks_reply(&mut stream, deadline)?;
-                let (message, expected) = check.tcp_exchange()?;
-                send(&mut stream, &message, deadline)?;
-                let mut answer = vec![0; expected.len()];
-                receive(&mut stream, &mut answer, deadline)?;
-                if answer != expected {
-                    return Err(invalid("target_response_mismatch"));
-                }
-                Ok(())
-            })();
-            if result.is_ok() {
-                break;
-            }
-        }
-        result.map_err(|_| io::Error::other("target_failed"))
+            .any(|c| crate::capability::permits(&connection.allowed_capabilities, c))
+    {
+        "capability_missing".to_owned()
     } else {
-        let mut result = Err(io::Error::other("target_failed"));
+        "dns_failed".to_owned()
+    };
+    let mut target_ok = false;
+    for (kind, capability) in [("A", "tcp_ipv4"), ("AAAA", "tcp_ipv6")] {
+        if Instant::now() >= deadline
+            || !crate::capability::permits(&connection.allowed_capabilities, capability)
+        {
+            continue;
+        }
+        let ips = if let Some(ip) = literal {
+            if ip.is_ipv4() != (kind == "A") {
+                continue;
+            }
+            vec![ip]
+        } else {
+            lookup(host, kind, resolver.as_ref().unwrap(), &local, deadline).unwrap_or_default()
+        };
+        let addresses = ips
+            .into_iter()
+            .map(|ip| SocketAddr::new(ip, port))
+            .collect::<Vec<_>>();
+        if addresses.is_empty() {
+            continue;
+        }
         for address in &addresses {
-            result = target_http(check, &local, std::slice::from_ref(address), deadline);
-            if result.is_ok() {
-                break;
+            client.check()?;
+            if client.route_context(
+                PROBE_TAG,
+                &address.ip().to_string(),
+                None,
+                proxy
+                    .connection_users
+                    .get(&connection.id)
+                    .map(String::as_str),
+                "tcp",
+                port,
+            )? != format!("wgates-out-{}", connection.id)
+            {
+                return Err(invalid("healthcheck diagnostic route changed"));
             }
         }
-        result
-    };
-    if let Err(error) = target {
-        results.insert("health".into(), error.to_string());
+        let target = if url.scheme() == "tcp" {
+            let mut result = Err(io::Error::other("target_failed"));
+            for address in &addresses {
+                result = (|| {
+                    let mut stream = socks(&local, deadline)?;
+                    let mut request = vec![5, 1, 0];
+                    match address.ip() {
+                        IpAddr::V4(ip) => {
+                            request.push(1);
+                            request.extend(ip.octets());
+                        }
+                        IpAddr::V6(ip) => {
+                            request.push(4);
+                            request.extend(ip.octets());
+                        }
+                    }
+                    request.extend(port.to_be_bytes());
+                    send(&mut stream, &request, deadline)?;
+                    socks_reply(&mut stream, deadline)?;
+                    let (message, expected) = check.tcp_exchange()?;
+                    send(&mut stream, &message, deadline)?;
+                    let mut answer = vec![0; expected.len()];
+                    receive(&mut stream, &mut answer, deadline)?;
+                    if answer != expected {
+                        return Err(invalid("target_response_mismatch"));
+                    }
+                    Ok(())
+                })();
+                if result.is_ok() {
+                    break;
+                }
+            }
+            result.map_err(|_| io::Error::other("target_failed"))
+        } else {
+            let mut result = Err(io::Error::other("target_failed"));
+            for address in &addresses {
+                result = target_http(check, &local, std::slice::from_ref(address), deadline);
+                if result.is_ok() {
+                    break;
+                }
+            }
+            result
+        };
+        match target {
+            Ok(()) => {
+                target_ok = true;
+                break;
+            }
+            Err(error) => target_error = error.to_string(),
+        }
+    }
+    if !target_ok {
+        results.insert("health".into(), target_error);
         return Ok(results);
     }
     let mut scoped = config.clone();

@@ -201,11 +201,10 @@ impl Observation {
             .cloned()
             .unwrap_or_else(|| "unknown".into());
         if self.reason == "verified" {
-            for capability in &policy.required_capabilities {
-                self.admitted.insert(capability.clone(), "verified".into());
-            }
-            if results.get("dns").is_some_and(|r| r == "verified") {
-                self.admitted.insert("dns".into(), "verified".into());
+            for capability in capability::ALL.into_iter().chain(["dns"]) {
+                if results.get(capability).is_some_and(|r| r == "verified") {
+                    self.admitted.insert(capability.into(), "verified".into());
+                }
             }
             self.failures = 0;
             self.successes = self

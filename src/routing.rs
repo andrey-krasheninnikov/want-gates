@@ -916,6 +916,7 @@ fn execute(
             &w.proxy,
             &w.matrix,
             &plan.ingress,
+            Some(&w.health),
         )?;
         return Ok(observation(&plan.id, &w.config, &w.snapshot, &w.matrix));
     }
@@ -955,6 +956,7 @@ fn execute(
         });
         let mut matrix = crate::probe::check(&client, &legacy, &journal.plan.proxy, None)?;
         let mut health = BTreeMap::new();
+        let mut verifications = BTreeMap::new();
         for connection in &input.config.connections {
             let group = input
                 .config
@@ -971,7 +973,11 @@ fn execute(
                 )?;
                 let results =
                     crate::probe::health(&client, &input.config, connection, &journal.plan.proxy)?;
-                let mut record = crate::health::Observation::default();
+                verifications.insert(connection.id.clone(), admitted.clone());
+                let mut record = crate::health::Observation {
+                    admitted: admitted.clone(),
+                    ..Default::default()
+                };
                 if let Some(previous) = &journal.previous
                     && let Some(old_connection) = previous
                         .config
@@ -986,8 +992,15 @@ fn execute(
                     && let Some(old) = previous.health.get(&connection.id)
                 {
                     record = old.clone();
+                    let mut retained = policy.required_capabilities.clone();
+                    retained.push("dns".into());
+                    if let Some(server) = &connection.dns {
+                        retained.push(crate::policy::Resolver::parse(server)?.capability());
+                    }
+                    record
+                        .admitted
+                        .extend(admitted.into_iter().filter(|(c, _)| !retained.contains(c)));
                 }
-                record.admitted = admitted;
                 record.record(results, policy);
                 health.insert(connection.id.clone(), record);
             }
@@ -1015,6 +1028,7 @@ fn execute(
             &journal.plan.proxy,
             &matrix,
             &journal.plan.ingress,
+            Some(&health),
         )?;
         let working = Working {
             plan_id: journal.plan.id.clone(),
@@ -1036,14 +1050,8 @@ fn execute(
             &working.matrix,
         );
         for connection in &input.config.connections {
-            if let Some(record) = working.health.get(&connection.id) {
-                record_connection(
-                    root,
-                    &input.config,
-                    connection,
-                    record.admitted.clone(),
-                    "apply",
-                )?;
+            if let Some(results) = verifications.get(&connection.id) {
+                record_connection(root, &input.config, connection, results.clone(), "apply")?;
             }
         }
         let effective = working.effective_config();
@@ -1129,12 +1137,32 @@ fn verify(
     proxy: &Proxy,
     matrix: &Matrix,
     ingress: &[String],
+    health: Option<&BTreeMap<String, crate::health::Observation>>,
 ) -> io::Result<()> {
     if client.read()? != *snapshot {
         return Err(invalid("observed panel drift during verification"));
     }
     wait_routes(client, config, matrix, ingress)?;
-    crate::probe::check(client, config, proxy, Some(matrix))?;
+    let mut verified = matrix.clone();
+    for group in config.groups.iter().filter(|g| g.healthcheck.is_some()) {
+        if let Some(record) = health.and_then(|h| group.primary.as_ref().and_then(|id| h.get(id)))
+            && record.fresh
+            && record.available
+            && record.failures > 0
+            && let Some(combinations) = verified.get_mut(&group.id)
+        {
+            for (capability, reason) in combinations {
+                if record
+                    .results
+                    .get(capability)
+                    .is_none_or(|r| r != "verified")
+                {
+                    *reason = "not_rechecked".into();
+                }
+            }
+        }
+    }
+    crate::probe::check(client, config, proxy, Some(&verified))?;
     if client.read()? != *snapshot {
         return Err(invalid("observed panel drift after traffic verification"));
     }
@@ -1289,6 +1317,7 @@ fn recover(root: &Path, client: &Client, journal: &mut Journal) -> io::Result<Va
             &previous.proxy,
             &previous.matrix,
             &journal.plan.ingress,
+            None,
         )
         .err()
         .map(|error| error.to_string())
@@ -1683,6 +1712,7 @@ fn health_cycle(
             &working.proxy,
             &matrix,
             &ingress,
+            Some(&working.health),
         )?;
         working.snapshot = candidate;
         working.selected = selected;

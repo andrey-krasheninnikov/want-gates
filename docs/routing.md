@@ -405,8 +405,12 @@ including members outside the fallback list. Only primary and listed reserves
 are selection candidates. Initial apply checks capabilities and the target;
 periodic checks repeat the target, required capability probes and needed DNS.
 Hostname targets use that connection's numeric resolver through its own VPN.
-They never use system DNS, another connection or a public fallback. Protected
-domain routing additionally requires the group's DNS probe to pass.
+They never use system DNS, another connection or a public fallback. Target
+address families depend on the connection's allowed TCP capabilities, separately
+from required group traffic. Checks try IPv4, then IPv6 when needed, within one
+deadline. A successful target does not wait for an unused address family.
+Protected domain routing additionally requires the group's DNS probe and its
+resolver transport to pass; recovery admits both together.
 
 Intervals range from 1 to 86400 seconds, timeout from 1 to 60 seconds and no
 longer than the interval; thresholds range from 1 to 1000. Timeout covers the
@@ -433,8 +437,12 @@ resume. Do not overwrite intervening panel edits. A new preview can become stale
 if an automatic switch changes the panel before apply.
 
 Monitoring uses retained applied configuration and profiles. An apply with
-unchanged connection and healthcheck inputs preserves failure and recovery history. Saving edits or
-removing desired objects does not silently change the active policy. Health
+unchanged connection and healthcheck inputs preserves failure and recovery history,
+including required traffic and DNS admission below the failure threshold.
+Apply records fresh capability observations separately. Final saved and runtime
+route checks still run; a second probe cannot bypass a pending failure threshold.
+Recovery requires strict traffic verification of the restored policy.
+Saving edits or removing desired objects does not silently change the active policy. Health
 status identifies its running revision separately. Restart retains the applied
 path and down history, resets streaks, marks old health unknown, and schedules
 fresh checks. Startup does not replay an interrupted external update.
