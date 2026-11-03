@@ -875,7 +875,11 @@ impl Runtime {
                 "nodad",
             ],
         )?;
+        let mut routed = std::collections::BTreeSet::new();
         for endpoint in &record.endpoints {
+            if !routed.insert(endpoint.address) {
+                continue;
+            }
             if endpoint.address.is_ipv4() {
                 ns(
                     record,

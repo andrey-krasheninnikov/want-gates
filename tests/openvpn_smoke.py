@@ -158,7 +158,7 @@ def acceptance(context):
         denied = stand.checked('python3','-c',"import os,socket,json,sys; os.setgroups([]); os.setgid(int(sys.argv[2])); os.setuid(65534); s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); s.sendall(b'{\"api_version\":1,\"command\":\"preflight\"}\\n'); print(s.recv(4096).decode())",str(runtime/'control.sock'),str(gid))
         assert json.loads(denied.stdout)['error']=='native peer is not authorized'
         group = control('group', 'create', '--name', 'Native company')['data']['id']
-        profile = 'client\ndev tun\nproto udp\nremote 10.213.0.2 1194\nremote-cert-tls server\n'
+        profile = 'client\ndev tun\nproto udp\nremote 10.213.0.2 1194\nremote 10.213.0.2 1195\nremote-cert-tls server\n'
         for kind, file in [('ca','ca.crt'), ('cert','client.crt'), ('key','client.key')]:
             profile += f'<{kind}>\n{(tls/file).read_text()}</{kind}>\n'
         connection = control('connection','import','--group',group,'--name','OpenVPN primary','--protocol','openvpn','--file','-',payload=profile)['data']['id']
