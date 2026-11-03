@@ -186,9 +186,30 @@ pub fn run(kind: &str, mut args: impl Iterator<Item = OsString>) -> io::Result<(
             request["settings"] = serde_json::from_slice(&bytes)
                 .map_err(|_| invalid("invalid panel settings JSON"))?;
         } else {
-            request["profile"] = json!(
-                String::from_utf8(bytes).map_err(|_| invalid("profile must be valid UTF-8"))?
-            );
+            let source =
+                String::from_utf8(bytes).map_err(|_| invalid("profile must be valid UTF-8"))?;
+            let protocol = if kind == "connection" && action == "update" {
+                exchange(&socket, &json!({"api_version":API_VERSION,"command":"connection.show","id":request["id"]}))?["data"]["protocol"].as_str().unwrap_or("").to_owned()
+            } else {
+                request["protocol"].as_str().unwrap_or("").to_owned()
+            };
+            request["profile"] = json!(if protocol == "openvpn" {
+                crate::openvpn::bundle(
+                    &source,
+                    if path == "-" {
+                        None
+                    } else {
+                        Some(
+                            std::path::Path::new(path)
+                                .parent()
+                                .filter(|p| !p.as_os_str().is_empty())
+                                .unwrap_or(std::path::Path::new(".")),
+                        )
+                    },
+                )?
+            } else {
+                source
+            });
         }
     }
     if matches!(action, "update" | "delete") {

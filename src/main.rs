@@ -2,6 +2,7 @@ mod capability;
 mod domain;
 mod health;
 mod management;
+mod openvpn;
 mod panel;
 mod policy;
 mod probe;
@@ -35,7 +36,7 @@ Usage:
   wgates group create --name NAME [--socket PATH]
   wgates group list|show ID|delete ID [--socket PATH]
   wgates group update ID [--name NAME] [--primary CONNECTION_ID|-] [--probe-file PATH|-] [--fallbacks ID,...|-] [--healthcheck-file PATH|-]
-  wgates connection import --group ID --name NAME --protocol vless --file PATH|- [--dns URI] [--capabilities LIST|all|none]
+  wgates connection import --group ID --name NAME --protocol vless|openvpn --file PATH|- [--dns URI] [--capabilities LIST|all|none]
   wgates connection verify ID
   wgates connection list [--group ID] [--sort group|name]
   wgates connection show ID|update ID [--name NAME] [--group ID] [--file PATH|-] [--dns URI|-] [--capabilities LIST|all|none]|delete ID
