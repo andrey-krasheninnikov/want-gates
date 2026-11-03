@@ -46,9 +46,22 @@ fn remaining(deadline: Instant) -> io::Result<Duration> {
         .checked_duration_since(Instant::now())
         .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "probe timed out"))
 }
-fn receive(stream: &mut TcpStream, buffer: &mut [u8], deadline: Instant) -> io::Result<()> {
-    stream.set_read_timeout(Some(remaining(deadline)?))?;
-    stream.read_exact(buffer)
+fn receive(stream: &mut TcpStream, mut buffer: &mut [u8], deadline: Instant) -> io::Result<()> {
+    while !buffer.is_empty() {
+        stream.set_read_timeout(Some(remaining(deadline)?))?;
+        match stream.read(buffer) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "probe connection closed",
+                ));
+            }
+            Ok(n) => buffer = &mut buffer[n..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 fn send(stream: &mut TcpStream, buffer: &[u8], deadline: Instant) -> io::Result<()> {
     stream.set_write_timeout(Some(remaining(deadline)?))?;
@@ -70,10 +83,7 @@ fn address(bytes: &[u8]) -> io::Result<(SocketAddr, usize)> {
         end + 2,
     ))
 }
-fn dns(probe: &DnsProbe, proxy: &Proxy) -> io::Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let server = probe.address()?;
-    let udp = UdpSocket::bind("127.0.0.1:0")?;
+fn socks(proxy: &Proxy, deadline: Instant) -> io::Result<TcpStream> {
     let mut stream = TcpStream::connect_timeout(
         &SocketAddr::from(([127, 0, 0, 1], proxy.port)),
         remaining(deadline)?,
@@ -93,27 +103,9 @@ fn dns(probe: &DnsProbe, proxy: &Proxy) -> io::Result<()> {
     if response != [1, 0] {
         return Err(invalid("SOCKS authentication failed"));
     }
-    let mut associate = vec![5, 3, 0, 1, 127, 0, 0, 1];
-    associate.extend(udp.local_addr()?.port().to_be_bytes());
-    send(&mut stream, &associate, deadline)?;
-    let mut head = [0; 4];
-    receive(&mut stream, &mut head, deadline)?;
-    if head[..3] != [5, 0, 0] {
-        return Err(invalid("SOCKS UDP association failed"));
-    }
-    let length = match head[3] {
-        1 => 6,
-        4 => 18,
-        _ => return Err(invalid("SOCKS relay must use a literal loopback IP")),
-    };
-    let mut relay = vec![head[3]];
-    relay.resize(length + 1, 0);
-    receive(&mut stream, &mut relay[1..], deadline)?;
-    let (relay, _) = address(&relay)?;
-    if !relay.ip().is_loopback() || relay.port() == 0 {
-        return Err(invalid("SOCKS relay is not local"));
-    }
-    udp.connect(relay)?;
+    Ok(stream)
+}
+fn dns_query(probe: &DnsProbe) -> io::Result<(Vec<u8>, u16)> {
     let id = random_id()?;
     let id = u16::from_str_radix(&id[..4], 16).unwrap();
     let mut query = vec![];
@@ -127,34 +119,92 @@ fn dns(probe: &DnsProbe, proxy: &Proxy) -> io::Result<()> {
     let query_type = if probe.query_type == "A" { 1_u16 } else { 28 };
     query.extend(query_type.to_be_bytes());
     query.extend([0, 1]);
-    let mut packet = vec![0, 0, 0];
+    Ok((query, query_type))
+}
+fn socks_reply(stream: &mut TcpStream, deadline: Instant) -> io::Result<SocketAddr> {
+    let mut head = [0; 4];
+    receive(stream, &mut head, deadline)?;
+    if head[..3] != [5, 0, 0] {
+        return Err(invalid("SOCKS request failed"));
+    }
+    let length = match head[3] {
+        1 => 6,
+        4 => 18,
+        _ => return Err(invalid("SOCKS reply requires a literal IP")),
+    };
+    let mut reply = vec![head[3]];
+    reply.resize(length + 1, 0);
+    receive(stream, &mut reply[1..], deadline)?;
+    Ok(address(&reply)?.0)
+}
+fn dns(probe: &DnsProbe, proxy: &Proxy) -> io::Result<()> {
+    dns_over(probe, proxy, "udp")
+}
+fn dns_over(probe: &DnsProbe, proxy: &Proxy, network: &str) -> io::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let server = probe.address()?;
+    let (query, query_type) = dns_query(probe)?;
+    let mut stream = socks(proxy, deadline)?;
+    let mut destination = Vec::new();
     match server.ip() {
         IpAddr::V4(ip) => {
-            packet.push(1);
-            packet.extend(ip.octets());
+            destination.push(1);
+            destination.extend(ip.octets());
         }
         IpAddr::V6(ip) => {
-            packet.push(4);
-            packet.extend(ip.octets());
+            destination.push(4);
+            destination.extend(ip.octets());
         }
     }
-    packet.extend(server.port().to_be_bytes());
-    packet.extend(&query);
-    udp.set_write_timeout(Some(remaining(deadline)?))?;
-    udp.send(&packet)?;
-    let mut buffer = [0; 4096 + 22];
-    udp.set_read_timeout(Some(remaining(deadline)?))?;
-    let n = udp
-        .recv(&mut buffer)
-        .map_err(|_| io::Error::other("UDP DNS reply timed out or failed"))?;
-    if n < 4 || buffer[..3] != [0, 0, 0] {
-        return Err(invalid("invalid SOCKS UDP response"));
-    }
-    let (source, offset) = address(&buffer[3..n])?;
-    if source != server {
-        return Err(invalid("unexpected DNS response source"));
-    }
-    let answer = &buffer[3 + offset..n];
+    destination.extend(server.port().to_be_bytes());
+    let answer = if network == "tcp" {
+        let mut connect = vec![5, 1, 0];
+        connect.extend(&destination);
+        send(&mut stream, &connect, deadline)?;
+        socks_reply(&mut stream, deadline)?;
+        send(&mut stream, &(query.len() as u16).to_be_bytes(), deadline)?;
+        send(&mut stream, &query, deadline)?;
+        let mut size = [0; 2];
+        receive(&mut stream, &mut size, deadline)?;
+        let size = u16::from_be_bytes(size) as usize;
+        if size > 4096 {
+            return Err(invalid("DNS probe response exceeds 4096 bytes"));
+        }
+        let mut answer = vec![0; size];
+        receive(&mut stream, &mut answer, deadline)?;
+        answer
+    } else {
+        let udp = UdpSocket::bind("127.0.0.1:0")?;
+        let mut associate = vec![5, 3, 0, 1, 127, 0, 0, 1];
+        associate.extend(udp.local_addr()?.port().to_be_bytes());
+        send(&mut stream, &associate, deadline)?;
+        let relay = socks_reply(&mut stream, deadline)?;
+        if !relay.ip().is_loopback() || relay.port() == 0 {
+            return Err(invalid("SOCKS relay is not local"));
+        }
+        udp.connect(relay)?;
+        let mut packet = vec![0, 0, 0];
+        packet.extend(destination);
+        packet.extend(&query);
+        udp.set_write_timeout(Some(remaining(deadline)?))?;
+        udp.send(&packet)?;
+        let mut buffer = [0; 4096 + 22];
+        udp.set_read_timeout(Some(remaining(deadline)?))?;
+        let n = udp
+            .recv(&mut buffer)
+            .map_err(|_| io::Error::other("UDP DNS reply timed out or failed"))?;
+        if n < 4 || buffer[..3] != [0, 0, 0] {
+            return Err(invalid("invalid SOCKS UDP response"));
+        }
+        let (source, offset) = address(&buffer[3..n])?;
+        if source != server {
+            return Err(invalid("unexpected DNS response source"));
+        }
+        buffer[3 + offset..n].to_vec()
+    };
+    dns_answer(&answer, &query, query_type)
+}
+fn dns_answer(answer: &[u8], query: &[u8], query_type: u16) -> io::Result<()> {
     // shortcut: require an uncompressed echoed question; extend for resolvers that compress it.
     if answer.len() < query.len()
         || answer[..2] != query[..2]
@@ -210,6 +260,99 @@ fn dns(probe: &DnsProbe, proxy: &Proxy) -> io::Result<()> {
     }
     Err(invalid("DNS answer has no record of the requested type"))
 }
+
+pub fn transport(
+    client: &Client,
+    connection: &crate::store::Connection,
+    group: &crate::store::Group,
+    proxy: &Proxy,
+    only_verified: Option<&std::collections::BTreeMap<String, String>>,
+) -> io::Result<std::collections::BTreeMap<String, String>> {
+    let group_proxy = proxy.for_connection(&connection.id, &group.id);
+    let email = proxy
+        .connection_users
+        .get(&connection.id)
+        .or_else(|| proxy.group_users.get(&group.id))
+        .map(String::as_str);
+    let mut results = std::collections::BTreeMap::new();
+    for capability in CAPABILITIES {
+        client.check()?;
+        let reason = if !crate::capability::permits(&connection.allowed_capabilities, capability) {
+            "configured_limit".to_owned()
+        } else if only_verified.is_some_and(|m| m.get(capability).is_none_or(|r| r != "verified")) {
+            "not_rechecked".to_owned()
+        } else {
+            let result: Option<io::Result<()>> = match capability {
+                "tcp_ipv4" | "tcp_ipv6" => {
+                    let probe = if capability == "tcp_ipv4" {
+                        &group.probes.tcp_ipv4
+                    } else {
+                        &group.probes.tcp_ipv6
+                    };
+                    probe.as_ref().map(|p| {
+                        (|| {
+                            let ip = p.address()?;
+                            let port = url::Url::parse(&p.url)
+                                .map_err(|_| invalid("invalid HTTP probe"))?
+                                .port_or_known_default()
+                                .unwrap();
+                            if client.route_context(
+                                PROBE_TAG,
+                                &ip.to_string(),
+                                None,
+                                email,
+                                "tcp",
+                                port,
+                            )? != format!("wgates-out-{}", &connection.id)
+                            {
+                                return Err(invalid("runtime route does not select primary"));
+                            }
+                            http(p, &group_proxy)
+                        })()
+                    })
+                }
+                _ => {
+                    let probe = if capability == "udp_ipv4" {
+                        &group.probes.udp_ipv4
+                    } else {
+                        &group.probes.udp_ipv6
+                    };
+                    probe.as_ref().map(|p| {
+                        (|| {
+                            let address = p.address()?;
+                            if client.route_context(
+                                PROBE_TAG,
+                                &address.ip().to_string(),
+                                None,
+                                email,
+                                "udp",
+                                address.port(),
+                            )? != format!("wgates-out-{}", &connection.id)
+                            {
+                                return Err(invalid("runtime route does not select primary"));
+                            }
+                            dns(p, &group_proxy)
+                        })()
+                    })
+                }
+            };
+            match result {
+                None => "probe_missing".to_owned(),
+                Some(Ok(())) => "verified".to_owned(),
+                Some(Err(error)) => format!("probe_failed: {error}"),
+            }
+        };
+        if only_verified.is_some_and(|m| m.get(capability).is_some_and(|r| r == "verified"))
+            && reason != "verified"
+        {
+            return Err(io::Error::other(
+                "running traffic verification failed; inspect routing state",
+            ));
+        }
+        results.insert(capability.to_owned(), reason.to_owned());
+    }
+    Ok(results)
+}
 pub fn check(
     client: &Client,
     config: &Config,
@@ -222,92 +365,20 @@ pub fn check(
         .iter()
         .filter(|g| config.rules.iter().any(|r| r.group_id == g.id))
     {
-        let group_proxy = proxy.for_group(&group.id);
-        let email = proxy.group_users.get(&group.id).map(String::as_str);
-        let mut results = std::collections::BTreeMap::new();
-        for capability in CAPABILITIES {
-            client.check()?;
-            let reason = if group.primary.is_none() {
-                "primary_missing".to_owned()
-            } else if only_verified.is_some_and(|m| {
-                m.get(&group.id)
-                    .and_then(|c| c.get(capability))
-                    .is_none_or(|r| r != "verified")
-            }) {
-                "not_rechecked".to_owned()
-            } else {
-                let result: Option<io::Result<()>> = match capability {
-                    "tcp_ipv4" | "tcp_ipv6" => {
-                        let probe = if capability == "tcp_ipv4" {
-                            &group.probes.tcp_ipv4
-                        } else {
-                            &group.probes.tcp_ipv6
-                        };
-                        probe.as_ref().map(|p| {
-                            (|| {
-                                let ip = p.address()?;
-                                let port = url::Url::parse(&p.url)
-                                    .map_err(|_| invalid("invalid HTTP probe"))?
-                                    .port_or_known_default()
-                                    .unwrap();
-                                if client.route_context(
-                                    PROBE_TAG,
-                                    &ip.to_string(),
-                                    None,
-                                    email,
-                                    "tcp",
-                                    port,
-                                )? != format!("wgates-out-{}", group.primary.as_ref().unwrap())
-                                {
-                                    return Err(invalid("runtime route does not select primary"));
-                                }
-                                http(p, &group_proxy)
-                            })()
-                        })
-                    }
-                    _ => {
-                        let probe = if capability == "udp_ipv4" {
-                            &group.probes.udp_ipv4
-                        } else {
-                            &group.probes.udp_ipv6
-                        };
-                        probe.as_ref().map(|p| {
-                            (|| {
-                                let address = p.address()?;
-                                if client.route_context(
-                                    PROBE_TAG,
-                                    &address.ip().to_string(),
-                                    None,
-                                    email,
-                                    "udp",
-                                    address.port(),
-                                )? != format!("wgates-out-{}", group.primary.as_ref().unwrap())
-                                {
-                                    return Err(invalid("runtime route does not select primary"));
-                                }
-                                dns(p, &group_proxy)
-                            })()
-                        })
-                    }
-                };
-                match result {
-                    None => "probe_missing".to_owned(),
-                    Some(Ok(())) => "verified".to_owned(),
-                    Some(Err(error)) => format!("probe_failed: {error}"),
-                }
-            };
-            if only_verified.is_some_and(|m| {
-                m.get(&group.id)
-                    .and_then(|c| c.get(capability))
-                    .is_some_and(|r| r == "verified")
-            }) && reason != "verified"
-            {
-                return Err(io::Error::other(
-                    "running traffic verification failed; inspect routing state",
-                ));
-            }
-            results.insert(capability.to_owned(), reason.to_owned());
-        }
+        let results = if let Some(connection) = crate::domain::connection(config, group) {
+            transport(
+                client,
+                connection,
+                group,
+                proxy,
+                only_verified.and_then(|m| m.get(&group.id)),
+            )?
+        } else {
+            CAPABILITIES
+                .iter()
+                .map(|c| (c.to_string(), "primary_missing".to_owned()))
+                .collect()
+        };
         matrix.insert(group.id.clone(), results);
     }
     for group in config.groups.iter().filter(|g| {
@@ -334,6 +405,11 @@ pub fn check(
                 } else {
                     let resolver = crate::policy::Resolver::parse(server)?;
                     if matrix[&group.id]
+                        .get(&resolver.capability())
+                        .is_some_and(|v| v == "configured_limit")
+                    {
+                        "configured_limit".to_owned()
+                    } else if matrix[&group.id]
                         .get(&resolver.capability())
                         .is_none_or(|v| v != "verified")
                     {
@@ -377,4 +453,67 @@ pub fn check(
             .insert("dns".into(), reason);
     }
     Ok(matrix)
+}
+
+pub fn connection(
+    client: &Client,
+    config: &Config,
+    connection: &crate::store::Connection,
+    proxy: &Proxy,
+) -> io::Result<std::collections::BTreeMap<String, String>> {
+    let group = config
+        .groups
+        .iter()
+        .find(|g| g.id == connection.group_id)
+        .ok_or_else(|| invalid("connection group missing"))?;
+    let mut results = transport(client, connection, group, proxy, None)?;
+    let reason = match (&connection.dns, &group.probes.dns) {
+        (None, _) => "dns_missing".to_owned(),
+        (_, None) => "probe_missing".to_owned(),
+        (Some(server), Some(probe)) => {
+            let resolver = crate::policy::Resolver::parse(server)?;
+            if !crate::capability::permits(&connection.allowed_capabilities, &resolver.capability())
+            {
+                "configured_limit".to_owned()
+            } else if results
+                .get(&resolver.capability())
+                .is_none_or(|v| v != "verified")
+            {
+                "dns_transport_unverified".to_owned()
+            } else {
+                client.check()?;
+                let result = (|| {
+                    if client.route_context(
+                        PROBE_TAG,
+                        &resolver.address.ip().to_string(),
+                        None,
+                        proxy
+                            .connection_users
+                            .get(&connection.id)
+                            .map(String::as_str),
+                        resolver.network,
+                        resolver.address.port(),
+                    )? != format!("wgates-out-{}", connection.id)
+                    {
+                        return Err(invalid("DNS diagnostic route does not select connection"));
+                    }
+                    dns_over(
+                        &DnsProbe {
+                            server: resolver.address.to_string(),
+                            query_name: crate::policy::domain_name(&probe.query_name)?,
+                            query_type: probe.query_type.clone(),
+                        },
+                        &proxy.for_connection(&connection.id, &group.id),
+                        resolver.network,
+                    )
+                })();
+                match result {
+                    Ok(()) => "verified".into(),
+                    Err(e) => format!("probe_failed: {e}"),
+                }
+            }
+        }
+    };
+    results.insert("dns".into(), reason);
+    Ok(results)
 }

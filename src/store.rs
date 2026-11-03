@@ -33,6 +33,8 @@ pub struct Connection {
     pub protocol: String,
     pub revision: u64,
     pub profile_ref: String,
+    #[serde(default = "crate::capability::defaults")]
+    pub allowed_capabilities: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns: Option<String>,
 }
@@ -176,6 +178,7 @@ impl Store {
             {
                 return Err(invalid("invalid saved connection DNS; state was retained"));
             }
+            crate::capability::validate(&connection.allowed_capabilities)?;
             let bytes = private_read(&secrets.join(&connection.profile_ref), MAX_PROFILE)?;
             let input = std::str::from_utf8(&bytes)
                 .map_err(|_| invalid("invalid saved profile; state was retained"))?;
@@ -276,7 +279,14 @@ impl Store {
             "rule.delete" => &["id", "expected_revision"],
             "group.delete" | "connection.delete" => &["id", "expected_revision"],
             "connection.list" => &["group_id", "sort", "offset", "list_revision"],
-            "connection.import" => &["name", "group_id", "protocol", "profile", "dns"],
+            "connection.import" => &[
+                "name",
+                "group_id",
+                "protocol",
+                "profile",
+                "dns",
+                "allowed_capabilities",
+            ],
             "connection.update" => &[
                 "id",
                 "expected_revision",
@@ -284,6 +294,7 @@ impl Store {
                 "group_id",
                 "profile",
                 "dns",
+                "allowed_capabilities",
             ],
             _ => return Err(invalid("unsupported command")),
         };
@@ -530,6 +541,7 @@ impl Store {
                     revision,
                     profile_ref: format!("c{revision}-r{revision}.json"),
                     dns: dns_setting(request.get("dns"))?,
+                    allowed_capabilities: capability_setting(request.get("allowed_capabilities"))?,
                 };
                 new_profile = Some((connection.profile_ref.clone(), profile));
                 config.connections.push(connection.clone());
@@ -565,7 +577,7 @@ impl Store {
                 if command == "connection.delete" {
                     summary(&config.connections.remove(index))
                 } else {
-                    if ["name", "group_id", "profile", "dns"]
+                    if ["name", "group_id", "profile", "dns", "allowed_capabilities"]
                         .iter()
                         .all(|k| request.get(k).is_none())
                     {
@@ -593,6 +605,10 @@ impl Store {
                     }
                     if request.get("dns").is_some() {
                         connection.dns = dns_setting(request.get("dns"))?;
+                    }
+                    if request.get("allowed_capabilities").is_some() {
+                        connection.allowed_capabilities =
+                            capability_setting(request.get("allowed_capabilities"))?;
                     }
                     connection.revision = revision;
                     config.connections[index] = connection.clone();
@@ -701,6 +717,19 @@ fn profile_filename(name: &str) -> bool {
         .iter()
         .all(|s| s.is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())))
 }
+fn capability_setting(value: Option<&Value>) -> io::Result<Vec<String>> {
+    let values = match value {
+        None => crate::capability::defaults(),
+        Some(value) => serde_json::from_value::<Vec<String>>(value.clone())
+            .map_err(|_| invalid("allowed_capabilities must be an array of strings"))?,
+    };
+    crate::capability::validate(&values)?;
+    Ok(crate::capability::ALL
+        .iter()
+        .filter(|v| crate::capability::permits(&values, v))
+        .map(|v| (*v).to_owned())
+        .collect())
+}
 fn dns_setting(value: Option<&Value>) -> io::Result<Option<String>> {
     value
         .filter(|v| !v.is_null())
@@ -719,7 +748,7 @@ fn protocol(value: &Value) -> io::Result<()> {
 }
 fn summary(c: &Connection) -> Value {
     json!({"id":c.id,"group_id":c.group_id,"name":c.name,"protocol":c.protocol,"revision":c.revision,
-        "dns":c.dns,"validation":"structural","authentication":"not_attempted"})
+        "dns":c.dns,"allowed_capabilities":c.allowed_capabilities,"verification":{"capabilities":crate::capability::observations(&c.allowed_capabilities,None,false),"observed_at":null},"validation":"structural","authentication":"not_attempted"})
 }
 
 fn id_number(id: &str, prefix: char) -> Option<u64> {
@@ -774,35 +803,22 @@ impl Store {
     pub fn routing_input(&self) -> io::Result<crate::routing::Input> {
         let mut profiles = std::collections::BTreeMap::new();
         let mut total = 0;
-        for group in self
-            .config
-            .groups
-            .iter()
-            .filter(|g| self.config.rules.iter().any(|r| r.group_id == g.id))
-        {
-            if let Some(id) = &group.primary {
-                let connection = self
-                    .config
-                    .connections
-                    .iter()
-                    .find(|c| &c.id == id)
-                    .unwrap();
-                let bytes = private_read(
-                    &self.root.join("secrets").join(&connection.profile_ref),
-                    MAX_PROFILE,
-                )?;
-                total += bytes.len();
-                if total > 10 * 1024 * 1024 {
-                    return Err(invalid(
-                        "active profiles exceed the panel update budget of 10 MiB",
-                    ));
-                }
-                profiles.insert(
-                    id.clone(),
-                    serde_json::from_slice(&bytes)
-                        .map_err(|_| invalid("invalid saved VLESS profile"))?,
-                );
+        for connection in &self.config.connections {
+            let bytes = private_read(
+                &self.root.join("secrets").join(&connection.profile_ref),
+                MAX_PROFILE,
+            )?;
+            total += bytes.len();
+            if total > 10 * 1024 * 1024 {
+                return Err(invalid(
+                    "prepared profiles exceed the panel update budget of 10 MiB",
+                ));
             }
+            profiles.insert(
+                connection.id.clone(),
+                serde_json::from_slice(&bytes)
+                    .map_err(|_| invalid("invalid saved VLESS profile"))?,
+            );
         }
         Ok(crate::routing::Input {
             config: self.config.clone(),

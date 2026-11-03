@@ -15,7 +15,8 @@ The Rust binary manages groups, VLESS profiles, domain/IP rules and connection
 DNS through a Unix
 socket. A preview and explicit apply configure 3x-ui 3.8.5 with Xray 26.9.9.
 TCP/UDP over IPv4/IPv6 are verified separately; unavailable combinations are
-blocked. See [service operation](docs/service.md) and
+blocked. Operators can limit each connection and verify a prepared connection
+without changing primary. See [service operation](docs/service.md) and
 [routing, verification and recovery](docs/routing.md).
 
 Both `vless://` and complete outbound JSON imports are supported. Import checks

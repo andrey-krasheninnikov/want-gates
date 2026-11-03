@@ -127,8 +127,10 @@ are not used as connection names. Supply `--name` explicitly.
 Routine responses contain metadata and `validation: structural`. Before apply,
 runtime is unavailable and capabilities are empty. After apply, responses expose
 the last matching capability observation; changed desired state is pending and
-incomplete operations are unknown. Native `authentication` remains
-`not_attempted`; VLESS traffic verification is reported separately.
+incomplete operations are unknown. Connection `verification` reports independent
+observations and staleness. VLESS `authentication` is `traffic_verified` after a
+matching successful observation, `unknown` after failure or invalidation, and
+`not_attempted` when no traffic check ran.
 Other protocol adapters report unavailable. No authentication sessions are
 created in this slice; future native adapters must isolate state per connection
 outside ordinary configuration.
@@ -140,7 +142,9 @@ when another process chooses a different socket. `config.json` uses schema
 version 2, a configuration revision, stable object IDs, and per-object revisions.
 Schema 1 loads with empty rules, primary and probes; the next saved mutation
 writes schema 2. Existing schema 1/2 data defaults to no connection DNS and no
-DNS probe. Existing routing snapshots and recovery journals remain readable.
+DNS probe. Absent `allowed_capabilities` permits verification of all four combinations
+without claiming support. Existing routing snapshots and recovery journals remain
+readable; unused old plans require another preview.
 Older binaries reject the extended configuration. Downgrading
 requires an offline migration rather than a reset.
 It contains metadata and profile references. Its limit is 16 MiB.
@@ -183,7 +187,7 @@ A successful response is:
 Error responses contain `api_version` and an `error` string. Requests and
 responses are limited to 4 MiB, excluding the terminating newline. Request reads
 and ordinary responses have a two-second total deadline. The CLI allows 330
-seconds for routing operations and panel preflight.
+seconds for routing operations, panel preflight and connection verification.
 The CLI rejects incompatible versions, malformed or incomplete messages, and
 not-ready responses.
 
@@ -195,16 +199,18 @@ and socket. It does not confirm VPN, DNS, or 3x-ui connectivity.
 Management uses the same one-request-per-connection framing. Commands are
 `group.create`, `group.list`, `group.show`, `group.update`, `group.delete`,
 `connection.import`, `connection.list`, `connection.show`, `connection.update`,
-`connection.delete`, `rule.create`, `rule.list`, `rule.show`, `rule.update`,
+`connection.delete`, `connection.verify`, `rule.create`, `rule.list`, `rule.show`, `rule.update`,
 `rule.delete`, `panel.configure`, `panel.preflight`, `routing.preview`,
 `routing.apply`, `routing.status`, and `routing.recover`.
 
 Create groups with `name`. Import connections with `name`, `group_id`,
 `protocol`, and the source text in `profile`; `dns` optionally supplies a numeric
-UDP/TCP resolver URI. Show uses `id`. Update and delete
+UDP/TCP resolver URI. Optional `allowed_capabilities` is an array of distinct
+`tcp_ipv4`, `udp_ipv4`, `tcp_ipv6`, `udp_ipv6` values; an empty array disables all.
+Show and verify use `id`. Update and delete
 require `id` and `expected_revision`, obtained from a prior show. Updates supply
 only changed fields: group `name`, `primary` (ID or null), or `probes`; connection
-`name`, `group_id`, `profile`, or `dns` (URI or null); rule `group_id` or
+`name`, `group_id`, `profile`, `dns` (URI or null), or `allowed_capabilities`; rule `group_id` or
 `destination`. Unexpected
 fields are rejected. Stale revisions fail without a write;
 the CLI supplies these revision preconditions automatically.
@@ -216,7 +222,11 @@ same pagination fields as other lists and an optional `group_id`.
 `routing.apply` and `routing.recover` require `plan_id`.
 
 Management responses wrap their result in `data`. Routing status includes
-`desired_revision`, `busy`, `recovery_required`, and `last_observation`. A caller
+`desired_revision`, `busy`, `recovery_required`, `last_observation`, and
+`connection_verifications`. Private `routing/connections.json` retains the latest
+per-connection observations. `connection.verify` returns `connection_id`,
+`verification`, and `policy_effect: observations_only`. It requires completed
+current preparation and never changes the primary or panel. A caller
 disconnect does not cancel an accepted operation. Inspect status before retrying.
 See [routing operation](routing.md) for observation and recovery semantics.
 

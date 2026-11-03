@@ -18,7 +18,7 @@ use std::thread::{self, JoinHandle};
 
 const PREFIX: &str = "wgates-";
 pub const PROBE_TAG: &str = "wgates-probe";
-pub const CAPABILITIES: [&str; 4] = ["tcp_ipv4", "udp_ipv4", "tcp_ipv6", "udp_ipv6"];
+pub use crate::capability::ALL as CAPABILITIES;
 pub type Matrix = BTreeMap<String, BTreeMap<String, String>>;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,6 +34,8 @@ pub struct Proxy {
     pub password: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub group_users: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub connection_users: BTreeMap<String, String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -55,9 +57,95 @@ struct Working {
     snapshot: Snapshot,
     proxy: Proxy,
     matrix: Matrix,
+    #[serde(default)]
+    prepared_digest: Option<String>,
+    #[serde(default)]
+    panel_digest: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConnectionObservation {
+    binding: String,
+    observed_at: u64,
+    source: String,
+    results: BTreeMap<String, String>,
+}
+type ConnectionObservations = BTreeMap<String, ConnectionObservation>;
+fn connection_binding(config: &Config, connection: &store::Connection) -> io::Result<String> {
+    let group = config
+        .groups
+        .iter()
+        .find(|g| g.id == connection.group_id)
+        .ok_or_else(|| invalid("connection group missing"))?;
+    digest(
+        &json!({"profile":connection.profile_ref,"group":connection.group_id,"dns":connection.dns,"allowed":connection.allowed_capabilities,"probes":group.probes}),
+    )
+}
+fn record_connection(
+    root: &Path,
+    config: &Config,
+    connection: &store::Connection,
+    results: BTreeMap<String, String>,
+    source: &str,
+) -> io::Result<()> {
+    let mut records: ConnectionObservations =
+        optional(&root.join("connections.json"))?.unwrap_or_default();
+    records.retain(|id, _| config.connections.iter().any(|c| &c.id == id));
+    records.insert(
+        connection.id.clone(),
+        ConnectionObservation {
+            binding: connection_binding(config, connection)?,
+            observed_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            source: source.into(),
+            results,
+        },
+    );
+    private_write(&root.join("connections.json"), &records)
+}
+fn connection_verification(
+    config: &Config,
+    connection: &store::Connection,
+    record: Option<&ConnectionObservation>,
+) -> Value {
+    let stale = record
+        .is_some_and(|r| connection_binding(config, connection).is_ok_and(|b| b != r.binding));
+    let results = record.map(|r| &r.results);
+    json!({"observed_at":record.map(|r|r.observed_at),"source":record.map(|r|&r.source),"stale":stale,
+        "capabilities":crate::capability::observations(&connection.allowed_capabilities, results, stale),
+        "dns":crate::capability::observation(if stale{"inputs_changed"}else{results.and_then(|r|r.get("dns")).map(String::as_str).unwrap_or("not_checked")})})
+}
+fn connection_reports(root: &Path, config: &Config) -> io::Result<Value> {
+    let records: ConnectionObservations =
+        optional(&root.join("connections.json"))?.unwrap_or_default();
+    Ok(Value::Object(
+        config
+            .connections
+            .iter()
+            .map(|c| {
+                (
+                    c.id.clone(),
+                    connection_verification(config, c, records.get(&c.id)),
+                )
+            })
+            .collect(),
+    ))
 }
 
 impl Proxy {
+    pub fn for_connection(&self, id: &str, group: &str) -> Self {
+        Self {
+            user: self
+                .connection_users
+                .get(id)
+                .cloned()
+                .unwrap_or_else(|| self.for_group(group).user),
+            ..self.clone()
+        }
+    }
     pub fn for_group(&self, id: &str) -> Self {
         Self {
             user: self.group_users.get(id).unwrap_or(&self.user).clone(),
@@ -250,10 +338,18 @@ fn initial_matrix(config: &Config) -> Matrix {
                 .map(|c| {
                     (
                         c.to_string(),
-                        if g.primary.is_some() {
-                            "candidate"
-                        } else {
-                            "primary_missing"
+                        match crate::domain::connection(config, g) {
+                            None => "primary_missing",
+                            Some(connection)
+                                if !crate::capability::permits(
+                                    &connection.allowed_capabilities,
+                                    c,
+                                ) =>
+                            {
+                                "configured_limit"
+                            }
+                            Some(_) if !probe_configured(g, c) => "probe_missing",
+                            Some(_) => "candidate",
                         }
                         .to_owned(),
                     )
@@ -272,14 +368,74 @@ fn initial_matrix(config: &Config) -> Matrix {
                     "dns_missing"
                 } else if g.probes.dns.is_none() {
                     "probe_missing"
+                } else if let Some(resolver) = crate::domain::connection(config, g)
+                    .and_then(|c| c.dns.as_ref())
+                    .and_then(|d| crate::policy::Resolver::parse(d).ok())
+                {
+                    if result
+                        .get(&resolver.capability())
+                        .is_some_and(|r| r == "configured_limit")
+                    {
+                        "configured_limit"
+                    } else if result
+                        .get(&resolver.capability())
+                        .is_none_or(|r| r != "candidate")
+                    {
+                        "dns_transport_unverified"
+                    } else {
+                        "candidate"
+                    }
                 } else {
-                    "candidate"
+                    "dns_missing"
                 };
                 result.insert("dns".into(), state.into());
             }
             (g.id.clone(), result)
         })
         .collect()
+}
+fn probe_configured(group: &store::Group, capability: &str) -> bool {
+    match capability {
+        "tcp_ipv4" => group.probes.tcp_ipv4.is_some(),
+        "udp_ipv4" => group.probes.udp_ipv4.is_some(),
+        "tcp_ipv6" => group.probes.tcp_ipv6.is_some(),
+        "udp_ipv6" => group.probes.udp_ipv6.is_some(),
+        _ => false,
+    }
+}
+fn eligibility(config: &Config) -> Value {
+    let matrix = initial_matrix(config);
+    let mut result = serde_json::Map::new();
+    for rule in &config.rules {
+        let family = Network::parse(&rule.destination)
+            .ok()
+            .map(|n| if n.address.is_ipv4() { "ipv4" } else { "ipv6" });
+        let mut fields = serde_json::Map::new();
+        for capability in CAPABILITIES
+            .into_iter()
+            .filter(|c| family.is_none_or(|f| c.ends_with(f)))
+        {
+            let reason = matrix
+                .get(&rule.group_id)
+                .and_then(|r| r.get(capability))
+                .map(String::as_str)
+                .unwrap_or("primary_missing");
+            fields.insert(
+                capability.to_owned(),
+                json!({"reason":if reason=="candidate"{"verification_required"}else{reason}}),
+            );
+        }
+        if family.is_none() {
+            let connection = config
+                .groups
+                .iter()
+                .find(|g| g.id == rule.group_id)
+                .and_then(|g| crate::domain::connection(config, g));
+            fields.insert("dns".into(), json!({"reason":matrix[&rule.group_id].get("dns"),"requires":connection.and_then(|c|c.dns.as_ref()).and_then(|d|crate::policy::Resolver::parse(d).ok()).map(|r|r.capability())}));
+        }
+        result.insert(rule.id.clone(), Value::Object(fields));
+    }
+    Value::Object(result)
 }
 pub(crate) fn allowed(matrix: &Matrix, group: &str, capability: &str) -> bool {
     matrix
@@ -327,6 +483,7 @@ fn render(
         proxy
             .group_users
             .values()
+            .chain(proxy.connection_users.values())
             .map(|u| json!({"user":u,"pass":proxy.password})),
     );
     inbounds.push(json!({"tag":PROBE_TAG,"listen":"127.0.0.1","port":proxy.port,"protocol":"socks","settings":{"auth":"password","users":users,"udp":true,"ip":"127.0.0.1"}}));
@@ -346,6 +503,21 @@ fn render(
     let mut ingress = tags.to_vec();
     ingress.push(PROBE_TAG.to_owned());
     let mut rules = vec![previous[0].clone()];
+    for connection in &input.config.connections {
+        let Some(user) = proxy.connection_users.get(&connection.id) else {
+            continue;
+        };
+        for protocol in ["tcp", "udp"] {
+            for (family, network) in [(4, "0.0.0.0/0"), (6, "::/0")] {
+                let permitted = crate::capability::permits(
+                    &connection.allowed_capabilities,
+                    &format!("{protocol}_ipv{family}"),
+                );
+                rules.push(json!({"type":"field","ruleTag":format!("wgates-check-{}-{protocol}-ipv{family}",connection.id),"inboundTag":[PROBE_TAG],"user":[user],"network":protocol,"ip":[network],"outboundTag":if permitted{format!("wgates-out-{}",connection.id)}else{"wgates-block".into()}}));
+            }
+        }
+        rules.push(json!({"type":"field","ruleTag":format!("wgates-check-{}-block",connection.id),"inboundTag":[PROBE_TAG],"user":[user],"outboundTag":"wgates-block"}));
+    }
     for (group_id, user) in &proxy.group_users {
         let group = input
             .config
@@ -448,6 +620,7 @@ impl Service {
             "panel.configure" => &["settings"],
             "panel.preflight" | "routing.preview" | "routing.status" => &[],
             "routing.apply" | "routing.recover" => &["plan_id"],
+            "connection.verify" => &["id"],
             _ => return Err(invalid("unsupported routing command")),
         };
         if request.as_object().is_none_or(|m| {
@@ -460,7 +633,7 @@ impl Service {
             let saved: Value = optional(&self.root.join("status.json"))?
                 .unwrap_or(json!({"state":"unapplied","running_revision":null}));
             return Ok(Some(
-                json!({"data":{"desired_revision":store.config().revision,"busy":self.busy(),"recovery_required":optional::<Journal>(&self.root.join("journal.json"))?.as_ref().is_some_and(pending) && !self.busy(),"last_observation":saved}}),
+                json!({"data":{"desired_revision":store.config().revision,"busy":self.busy(),"recovery_required":optional::<Journal>(&self.root.join("journal.json"))?.as_ref().is_some_and(pending) && !self.busy(),"last_observation":saved,"connection_verifications":connection_reports(&self.root,store.config()).unwrap_or_else(|_|json!({"state":"unknown","reason":"observation_state_unreadable"}))}}),
             ));
         }
         if self.busy() {
@@ -539,6 +712,51 @@ fn execute(
         client.read()?;
         return Ok(status);
     }
+    if command == "connection.verify" {
+        if optional::<Journal>(&root.join("journal.json"))?
+            .as_ref()
+            .is_some_and(pending)
+        {
+            return Err(invalid(
+                "unfinished apply requires routing recover before verification",
+            ));
+        }
+        let connection = input
+            .config
+            .connections
+            .iter()
+            .find(|c| request["id"] == c.id)
+            .ok_or_else(|| invalid("connection not found"))?;
+        let working: Option<Working> = optional(&root.join("working.json"))?;
+        let working = working
+            .filter(|w| {
+                w.prepared_digest
+                    .as_ref()
+                    .is_some_and(|d| digest(&input).is_ok_and(|v| &v == d))
+                    && w.panel_digest.as_ref() == Some(&panel_digest)
+                    && w.proxy.connection_users.contains_key(&connection.id)
+            })
+            .ok_or_else(|| {
+                invalid("connection verification requires a current routing preview and apply")
+            })?;
+        client.running()?;
+        if client.read()? != working.snapshot {
+            return Err(invalid(
+                "observed panel drift; preview and apply before verification",
+            ));
+        }
+        let results = crate::probe::connection(&client, &input.config, connection, &working.proxy)?;
+        if client.read()? != working.snapshot {
+            return Err(invalid(
+                "observed panel drift during verification; observations were not saved",
+            ));
+        }
+        record_connection(root, &input.config, connection, results, "connection")?;
+        let reports = connection_reports(root, &input.config)?;
+        return Ok(
+            json!({"connection_id":connection.id,"verification":reports[&connection.id],"policy_effect":"observations_only"}),
+        );
+    }
     if command == "routing.preview" {
         if let Some(journal) = optional::<Journal>(&root.join("journal.json"))?
             && pending(&journal)
@@ -558,6 +776,7 @@ fn execute(
                 user: random_id()?,
                 password: random_id()?,
                 group_users: BTreeMap::new(),
+                connection_users: BTreeMap::new(),
             },
         };
         proxy
@@ -571,6 +790,16 @@ fn execute(
         {
             if !proxy.group_users.contains_key(&group.id) {
                 proxy.group_users.insert(group.id.clone(), random_id()?);
+            }
+        }
+        proxy
+            .connection_users
+            .retain(|id, _| input.config.connections.iter().any(|c| &c.id == id));
+        for connection in &input.config.connections {
+            if !proxy.connection_users.contains_key(&connection.id) {
+                proxy
+                    .connection_users
+                    .insert(connection.id.clone(), random_id()?);
             }
         }
         let candidate = render(
@@ -593,7 +822,7 @@ fn execute(
         private_write(&root.join("plan.json"), &plan)?;
         return Ok(
             json!({"plan_id":plan.id,"desired_revision":plan.input.config.revision,"ingress":plan.ingress,"rules":plan.input.config.rules,
-            "dns":crate::domain::describe(&plan.input.config),"panel_dns_rules":plan.candidate.template["routing"]["rules"].as_array().map(|a|a.iter().filter(|v|v["ruleTag"]=="xui-dns-allow").collect::<Vec<_>>()),"capabilities":"conditional_on_runtime_probes","unmatched":"direct","unverified":"blocked","sessions_may_interrupt":true}),
+            "dns":crate::domain::describe(&plan.input.config),"panel_dns_rules":plan.candidate.template["routing"]["rules"].as_array().map(|a|a.iter().filter(|v|v["ruleTag"]=="xui-dns-allow").collect::<Vec<_>>()),"capabilities":"conditional_on_runtime_probes","prepared_connections":plan.input.config.connections.iter().map(|c|&c.id).collect::<Vec<_>>(),"eligibility":eligibility(&plan.input.config),"unmatched":"direct","unverified":"blocked","sessions_may_interrupt":true}),
         );
     }
     if command == "routing.recover" {
@@ -624,6 +853,16 @@ fn execute(
     {
         return Err(invalid(
             "unfinished apply requires routing recover before another apply",
+        ));
+    }
+    if input
+        .config
+        .connections
+        .iter()
+        .any(|c| !plan.proxy.connection_users.contains_key(&c.id))
+    {
+        return Err(invalid(
+            "plan predates connection verification; preview again; no changes applied",
         ));
     }
     let previous: Option<Working> = optional(&root.join("working.json"))?;
@@ -691,6 +930,8 @@ fn execute(
             snapshot: final_snapshot.clone(),
             proxy: journal.plan.proxy.clone(),
             matrix,
+            prepared_digest: Some(digest(&input)?),
+            panel_digest: Some(panel_digest.clone()),
         };
         let report = observation(
             &working.plan_id,
@@ -698,6 +939,13 @@ fn execute(
             &working.snapshot,
             &working.matrix,
         );
+        for group in &input.config.groups {
+            if let Some(connection) = crate::domain::connection(&input.config, group)
+                && let Some(results) = working.matrix.get(&group.id)
+            {
+                record_connection(root, &input.config, connection, results.clone(), "apply")?;
+            }
+        }
         private_write(&root.join("working.json"), &working)?;
         private_write(&root.join("status.json"), &report)?;
         journal.phase = "complete".to_owned();
@@ -963,6 +1211,8 @@ impl Service {
                 .is_some_and(pending);
             Ok((pending, optional(&self.root.join("working.json"))?))
         })();
+        let records: io::Result<Option<ConnectionObservations>> =
+            optional(&self.root.join("connections.json"));
         let describe = |value: &mut Value| {
             let fields = match &inspected {
                 Err(_) => {
@@ -1005,6 +1255,48 @@ impl Service {
             };
             if let Some(object) = value.as_object_mut() {
                 object.extend(fields.as_object().unwrap().clone());
+                if let Some(connection) = config
+                    .connections
+                    .iter()
+                    .find(|c| object.get("id").is_some_and(|v| v == &c.id))
+                {
+                    match &records {
+                        Ok(records) => {
+                            let record = records.as_ref().and_then(|r| r.get(&connection.id));
+                            object.insert(
+                                "verification".into(),
+                                connection_verification(config, connection, record),
+                            );
+                            if let Some(record) = record {
+                                let authentication = if connection_binding(config, connection)
+                                    .is_ok_and(|b| b == record.binding)
+                                {
+                                    if record.results.values().any(|v| v == "verified") {
+                                        "traffic_verified"
+                                    } else if record
+                                        .results
+                                        .values()
+                                        .any(|v| v.starts_with("probe_failed:"))
+                                    {
+                                        "unknown"
+                                    } else {
+                                        "not_attempted"
+                                    }
+                                } else {
+                                    "unknown"
+                                };
+                                object.insert("authentication".into(), json!(authentication));
+                            }
+                        }
+                        Err(_) => {
+                            object.insert(
+                                "verification".into(),
+                                json!({"state":"unknown","reason":"observation_state_unreadable"}),
+                            );
+                            object.insert("authentication".into(), json!("unknown"));
+                        }
+                    }
+                }
             }
         };
         if let Some(items) = response["data"].as_array_mut() {

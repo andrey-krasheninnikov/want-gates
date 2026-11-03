@@ -119,7 +119,13 @@ def resource(events):
                                         head=receive(connection,2)
                                         query=receive(connection,struct.unpack('!H',head)[0])
                                         result=dns_reply(query,peer,'dns-tcp')
-                                        if result:connection.sendall(struct.pack('!H',len(result))+result)
+                                        if result:
+                                            connection.sendall(struct.pack('!H',len(result)))
+                                            if b'\x04slow\x04corp\x04test' in query:
+                                                # A steady trickle must not reset the probe's total deadline.
+                                                for byte in result:
+                                                    connection.sendall(bytes([byte]));time.sleep(0.2)
+                                            else:connection.sendall(result)
                                 except (OSError,EOFError):pass
                         threading.Thread(target=exchange,daemon=True).start()
             threading.Thread(target=answer,daemon=True).start()
@@ -571,6 +577,83 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
         lookup('v4.dev.corp.test',expected='10.221.0.10')
         # Reusing a name with a long TTL must use the new connection's DNS context.
         reserve=control('connection','import','--group',groups['a'],'--name','DNS reserve','--protocol','vless','--file','-','--dns','udp://[fd42:220::10]:15353',payload=json.dumps(outbound('10.214.0.2',19002,ids['b'])))['data']['id']
+        # An unselected connection uses its own diagnostic path and DNS context.
+        rejected=control('connection','verify',reserve,success=False)
+        assert 'preview and apply' in rejected.stderr
+        preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+        before=api('xray/',{});event_start=len(events.read_text().splitlines())
+        verification=control('connection','verify',reserve)['data']['verification']
+        assert all(v['state']=='verified' for v in verification['capabilities'].values()),verification
+        assert verification['dns']['state']=='verified',verification
+        assert api('xray/',{})==before,'connection verification changed the panel'
+        assert control('group','show',groups['a'])['data']['primary']==connections['a']
+        evidence=[json.loads(line) for line in events.read_text().splitlines()[event_start:]]
+        assert evidence and all(e['peer'] in ['10.212.0.1','fd42:212::1'] for e in evidence),'reserve probes used another connection'
+        assert {'tcp','udp'} <= {e['transport'] for e in evidence}
+        summary=control('connection','show',reserve)['data']
+        assert summary['capabilities']==[] and summary['authentication']=='traffic_verified'
+        # A failed credential check is unavailable, never a configured capability limit.
+        ids['invalid']=str(uuid.uuid4())
+        invalid=control('connection','import','--group',groups['a'],'--name','Invalid credentials','--protocol','vless','--file','-',payload=json.dumps(outbound('10.213.0.2',19001,ids['invalid'])))['data']['id']
+        preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+        rejected=control('connection','verify',invalid)['data']['verification']
+        assert all(v['state']=='unavailable' and v['reason']=='probe_failed' for v in rejected['capabilities'].values()),rejected
+        assert control('connection','show',invalid)['data']['authentication']=='unknown'
+        control('connection','delete',invalid)
+        blocked_capabilities=[]
+        # A usable TCP path cannot substitute for a disabled UDP DNS transport.
+        control('connection','update',connections['a'],'--capabilities','tcp_ipv4')
+        preview=control('routing','preview')['data']
+        assert preview['eligibility'][domain_rules[0]]['dns']['reason']=='configured_limit',preview
+        limited=control('routing','apply',preview['plan_id'])['data'];assert limited['state']=='partial'
+        denied=secrets.token_hex(12)+'.corp.test';lookup(denied,rcode=5)
+        blocked_capabilities.append(named_tcp('v4.corp.test',None,positive=False))
+        tcp('10.220.0.10','10.211.0.1')
+        for limit,server in [('tcp_ipv4,tcp_ipv6','tcp://[fd42:220::10]:15353'),('tcp_ipv4,udp_ipv4','udp://10.220.0.10:15353')]:
+            control('connection','update',connections['a'],'--capabilities',limit,'--dns',server)
+            preview=control('routing','preview')['data'];limited=control('routing','apply',preview['plan_id'])['data']
+            assert limited['state']=='partial',limited
+            summary=control('connection','show',connections['a'])['data']
+            assert set(summary['capabilities'])==set(limit.split(','))|{'dns'},summary
+            for mode in ['tcp','udp']:
+                lookup('v4.corp.test',mode=mode,expected='10.220.0.10')
+                lookup('v6.corp.test',kind=28,mode=mode,expected='fd42:220::10')
+            named_tcp('v4.corp.test','10.211.0.1')
+            if 'tcp_ipv6' in limit:
+                named_tcp('v6.corp.test','fd42:211::1')
+            else:
+                blocked_capabilities.extend([tcp('fd42:220::10',None,False),named_tcp('v6.corp.test',None,positive=False),named_tcp('v4.corp.test',None,ip='fd42:220::10',positive=False)])
+            for port,capability in [(15354,'udp_ipv4'),(15356,'udp_ipv6')]:
+                if capability in limit:udp(port,'198.18.1.1')
+                else:blocked_capabilities.append(udp(port,None,False))
+            tcp('10.221.0.10','10.212.0.1');tcp('1.1.1.1','10.210.0.1')
+        control('connection','update',connections['a'],'--capabilities','all','--dns','udp://10.220.0.10:15353')
+        control('connection','update',reserve,'--dns','tcp://10.220.0.10:15353','--capabilities','tcp_ipv4')
+        preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+        before=api('xray/',{});event_start=len(events.read_text().splitlines())
+        limited=control('connection','verify',reserve)['data']['verification']
+        assert limited['capabilities']['tcp_ipv4']['state']=='verified' and limited['dns']['state']=='verified'
+        assert all(limited['capabilities'][c]['state']=='unsupported' for c in ['udp_ipv4','tcp_ipv6','udp_ipv6'])
+        assert api('xray/',{})==before
+        evidence=[json.loads(line) for line in events.read_text().splitlines()[event_start:]]
+        assert any(e['transport']=='dns-tcp' and e['marker']=='health.corp.test' for e in evidence),evidence
+        assert all(e['peer']=='10.212.0.1' for e in evidence),evidence
+        recorded=[json.loads(line) for line in events.read_text().splitlines()]
+        assert not any(e['marker'] in blocked_capabilities+[denied] for e in recorded),'unsupported traffic or DNS escaped'
+        control('group','update',groups['a'],'--probe-file','-',payload=probes(220,'slow.corp.test'))
+        preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+        started=time.monotonic();slow=control('connection','verify',reserve)['data']['verification']
+        assert time.monotonic()-started<8,'TCP DNS exceeded its total deadline'
+        assert slow['capabilities']['tcp_ipv4']['state']=='verified' and slow['dns']['reason']=='probe_failed',slow
+        deadline=time.monotonic()+2
+        while control('routing','status')['data']['busy']:
+            assert time.monotonic()<deadline,'verification worker remained busy';time.sleep(0.01)
+        control('group','update',groups['a'],'--probe-file','-',payload=probes(220,'health.corp.test'))
+        assert control('connection','show',reserve)['data']['verification']['stale'] is True
+        print('slow TCP DNS respects the total deadline and releases the verification worker')
+        control('connection','update',reserve,'--capabilities','all','--dns','udp://[fd42:220::10]:15353')
+        preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+        print('per-connection verification, credential failure, TCP-only and IPv4-only routing, DNS transport requirements and blocked packet evidence passed')
         cached='cached.v4.corp.test';lookup(cached,expected='10.220.0.10')
         control('group','update',groups['a'],'--primary',reserve)
         recovery_plan=control('routing','preview')['data']['plan_id'];flag.write_text('fail_after_save')
