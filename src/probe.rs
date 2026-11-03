@@ -306,7 +306,9 @@ fn transport_at(
     let mut results = std::collections::BTreeMap::new();
     for capability in CAPABILITIES {
         client.check()?;
-        let reason = if !crate::capability::permits(&connection.allowed_capabilities, capability) {
+        let reason = if connection.protocol == "forti" && capability.ends_with("_ipv6") {
+            "protocol_limit".to_owned()
+        } else if !crate::capability::permits_connection(connection, capability) {
             "configured_limit".to_owned()
         } else if only_verified.is_some_and(|m| m.get(capability).is_none_or(|r| r != "verified")) {
             "not_rechecked".to_owned()
@@ -520,8 +522,7 @@ fn connection_at(
         (_, None) => "probe_missing".to_owned(),
         (Some(server), Some(probe)) => {
             let resolver = crate::policy::Resolver::parse(server)?;
-            if !crate::capability::permits(&connection.allowed_capabilities, &resolver.capability())
-            {
+            if !crate::capability::permits_connection(connection, &resolver.capability()) {
                 "configured_limit".to_owned()
             } else if results
                 .get(&resolver.capability())
@@ -883,7 +884,7 @@ fn health_at(
             return Ok(results);
         };
         let resolver = crate::policy::Resolver::parse(server)?;
-        if !crate::capability::permits(&connection.allowed_capabilities, &resolver.capability()) {
+        if !crate::capability::permits_connection(connection, &resolver.capability()) {
             results.insert("health".into(), "dns_capability_missing".into());
             return Ok(results);
         }
@@ -905,7 +906,7 @@ fn health_at(
     let mut target_error = if literal.is_some()
         || !["tcp_ipv4", "tcp_ipv6"]
             .into_iter()
-            .any(|c| crate::capability::permits(&connection.allowed_capabilities, c))
+            .any(|c| crate::capability::permits_connection(connection, c))
     {
         "capability_missing".to_owned()
     } else {
@@ -914,7 +915,7 @@ fn health_at(
     let mut target_ok = false;
     for (kind, capability) in [("A", "tcp_ipv4"), ("AAAA", "tcp_ipv6")] {
         if Instant::now() >= deadline
-            || !crate::capability::permits(&connection.allowed_capabilities, capability)
+            || !crate::capability::permits_connection(connection, capability)
         {
             continue;
         }

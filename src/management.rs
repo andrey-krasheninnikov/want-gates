@@ -228,6 +228,20 @@ pub fn run(kind: &str, mut args: impl Iterator<Item = OsString>) -> io::Result<(
                         )
                     },
                 )?
+            } else if protocol == "forti" {
+                crate::forti::bundle(
+                    &source,
+                    if path == "-" {
+                        None
+                    } else {
+                        Some(
+                            std::path::Path::new(path)
+                                .parent()
+                                .filter(|p| !p.as_os_str().is_empty())
+                                .unwrap_or(std::path::Path::new(".")),
+                        )
+                    },
+                )?
             } else {
                 source
             });

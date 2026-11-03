@@ -90,6 +90,12 @@ impl Authentication {
             dynamic_response: None,
         })
     }
+    pub fn submitted(&mut self) {
+        self.action = None;
+        self.expires_at = None;
+        self.state = "authenticating".into();
+        self.reason = "operator_input_submitted".into();
+    }
     pub fn describe(&self) -> Value {
         json!({"authentication":self.state,"reason":self.reason,"requires_input":self.action.is_some(),"action":self.action.as_ref().map(|a|a.kind),"expires_at":self.expires_at,"remembered":self.remembered})
     }
@@ -131,7 +137,7 @@ impl Authentication {
         }
         false
     }
-    fn require(
+    pub fn require(
         &mut self,
         kind: &'static str,
         prompt: &str,

@@ -3,8 +3,8 @@
 Want Gates manages domain and IP/CIDR routing beside MHSanaei/3x-ui 3.8.5 with Xray
 26.9.9. It controls the shared policy of enabled local VLESS inbounds. Rules
 select a group; its primary or an eligible ordered fallback supplies the outgoing
-VLESS or isolated native OpenVPN connection. Groups without a healthcheck retain
-explicit-primary routing. See [OpenVPN operation](openvpn.md) for native setup,
+VLESS or isolated native OpenVPN/Forti connection. Groups without a healthcheck retain
+explicit-primary routing. See [OpenVPN](openvpn.md) and [Forti](forti.md) for native setup,
 authentication, effective DNS and session verification.
 
 ## Configure and preview

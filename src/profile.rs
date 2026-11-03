@@ -13,6 +13,7 @@ pub fn parse_for(protocol: &str, input: &str) -> io::Result<Value> {
     match protocol {
         "vless" => parse(input),
         "openvpn" => crate::openvpn::parse(input),
+        "forti" => crate::forti::parse(input),
         _ => Err(invalid("protocol adapter unavailable")),
     }
 }
