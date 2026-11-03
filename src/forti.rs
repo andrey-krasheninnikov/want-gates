@@ -97,8 +97,10 @@ fn validate(profile: &Profile) -> io::Result<()> {
                 value.parse::<std::net::Ipv4Addr>().is_ok()
                     || crate::policy::domain_name(value).is_ok()
             }
-            "port" => value.parse::<u16>().is_ok_and(|v| v != 0),
-            "realm" => value.len() <= 255 && !value.chars().any(char::is_whitespace),
+            "port" => value
+                .parse::<u16>()
+                .is_ok_and(|v| v != 0 && v.to_string() == value),
+            "realm" => value.len() <= 63 && value.trim() == value,
             "trusted-cert" => {
                 *count <= 16 && value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
             }

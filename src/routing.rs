@@ -141,7 +141,7 @@ fn connection_verification(
     });
     let results = record.map(|r| &r.results);
     json!({"observed_at":record.map(|r|r.observed_at),"source":record.map(|r|&r.source),"stale":stale,
-        "capabilities":crate::capability::observations(&connection.allowed_capabilities, results, stale),
+        "capabilities":crate::capability::observations(connection, results, stale),
         "dns":crate::capability::observation(if stale{"inputs_changed"}else{results.and_then(|r|r.get("dns")).map(String::as_str).unwrap_or("not_checked")})})
 }
 fn connection_reports(
@@ -394,10 +394,7 @@ fn initial_matrix(config: &Config) -> Matrix {
                         match crate::domain::connection(config, g) {
                             None => "primary_missing",
                             Some(connection)
-                                if !crate::capability::permits(
-                                    &connection.allowed_capabilities,
-                                    c,
-                                ) =>
+                                if !crate::capability::permits_connection(connection, c) =>
                             {
                                 "configured_limit"
                             }
@@ -594,8 +591,8 @@ fn render(
         };
         for protocol in ["tcp", "udp"] {
             for (family, network) in [(4, "0.0.0.0/0"), (6, "::/0")] {
-                let permitted = crate::capability::permits(
-                    &connection.allowed_capabilities,
+                let permitted = crate::capability::permits_connection(
+                    connection,
                     &format!("{protocol}_ipv{family}"),
                 );
                 rules.push(json!({"type":"field","ruleTag":format!("wgates-check-{}-{protocol}-ipv{family}",connection.id),"inboundTag":[PROBE_TAG],"user":[user],"network":protocol,"ip":[network],"outboundTag":if permitted{crate::native::diagnostic_tag(connection)}else{"wgates-block".into()}}));
@@ -1013,7 +1010,7 @@ fn execute(
             .iter()
             .any(|c| crate::native::is_native(&c.protocol))
         {
-            native.call(json!({"command":"preflight"}))?;
+            native.call(json!({"command":"preflight","protocols":input.config.connections.iter().filter(|c| crate::native::is_native(&c.protocol)).map(|c|c.protocol.clone()).collect::<std::collections::BTreeSet<_>>()}))?;
         }
         for connection in input
             .config
@@ -1942,7 +1939,10 @@ impl Service {
                 }
             }
             if let Some(object) = value.as_object_mut()
-                && object.get("protocol").is_some_and(|v| v == "openvpn")
+                && object
+                    .get("protocol")
+                    .and_then(Value::as_str)
+                    .is_some_and(crate::native::is_native)
             {
                 let id = object
                     .get("id")

@@ -785,7 +785,7 @@ fn protocol(value: &Value) -> io::Result<()> {
 }
 fn summary(c: &Connection) -> Value {
     json!({"id":c.id,"group_id":c.group_id,"name":c.name,"protocol":c.protocol,"revision":c.revision,
-        "dns":c.dns,"allowed_capabilities":c.allowed_capabilities,"verification":{"capabilities":crate::capability::observations(&c.allowed_capabilities,None,false),"observed_at":null},"validation":"structural","authentication":"not_attempted"})
+        "dns":c.dns,"allowed_capabilities":c.allowed_capabilities,"verification":{"capabilities":crate::capability::observations(c,None,false),"observed_at":null},"validation":"structural","authentication":"not_attempted"})
 }
 
 fn id_number(id: &str, prefix: char) -> Option<u64> {

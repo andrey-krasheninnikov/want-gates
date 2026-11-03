@@ -50,6 +50,14 @@ fn forti_import_is_private_and_survives_restart_without_claiming_access() {
     assert_eq!(connection["validation"], "structural");
     assert_eq!(connection["authentication"], "not_attempted");
     assert_eq!(connection["capabilities"], serde_json::json!([]));
+    assert_eq!(
+        connection["verification"]["capabilities"]["tcp_ipv6"]["state"],
+        "unsupported"
+    );
+    assert_eq!(
+        connection["verification"]["capabilities"]["udp_ipv6"]["reason"],
+        "protocol_limit"
+    );
     assert!(!connection.to_string().contains("vpn.example.test"));
     let login = call(
         &service,
@@ -116,6 +124,7 @@ fn forti_assets_are_packaged_and_unsafe_native_options_never_reach_the_service()
         "ca-file = linked.pem",
         "host = other.example.test",
         "port = 0",
+        "port = 010443",
         "unknown = private-secret-marker",
     ] {
         std::fs::write(&path, format!("host = vpn.example.test\n{option}\n")).unwrap();

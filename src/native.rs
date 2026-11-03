@@ -320,7 +320,7 @@ pub fn blocked(
         .map(|capability| {
             (
                 capability.to_owned(),
-                if crate::capability::permits(&connection.allowed_capabilities, capability) {
+                if crate::capability::permits_connection(connection, capability) {
                     reason.to_owned()
                 } else {
                     "configured_limit".into()
