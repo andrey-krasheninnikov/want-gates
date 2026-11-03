@@ -22,7 +22,7 @@ invalidate the associated access evidence. Host forwarding is a checked
 prerequisite; the runtime does not change global sysctl or the management route.
 This runtime extends the single-worker design in ADR 0007 with the privileged
 operations required by native clients. Health selection stays in the control
-service. OpenVPN is the first adapter; other native adapters remain unavailable.
+service. OpenVPN and Forti share this runtime; other native adapters remain unavailable.
 
 The private bridge uses VLESS over fixed TCP ports, carrying UDP without exposing
 ephemeral relay ports. Separate identities keep diagnostics apart from admitted
@@ -30,6 +30,12 @@ traffic. The namespace permits numeric destinations through the TUN and native
 control traffic only to pinned VPN endpoints. The control service retains group
 selection, capability checks and recovery; the helper owns native resources.
 
-Linux acceptance uses controlled OpenVPN servers and public CLI/VLESS traffic.
+Forti also uses a private mount namespace for PPP defaults, hooks, runtime files,
+root home and pinned endpoint hosts. Server DNS is observed from native output;
+native route and resolver writes are disabled. Only IPv4 payloads are supported.
+Native SAML uses a temporary loopback relay reached through an operator SSH
+forward. Its callback closes on completion, logout or a 50-second deadline.
+
+Linux acceptance uses controlled OpenVPN/Forti servers and public CLI/VLESS traffic.
 It does not establish compatibility with corporate identity providers or every
-OpenVPN profile feature.
+native profile feature.

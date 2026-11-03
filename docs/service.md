@@ -1,9 +1,9 @@
 # Run the control service
 
-The service manages groups, VLESS/OpenVPN profiles, domain/IP rules and connection DNS.
+The service manages groups, VLESS/OpenVPN/Forti profiles, domain/IP rules and connection DNS.
 Saving an object
 changes desired state only. Routing requires a preview and explicit apply
-through 3x-ui. See [routing and recovery](routing.md). See [native OpenVPN operation](openvpn.md) for helper installation and authentication.
+through 3x-ui. See [routing and recovery](routing.md). See [OpenVPN](openvpn.md) and [Forti](forti.md) for native helper installation and authentication.
 
 ## Build and commands
 
@@ -131,8 +131,9 @@ observations and staleness. VLESS `authentication` is `traffic_verified` after a
 matching successful observation, `unknown` after failure or invalidation, and
 `not_attempted` when no traffic check ran.
 OpenVPN profiles use `--protocol openvpn`; see [profile and authentication limits](openvpn.md).
-OpenVPN reports native authentication separately from resource verification.
-Forti, WireGuard and NetBird adapters remain unavailable.
+Forti profiles use `--protocol forti`; see [Forti operation](forti.md).
+Both native adapters report authentication separately from resource verification.
+WireGuard and NetBird adapters remain unavailable.
 
 ### Persistent state
 
