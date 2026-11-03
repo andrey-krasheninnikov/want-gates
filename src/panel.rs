@@ -69,6 +69,14 @@ impl Client {
             deadline: Instant::now() + Duration::from_secs(300),
         })
     }
+    pub fn until(&self, deadline: Instant) -> Self {
+        Self {
+            settings: self.settings.clone(),
+            http: self.http.clone(),
+            stopping: self.stopping.clone(),
+            deadline: self.deadline.min(deadline),
+        }
+    }
     pub fn check(&self) -> io::Result<()> {
         if self.stopping.load(Ordering::Relaxed) {
             return Err(io::Error::other(
@@ -93,18 +101,30 @@ impl Client {
             self.settings.url.trim_end_matches('/')
         );
         let authorization = format!("Bearer {}", self.settings.token);
+        let timeout = self
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_secs(5));
         let response = if let Some(form) = form {
             self.http
                 .post(&url)
                 .header("Authorization", &authorization)
+                .config()
+                .timeout_global(Some(timeout))
+                .build()
                 .send_form(form.iter().copied())
         } else {
             self.http
                 .get(&url)
                 .header("Authorization", &authorization)
+                .config()
+                .timeout_global(Some(timeout))
+                .build()
                 .call()
         };
-        let mut response = response.map_err(|_| io::Error::other("panel request failed; check access, version, TLS and connectivity; no automatic retry"))?;
+        let mut response = response.map_err(|error| io::Error::new(
+            if matches!(error,ureq::Error::Timeout(_)) || Instant::now()>=self.deadline {io::ErrorKind::TimedOut}else{io::ErrorKind::Other},
+            "panel request failed; check access, version, TLS and connectivity; no automatic retry"))?;
         if response.status().as_u16() != 200 {
             return Err(io::Error::other("unexpected panel HTTP status"));
         }
@@ -114,7 +134,23 @@ impl Client {
             .as_reader()
             .take(MAX_PANEL as u64 + 1)
             .read_to_end(&mut bytes)
-            .map_err(|_| io::Error::other("cannot read panel response"))?;
+            .map_err(|error| {
+                io::Error::new(
+                    if Instant::now() >= self.deadline
+                        || error.kind() == io::ErrorKind::TimedOut
+                        || error
+                            .get_ref()
+                            .and_then(|e| e.downcast_ref::<ureq::Error>())
+                            .is_some_and(|e| matches!(e, ureq::Error::Timeout(_)))
+                    {
+                        io::ErrorKind::TimedOut
+                    } else {
+                        io::ErrorKind::Other
+                    },
+                    "cannot read panel response",
+                )
+            })?;
+        self.check()?;
         if bytes.len() > MAX_PANEL {
             return Err(invalid("panel response exceeds 16 MiB"));
         }

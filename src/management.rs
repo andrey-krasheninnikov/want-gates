@@ -17,7 +17,13 @@ pub fn run(kind: &str, mut args: impl Iterator<Item = OsString>) -> io::Result<(
     let action = action.to_str().ok_or_else(|| invalid("invalid action"))?;
     let allowed: &[&str] = match (kind, action) {
         ("group", "create") => &["--name"],
-        ("group", "update") => &["--name", "--primary", "--probe-file"],
+        ("group", "update") => &[
+            "--name",
+            "--primary",
+            "--probe-file",
+            "--fallbacks",
+            "--healthcheck-file",
+        ],
         ("rule", "create" | "update") => &["--group", "--destination"],
         ("rule", "list") => &["--group"],
         ("panel", "configure") => &["--file"],
@@ -116,19 +122,43 @@ pub fn run(kind: &str, mut args: impl Iterator<Item = OsString>) -> io::Result<(
     if request["primary"] == "-" {
         request["primary"] = Value::Null;
     }
-    if let Some(path) = options.get("--probe-file") {
-        let source: Box<dyn Read> = if path == "-" {
-            Box::new(io::stdin())
+    if let Some(value) = options.get("--fallbacks") {
+        let value = value
+            .to_str()
+            .ok_or_else(|| invalid("fallbacks must be UTF-8"))?;
+        request["fallbacks"] = if value == "-" {
+            json!([])
         } else {
-            Box::new(std::fs::File::open(path)?)
+            json!(value.split(',').collect::<Vec<_>>())
         };
-        let mut bytes = Vec::new();
-        source.take(64 * 1024 + 1).read_to_end(&mut bytes)?;
-        if bytes.len() > 64 * 1024 {
-            return Err(invalid("probe configuration exceeds 64 KiB"));
+    }
+    for (option, field) in [
+        ("--probe-file", "probes"),
+        ("--healthcheck-file", "healthcheck"),
+    ] {
+        if let Some(path) = options.get(option) {
+            let source: Box<dyn Read> = if path == "-" {
+                Box::new(io::stdin())
+            } else {
+                Box::new(std::fs::File::open(path)?)
+            };
+            let mut bytes = Vec::new();
+            let limit = if field == "healthcheck" {
+                128 * 1024
+            } else {
+                64 * 1024
+            };
+            source.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+            if bytes.len() > limit {
+                return Err(invalid(if field == "healthcheck" {
+                    "healthcheck configuration exceeds 128 KiB"
+                } else {
+                    "probe configuration exceeds 64 KiB"
+                }));
+            }
+            request[field] =
+                serde_json::from_slice(&bytes).map_err(|_| invalid("invalid probe JSON"))?;
         }
-        request["probes"] =
-            serde_json::from_slice(&bytes).map_err(|_| invalid("invalid probe JSON"))?;
     }
     if action == "import"
         && ["--name", "--group", "--protocol", "--file"]

@@ -2,8 +2,8 @@
 
 Want Gates manages domain and IP/CIDR routing beside MHSanaei/3x-ui 3.8.5 with Xray
 26.9.9. It controls the shared policy of enabled local VLESS inbounds. Rules
-select a group; its explicit primary supplies the outgoing VLESS connection.
-No fallback or continuous health monitoring runs in this slice.
+select a group; its primary or an eligible ordered fallback supplies the outgoing
+VLESS connection. Groups without a healthcheck retain explicit-primary routing.
 
 ## Configure and preview
 
@@ -286,9 +286,10 @@ leave newly requested rules unapplied. Read desired and running revisions
 before relying on them. A completed successful apply cannot be undone through
 `recover`; create and review another desired configuration instead.
 
-One network worker serializes panel operations. Readiness, object reads and
+One network worker serializes panel operations and periodic healthchecks. Readiness, object reads and
 routing status remain available; configuration writes are rejected while it
-runs. Panel requests and individual probes have five-second budgets. The
+runs. Panel requests and explicit verification probes have five-second budgets.
+Periodic checks use the group timeout for the whole connection attempt. The
 operation has a 300-second budget; CLI network responses allow 330 seconds.
 Shutdown retains uncertain work for recovery instead of retrying it.
 
@@ -337,3 +338,108 @@ remain subject to individual connection verification. Each fixture removes its a
 Remove the task-owned container and its disposable data after testing; preserve
 pre-existing resources. Linux/arm64 acceptance does not establish amd64 or a
 corporate provider's live compatibility.
+
+## Automatic group health and failover
+
+Saving a healthcheck changes desired state. Preview and explicit apply activate
+it. A group without a healthcheck keeps manual primary selection. Ordered
+fallbacks must be distinct members of the group and exclude its primary.
+Clear references before moving or deleting a connection.
+
+```sh
+wgates group update GROUP_ID --fallbacks FIRST_RESERVE,SECOND_RESERVE
+wgates group update GROUP_ID --healthcheck-file healthcheck.json
+wgates routing preview
+wgates routing apply PLAN_ID
+wgates routing status
+```
+
+Example `healthcheck.json`:
+
+```json
+{
+  "target": "https://health.corp.example/ready",
+  "required_capabilities": ["tcp_ipv4", "udp_ipv4"],
+  "expected_status": 200,
+  "interval_seconds": 30,
+  "timeout_seconds": 5,
+  "failure_threshold": 3,
+  "recovery_threshold": 5
+}
+```
+
+The healthcheck file is bounded at 128 KiB, including JSON escaping.
+The target accepts `tcp://host:port`, HTTP and HTTPS. TCP requires a nonzero
+port and `expect_hex`, a nonempty expected response prefix. Optional `send_hex`
+sends a request before reading. Both hex strings decode to at most 1024 bytes.
+Only a matching resource response establishes health; a SOCKS CONNECT reply
+does not. Use non-secret test messages because these fields are ordinary group
+metadata. Silent TCP targets cannot supply affirmative proof in this mode.
+HTTP uses GET and defaults to status 200. Targets have no credentials,
+query or fragment. Redirects are disabled; response bodies are bounded at
+64 KiB. HTTPS verifies the certificate chain, hostname and validity period.
+An optional `ca_pem` contains additional public CA certificates, up to 64 KiB.
+The supplied CA is tried first when present; an unknown issuer may try standard
+public trust within the same deadline. Wrong names and expired certificates fail
+without trying another trust store. Private keys and disabled TLS verification are rejected.
+
+For a TCP echo resource, use this target configuration with the same interval
+and capability settings:
+
+```json
+{"target":"tcp://health.corp.example:9000","send_hex":"50494e47","expect_hex":"504f4e47","required_capabilities":["tcp_ipv4"]}
+```
+
+This sends `PING` and requires a `PONG` prefix. A banner resource can omit
+`send_hex`; for SSH, an expected `SSH-` prefix is `5353482d`.
+
+`required_capabilities` is a nonempty set of the four existing combinations.
+The chosen connection must satisfy the entire set. A group uses one connection
+for both data and protected DNS; it does not divide protocols across reserves.
+Other combinations remain subject to the connection's limits and admitted
+traffic results. Explicit `connection verify` records stay separate and cannot
+switch the group.
+
+Every connection in an enabled group is checked through its own prepared route,
+including members outside the fallback list. Only primary and listed reserves
+are selection candidates. Initial apply checks capabilities and the target;
+periodic checks repeat the target, required capability probes and needed DNS.
+Hostname targets use that connection's numeric resolver through its own VPN.
+They never use system DNS, another connection or a public fallback. Protected
+domain routing additionally requires the group's DNS probe to pass.
+
+Intervals range from 1 to 86400 seconds, timeout from 1 to 60 seconds and no
+longer than the interval; thresholds range from 1 to 1000. Timeout covers the
+whole periodic attempt, including DNS, SOCKS, TLS and response reads. One worker
+serializes operations. Large or slow groups can delay later checks; status shows
+overdue scheduling. Missed intervals do not create queued samples or increment
+streaks. The service must run for automatic checks and switches to occur.
+
+A new candidate can enter service after its first successful initial check.
+Three consecutive failures exclude an admitted connection by default. Until
+that threshold, status shows `suspect` and the previously admitted path remains.
+After exclusion, five consecutive successes restore eligibility. The same
+stabilization applies to primary and higher-priority reserves. Selection chooses
+the first eligible candidate in order. No eligible candidate blocks protected
+data and DNS; unmatched traffic stays direct. Timeouts and TLS/DNS/target errors
+are distinct from configured capability limits. Failed VLESS access does not
+prove an authentication cause.
+
+Automatic updates reuse the submission journal, saved and runtime checks, and
+guarded restoration. Observed drift or an uncertain update stops automatic
+writes and exposes the error or recovery requirement. Inspect `routing status`;
+recover a pending recorded operation where required, then preview and apply to
+resume. Do not overwrite intervening panel edits. A new preview can become stale
+if an automatic switch changes the panel before apply.
+
+Monitoring uses retained applied configuration and profiles. An apply with
+unchanged connection and healthcheck inputs preserves failure and recovery history. Saving edits or
+removing desired objects does not silently change the active policy. Health
+status identifies its running revision separately. Restart retains the applied
+path and down history, resets streaks, marks old health unknown, and schedules
+fresh checks. Startup does not replay an interrupted external update.
+
+Use `--fallbacks -` to clear reserves. Pass JSON `null` through
+`--healthcheck-file -` to disable monitoring, then preview and apply. Path
+changes and Xray updates may interrupt existing sessions. These checks do not
+establish native-client, corporate-provider, or production compatibility.

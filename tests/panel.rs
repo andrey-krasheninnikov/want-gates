@@ -17,6 +17,7 @@ struct Panel {
     writes: Arc<Mutex<usize>>,
     stop: Arc<AtomicBool>,
     failure: Arc<AtomicU8>,
+    slow_route: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
 impl Panel {
@@ -31,8 +32,11 @@ impl Panel {
         let stop = Arc::new(AtomicBool::new(false));
         let failure = Arc::new(AtomicU8::new(0));
         let mode = failure.clone();
+        let slow_route = Arc::new(AtomicBool::new(false));
+        let slow = slow_route.clone();
         let (saved, count, stopping) = (template.clone(), writes.clone(), stop.clone());
         let thread = thread::spawn(move || {
+            let mut restarting = false;
             while !stopping.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() {
                     Ok(c) => c,
@@ -82,7 +86,13 @@ impl Panel {
                 let mut disconnect = false;
                 let obj = match path {
                     "/panel/api/server/status" => {
-                        json!({"panelVersion":"3.8.5","xray":{"state":"running","version":"26.9.9","errorMsg":""}})
+                        let state = if restarting {
+                            restarting = false;
+                            "restarting"
+                        } else {
+                            "running"
+                        };
+                        json!({"panelVersion":"3.8.5","xray":{"state":state,"version":"26.9.9","errorMsg":""}})
                     }
                     "/panel/api/xray/" => {
                         json!({"xraySetting":saved.lock().unwrap().clone(),"outboundTestUrl":"https://example.org/check"})
@@ -108,6 +118,7 @@ impl Panel {
                             }
                             3 => disconnect = true,
                             4 => thread::sleep(Duration::from_millis(1500)),
+                            5 => restarting = true,
                             _ => {}
                         }
                         Value::Null
@@ -118,6 +129,9 @@ impl Panel {
                             url::form_urlencoded::parse(body.as_bytes())
                                 .into_owned()
                                 .collect();
+                        if !params["email"].is_empty() && slow.swap(false, Ordering::SeqCst) {
+                            thread::sleep(Duration::from_millis(1500));
+                        }
                         json!({"outboundTag":if params["inboundTag"].starts_with("wgates-dns-"){"wgates-block"}else if params["port"]=="53"{"wgates-dns"}else if !params["domain"].is_empty()||params["ip"].starts_with("10.40."){"wgates-block"}else{"wgates-direct"}})
                     }
                     _ => panic!("unexpected API {path}"),
@@ -140,6 +154,7 @@ impl Panel {
             writes,
             stop,
             failure,
+            slow_route,
             thread: Some(thread),
         }
     }
@@ -833,4 +848,68 @@ fn disabled_dns_transport_has_the_same_reason_after_apply_and_verify() {
     let verified = ok(&s, &["connection", "verify", &id], None);
     assert_eq!(verified["data"]["verification"]["dns"], after_apply);
     assert_eq!(after_apply["state"], "unsupported");
+}
+
+#[test]
+fn apply_waits_for_a_transient_xray_restart_before_claiming_running_state() {
+    let s = Service::start();
+    let p = Panel::start();
+    ok(
+        &s,
+        &["panel", "configure", "--file", "-"],
+        Some(&json!({"url":p.url,"token":"private-panel-token"}).to_string()),
+    );
+    let preview = ok(&s, &["routing", "preview"], None);
+    p.failure.store(5, Ordering::SeqCst);
+    let applied = ok(
+        &s,
+        &[
+            "routing",
+            "apply",
+            preview["data"]["plan_id"].as_str().unwrap(),
+        ],
+        None,
+    );
+    assert_eq!(applied["data"]["state"], "applied");
+}
+
+#[test]
+fn exhausted_health_budget_records_a_failure_without_stopping_automation() {
+    let s = Service::start();
+    let p = Panel::start();
+    let (group, _) = configured_rule(&s, &p);
+    let id=ok(&s,&["connection","import","--group",&group,"--name","VPN","--protocol","vless","--file","-"],Some("vless://00000000-0000-4000-8000-000000000001@127.0.0.1:443?encryption=none&security=none"))["data"]["id"].as_str().unwrap().to_owned();
+    ok(
+        &s,
+        &[
+            "group",
+            "update",
+            &group,
+            "--primary",
+            &id,
+            "--healthcheck-file",
+            "-",
+        ],
+        Some(
+            r#"{"target":"tcp://10.40.0.10:443","expect_hex":"5353482d","required_capabilities":["tcp_ipv4"],"timeout_seconds":1}"#,
+        ),
+    );
+    p.slow_route.store(true, Ordering::SeqCst);
+    let preview = ok(&s, &["routing", "preview"], None);
+    let applied = ok(
+        &s,
+        &[
+            "routing",
+            "apply",
+            preview["data"]["plan_id"].as_str().unwrap(),
+        ],
+        None,
+    );
+    assert_eq!(applied["data"]["state"], "blocked");
+    let status = ok(&s, &["routing", "status"], None);
+    assert!(status["data"]["health"]["error"].is_null());
+    assert_eq!(
+        status["data"]["health"]["groups"][0]["connections"][&id]["reason"],
+        "probe_timed_out"
+    );
 }

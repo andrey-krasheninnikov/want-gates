@@ -6,8 +6,8 @@ Network routing and tunnel management for an existing 3x-ui gateway.
 
 Want Gates routes traffic from VLESS clients through outgoing VLESS connections
 selected by destination domains, IP addresses, and CIDR ranges. Connections
-are organized into company groups with an explicit primary. Ordered fallbacks
-remain planned.
+are organized into company groups with an explicit primary and ordered fallbacks.
+Optional target-resource checks switch data and DNS together within a group.
 
 ## Status
 
@@ -22,10 +22,10 @@ without changing primary. See [service operation](docs/service.md) and
 Both `vless://` and complete outbound JSON imports are supported. Import checks
 structure; apply checks the panel and actual traffic. The isolated local
 Linux/arm64 stand exercises two groups and the complete VLESS ingress path.
-Native authentication, continuous health/fallback, bootstrap,
+Native authentication, bootstrap,
 the skill package and panel UI remain planned. No binary release is published.
 
-## Planned routing model
+## Routing model
 
 1. A user connects to the VPS through VLESS in 3x-ui.
 2. A destination rule selects a group.
@@ -39,17 +39,17 @@ Groups operate concurrently. Each connection has a group, name, protocol,
 authentication state, DNS settings, and verified TCP/UDP and IPv4/IPv6
 capabilities. Ambiguous rules of equal specificity are rejected.
 
-## Planned connections and checks
+## Connections and checks
 
 - Outgoing VLESS through Xray.
 - OpenVPN, Forti through openfortivpn, and WireGuard.
 - NetBird private-network routes and exit nodes.
 - Profile import and native authentication, including supported MFA/SSO flows.
-- Target-resource healthchecks, ordered failover, and automatic failback.
+- TCP, HTTP and HTTPS target checks, ordered failover, and stable failback for VLESS.
 
 Default healthchecks run every 30 seconds with a 5-second timeout. Three
 consecutive failures mark a connection unavailable; five consecutive successes
-make a recovered primary eligible again. These settings are configurable per
+make a recovered connection eligible again. These settings are configurable per
 group.
 
 Simultaneous isolated NetBird accounts and UDP/IPv6 support for the Forti bridge
