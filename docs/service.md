@@ -1,9 +1,9 @@
 # Run the control service
 
-The service manages groups, VLESS profiles and IP/CIDR rules. Saving an object
+The service manages groups, VLESS profiles, domain/IP rules and connection DNS.
+Saving an object
 changes desired state only. Routing requires a preview and explicit apply
-through 3x-ui. See [IP routing and recovery](routing.md). Native authentication,
-domain routing and per-connection DNS policy remain planned.
+through 3x-ui. See [routing and recovery](routing.md). Native authentication remains planned.
 
 ## Build and commands
 
@@ -76,6 +76,8 @@ wgates connection list --group GROUP_ID
 wgates connection show CONNECTION_ID
 wgates connection update CONNECTION_ID --name 'Backup VPN' --group OTHER_GROUP_ID
 wgates connection update CONNECTION_ID --file replacement.json
+wgates connection update CONNECTION_ID --dns udp://10.20.0.53:53
+wgates connection update CONNECTION_ID --dns -
 wgates connection delete CONNECTION_ID
 wgates group delete GROUP_ID
 ```
@@ -137,7 +139,9 @@ The service holds an exclusive advisory lock on its state directory, including
 when another process chooses a different socket. `config.json` uses schema
 version 2, a configuration revision, stable object IDs, and per-object revisions.
 Schema 1 loads with empty rules, primary and probes; the next saved mutation
-writes schema 2. Older binaries reject the extended configuration. Downgrading
+writes schema 2. Existing schema 1/2 data defaults to no connection DNS and no
+DNS probe. Existing routing snapshots and recovery journals remain readable.
+Older binaries reject the extended configuration. Downgrading
 requires an offline migration rather than a reset.
 It contains metadata and profile references. Its limit is 16 MiB.
 
@@ -196,10 +200,12 @@ Management uses the same one-request-per-connection framing. Commands are
 `routing.apply`, `routing.status`, and `routing.recover`.
 
 Create groups with `name`. Import connections with `name`, `group_id`,
-`protocol`, and the source text in `profile`. Show uses `id`. Update and delete
+`protocol`, and the source text in `profile`; `dns` optionally supplies a numeric
+UDP/TCP resolver URI. Show uses `id`. Update and delete
 require `id` and `expected_revision`, obtained from a prior show. Updates supply
 only changed fields: group `name`, `primary` (ID or null), or `probes`; connection
-`name`, `group_id`, or `profile`; rule `group_id` or `destination`. Unexpected
+`name`, `group_id`, `profile`, or `dns` (URI or null); rule `group_id` or
+`destination`. Unexpected
 fields are rejected. Stale revisions fail without a write;
 the CLI supplies these revision preconditions automatically.
 

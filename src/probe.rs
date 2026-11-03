@@ -222,6 +222,8 @@ pub fn check(
         .iter()
         .filter(|g| config.rules.iter().any(|r| r.group_id == g.id))
     {
+        let group_proxy = proxy.for_group(&group.id);
+        let email = proxy.group_users.get(&group.id).map(String::as_str);
         let mut results = std::collections::BTreeMap::new();
         for capability in CAPABILITIES {
             client.check()?;
@@ -248,12 +250,18 @@ pub fn check(
                                     .map_err(|_| invalid("invalid HTTP probe"))?
                                     .port_or_known_default()
                                     .unwrap();
-                                if client.route(PROBE_TAG, &ip.to_string(), "tcp", port)?
-                                    != format!("wgates-out-{}", group.primary.as_ref().unwrap())
+                                if client.route_context(
+                                    PROBE_TAG,
+                                    &ip.to_string(),
+                                    None,
+                                    email,
+                                    "tcp",
+                                    port,
+                                )? != format!("wgates-out-{}", group.primary.as_ref().unwrap())
                                 {
                                     return Err(invalid("runtime route does not select primary"));
                                 }
-                                http(p, proxy)
+                                http(p, &group_proxy)
                             })()
                         })
                     }
@@ -266,16 +274,18 @@ pub fn check(
                         probe.as_ref().map(|p| {
                             (|| {
                                 let address = p.address()?;
-                                if client.route(
+                                if client.route_context(
                                     PROBE_TAG,
                                     &address.ip().to_string(),
+                                    None,
+                                    email,
                                     "udp",
                                     address.port(),
                                 )? != format!("wgates-out-{}", group.primary.as_ref().unwrap())
                                 {
                                     return Err(invalid("runtime route does not select primary"));
                                 }
-                                dns(p, proxy)
+                                dns(p, &group_proxy)
                             })()
                         })
                     }
@@ -299,6 +309,72 @@ pub fn check(
             results.insert(capability.to_owned(), reason.to_owned());
         }
         matrix.insert(group.id.clone(), results);
+    }
+    for group in config.groups.iter().filter(|g| {
+        crate::domain::rules(config)
+            .iter()
+            .any(|(_, r)| r.group_id == g.id)
+    }) {
+        let connection = crate::domain::connection(config, group);
+        let reason = match (
+            connection,
+            connection.and_then(|c| c.dns.as_ref()),
+            group.probes.dns.as_ref(),
+        ) {
+            (None, _, _) => "primary_missing".to_owned(),
+            (_, None, _) => "dns_missing".to_owned(),
+            (_, _, None) => "probe_missing".to_owned(),
+            (_, Some(server), Some(probe)) => {
+                if only_verified.is_some_and(|m| {
+                    m.get(&group.id)
+                        .and_then(|r| r.get("dns"))
+                        .is_none_or(|r| r != "verified")
+                }) {
+                    "not_rechecked".to_owned()
+                } else {
+                    let resolver = crate::policy::Resolver::parse(server)?;
+                    if matrix[&group.id]
+                        .get(&resolver.capability())
+                        .is_none_or(|v| v != "verified")
+                    {
+                        "dns_transport_unverified".to_owned()
+                    } else {
+                        let result = (|| {
+                            client.check()?;
+                            if client.route(PROBE_TAG, "127.0.0.1", "udp", 53)? != "wgates-dns" {
+                                return Err(invalid("DNS interception route is missing"));
+                            }
+                            dns(
+                                &DnsProbe {
+                                    server: "127.0.0.1:53".into(),
+                                    query_name: crate::policy::domain_name(&probe.query_name)?,
+                                    query_type: probe.query_type.clone(),
+                                },
+                                proxy,
+                            )
+                        })();
+                        match result {
+                            Ok(()) => "verified".to_owned(),
+                            Err(e) => format!("probe_failed: {e}"),
+                        }
+                    }
+                }
+            }
+        };
+        if only_verified.is_some_and(|m| {
+            m.get(&group.id)
+                .and_then(|r| r.get("dns"))
+                .is_some_and(|r| r == "verified")
+        }) && reason != "verified"
+        {
+            return Err(io::Error::other(
+                "running DNS verification failed; inspect routing state",
+            ));
+        }
+        matrix
+            .get_mut(&group.id)
+            .unwrap()
+            .insert("dns".into(), reason);
     }
     Ok(matrix)
 }

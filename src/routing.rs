@@ -32,6 +32,8 @@ pub struct Proxy {
     pub port: u16,
     pub user: String,
     pub password: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub group_users: BTreeMap<String, String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -55,6 +57,15 @@ struct Working {
     matrix: Matrix,
 }
 
+impl Proxy {
+    pub fn for_group(&self, id: &str) -> Self {
+        Self {
+            user: self.group_users.get(id).unwrap_or(&self.user).clone(),
+            ..self.clone()
+        }
+    }
+}
+
 pub fn digest(value: &impl Serialize) -> io::Result<String> {
     Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(value)?)))
 }
@@ -69,14 +80,14 @@ fn optional<T: serde::de::DeserializeOwned>(path: &Path) -> io::Result<Option<T>
         Err(e) => Err(e),
     }
 }
-fn owned(value: &Value) -> bool {
+pub(crate) fn owned(value: &Value) -> bool {
     value["tag"]
         .as_str()
         .or_else(|| value["ruleTag"].as_str())
         .is_some_and(|s| s.starts_with(PREFIX))
 }
 fn managed(template: &Value) -> Value {
-    json!({"inbounds":template["inbounds"].as_array().map(|a|a.iter().filter(|v|owned(v)).collect::<Vec<_>>()).unwrap_or_default(),
+    json!({"dns_servers":template["dns"]["servers"].as_array().map(|a|a.iter().filter(|v|owned(v)).collect::<Vec<_>>()).unwrap_or_default(),"inbounds":template["inbounds"].as_array().map(|a|a.iter().filter(|v|owned(v)).collect::<Vec<_>>()).unwrap_or_default(),
         "outbounds":template["outbounds"].as_array().map(|a|a.iter().filter(|v|owned(v)).collect::<Vec<_>>()).unwrap_or_default(),
         "rules":template["routing"]["rules"].as_array().map(|a|a.iter().filter(|v|owned(v)).collect::<Vec<_>>()).unwrap_or_default()})
 }
@@ -165,7 +176,7 @@ fn validate(input: &Input, base: &Snapshot, working: Option<&Working>) -> io::Re
     let actual = managed(&base.template);
     let expected = working
         .map(|w| managed(&w.snapshot.template))
-        .unwrap_or_else(|| json!({"inbounds":[],"outbounds":[],"rules":[]}));
+        .unwrap_or_else(|| json!({"dns_servers":[],"inbounds":[],"outbounds":[],"rules":[]}));
     if actual != expected {
         return Err(invalid(
             "managed settings drift or reserved tag collision; reconcile before preview",
@@ -222,34 +233,9 @@ fn validate(input: &Input, base: &Snapshot, working: Option<&Working>) -> io::Re
             ));
         }
     }
-    for group in input
-        .config
-        .groups
-        .iter()
-        .filter(|g| input.config.rules.iter().any(|r| r.group_id == g.id))
-    {
+    crate::domain::validate(input, base)?;
+    for group in &input.config.groups {
         group.probes.validate()?;
-        let addresses = [
-            group.probes.tcp_ipv4.as_ref().map(|p| p.address()),
-            group.probes.tcp_ipv6.as_ref().map(|p| p.address()),
-            group
-                .probes
-                .udp_ipv4
-                .as_ref()
-                .map(|p| p.address().map(|a| a.ip())),
-            group
-                .probes
-                .udp_ipv6
-                .as_ref()
-                .map(|p| p.address().map(|a| a.ip())),
-        ];
-        for address in addresses.into_iter().flatten() {
-            if winner(&input.config, address?) != Some(group.id.as_str()) {
-                return Err(invalid(
-                    "probe destination must select its group under the most-specific rule",
-                ));
-            }
-        }
     }
     Ok(tags)
 }
@@ -259,27 +245,43 @@ fn initial_matrix(config: &Config) -> Matrix {
         .iter()
         .filter(|g| config.rules.iter().any(|r| r.group_id == g.id))
         .map(|g| {
-            (
-                g.id.clone(),
-                CAPABILITIES
-                    .iter()
-                    .map(|c| {
-                        (
-                            c.to_string(),
-                            if g.primary.is_some() {
-                                "candidate"
-                            } else {
-                                "primary_missing"
-                            }
-                            .to_owned(),
-                        )
-                    })
-                    .collect(),
-            )
+            let mut result: BTreeMap<_, _> = CAPABILITIES
+                .iter()
+                .map(|c| {
+                    (
+                        c.to_string(),
+                        if g.primary.is_some() {
+                            "candidate"
+                        } else {
+                            "primary_missing"
+                        }
+                        .to_owned(),
+                    )
+                })
+                .collect();
+            if crate::domain::rules(config)
+                .iter()
+                .any(|(_, r)| r.group_id == g.id)
+            {
+                let state = if g.primary.is_none() {
+                    "primary_missing"
+                } else if crate::domain::connection(config, g)
+                    .and_then(|c| c.dns.as_ref())
+                    .is_none()
+                {
+                    "dns_missing"
+                } else if g.probes.dns.is_none() {
+                    "probe_missing"
+                } else {
+                    "candidate"
+                };
+                result.insert("dns".into(), state.into());
+            }
+            (g.id.clone(), result)
         })
         .collect()
 }
-fn allowed(matrix: &Matrix, group: &str, capability: &str) -> bool {
+pub(crate) fn allowed(matrix: &Matrix, group: &str, capability: &str) -> bool {
     matrix
         .get(group)
         .and_then(|c| c.get(capability))
@@ -320,7 +322,14 @@ fn render(
         .as_array_mut()
         .ok_or_else(|| invalid("invalid template inbounds"))?;
     inbounds.retain(|v| !owned(v));
-    inbounds.push(json!({"tag":PROBE_TAG,"listen":"127.0.0.1","port":proxy.port,"protocol":"socks","settings":{"auth":"password","users":[{"user":proxy.user,"pass":proxy.password}],"udp":true,"ip":"127.0.0.1"}}));
+    let mut users = vec![json!({"user":proxy.user,"pass":proxy.password})];
+    users.extend(
+        proxy
+            .group_users
+            .values()
+            .map(|u| json!({"user":u,"pass":proxy.password})),
+    );
+    inbounds.push(json!({"tag":PROBE_TAG,"listen":"127.0.0.1","port":proxy.port,"protocol":"socks","settings":{"auth":"password","users":users,"udp":true,"ip":"127.0.0.1"}}));
     if template.get("routing").is_none() {
         template["routing"] = json!({"rules":[]});
     }
@@ -337,12 +346,31 @@ fn render(
     let mut ingress = tags.to_vec();
     ingress.push(PROBE_TAG.to_owned());
     let mut rules = vec![previous[0].clone()];
+    for (group_id, user) in &proxy.group_users {
+        let group = input
+            .config
+            .groups
+            .iter()
+            .find(|g| &g.id == group_id)
+            .unwrap();
+        for protocol in ["tcp", "udp"] {
+            for (family, network) in [(4, "0.0.0.0/0"), (6, "::/0")] {
+                let primary = group
+                    .primary
+                    .as_ref()
+                    .filter(|_| allowed(matrix, group_id, &format!("{protocol}_ipv{family}")));
+                rules.push(json!({"type":"field","ruleTag":format!("wgates-probe-{group_id}-{protocol}-ipv{family}"),"inboundTag":[PROBE_TAG],"user":[user],"network":protocol,"ip":[network],"outboundTag":primary.map(|id|format!("wgates-out-{id}")).unwrap_or_else(||"wgates-block".into())}));
+            }
+        }
+        rules.push(json!({"type":"field","ruleTag":format!("wgates-probe-{group_id}-block"),"inboundTag":[PROBE_TAG],"user":[user],"outboundTag":"wgates-block"}));
+    }
+    rules.extend(crate::domain::render(input, template, &ingress, matrix)?);
     let mut ordered = input
         .config
         .rules
         .iter()
-        .map(|r| Ok((Network::parse(&r.destination)?, r)))
-        .collect::<io::Result<Vec<_>>>()?;
+        .filter_map(|r| Network::parse(&r.destination).ok().map(|n| (n, r)))
+        .collect::<Vec<_>>();
     ordered.sort_by(|(a, ar), (b, br)| {
         b.prefix
             .cmp(&a.prefix)
@@ -371,6 +399,7 @@ fn render(
     rules.push(json!({"type":"field","ruleTag":"wgates-unmatched","inboundTag":ingress,"outboundTag":"wgates-direct"}));
     rules.extend(previous.into_iter().skip(1));
     template["routing"]["rules"] = json!(rules);
+    crate::domain::normalise_panel_dns(template)?;
     Ok(result)
 }
 
@@ -522,14 +551,28 @@ fn execute(
         let base = client.read()?;
         let working: Option<Working> = optional(&root.join("working.json"))?;
         let ingress = validate(&input, &base, working.as_ref())?;
-        let proxy = match working {
+        let mut proxy = match working {
             Some(w) => w.proxy,
             None => Proxy {
                 port: TcpListener::bind("127.0.0.1:0")?.local_addr()?.port(),
                 user: random_id()?,
                 password: random_id()?,
+                group_users: BTreeMap::new(),
             },
         };
+        proxy
+            .group_users
+            .retain(|id, _| input.config.rules.iter().any(|r| &r.group_id == id));
+        for group in input
+            .config
+            .groups
+            .iter()
+            .filter(|g| input.config.rules.iter().any(|r| r.group_id == g.id))
+        {
+            if !proxy.group_users.contains_key(&group.id) {
+                proxy.group_users.insert(group.id.clone(), random_id()?);
+            }
+        }
         let candidate = render(
             &input,
             &base,
@@ -550,7 +593,7 @@ fn execute(
         private_write(&root.join("plan.json"), &plan)?;
         return Ok(
             json!({"plan_id":plan.id,"desired_revision":plan.input.config.revision,"ingress":plan.ingress,"rules":plan.input.config.rules,
-            "capabilities":"conditional_on_runtime_probes","unmatched":"direct","unverified":"blocked","sessions_may_interrupt":true}),
+            "dns":crate::domain::describe(&plan.input.config),"panel_dns_rules":plan.candidate.template["routing"]["rules"].as_array().map(|a|a.iter().filter(|v|v["ruleTag"]=="xui-dns-allow").collect::<Vec<_>>()),"capabilities":"conditional_on_runtime_probes","unmatched":"direct","unverified":"blocked","sessions_may_interrupt":true}),
         );
     }
     if command == "routing.recover" {
@@ -753,7 +796,9 @@ fn verify_routes(
     let mut tags = ingress.to_vec();
     tags.push(PROBE_TAG.to_owned());
     for rule in &config.rules {
-        let network = Network::parse(&rule.destination)?;
+        let Ok(network) = Network::parse(&rule.destination) else {
+            continue;
+        };
         let bits = if network.address.is_ipv4() { 32 } else { 128 };
         let number = match network.address {
             std::net::IpAddr::V4(a) => u32::from(a) as u128,
@@ -801,6 +846,7 @@ fn verify_routes(
             }
         }
     }
+    crate::domain::verify_routes(client, config, matrix, ingress)?;
     for address in ["198.51.100.254", "2001:db8:ffff::1"] {
         if winner(config, address.parse().unwrap()).is_none() {
             for tag in &tags {
@@ -837,7 +883,7 @@ fn observation(id: &str, config: &Config, snapshot: &Snapshot, matrix: &Matrix) 
         .flat_map(|v| v.values())
         .filter(|v| v.as_str() == "verified")
         .count();
-    let total = matrix.len() * 4;
+    let total: usize = matrix.values().map(BTreeMap::len).sum();
     json!({"state":if total>0&&verified==0{"blocked"}else if verified<total{"partial"}else{"applied"},"plan_id":id,
         "desired_revision":config.revision,"running_revision":config.revision,"saved_digest":digest(snapshot).ok(),"capabilities":matrix,
         "mismatch":false,"runtime_verification":if verified>0{"traffic_and_routes"}else{"blocked_routes_only"},

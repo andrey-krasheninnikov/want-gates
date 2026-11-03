@@ -24,11 +24,11 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-def dns_query(name):
+def dns_query(name, kind=1):
     query = struct.pack('!6H', secrets.randbits(16), 0x100, 1, 0, 0, 0)
     for label in name.split('.'):
         query += bytes([len(label)]) + label.encode()
-    return query + b'\0' + struct.pack('!HH', 1, 1)
+    return query + b'\0' + struct.pack('!HH', kind, 1)
 
 
 def resource(events):
@@ -60,33 +60,69 @@ def resource(events):
     for cls, address in [(ThreadingHTTPServer, '0.0.0.0'), (V6, '::')]:
         server = cls((address, 18080), Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
-    for family, address in [(socket.AF_INET, '10.220.0.10'), (socket.AF_INET, '10.221.0.10'), (socket.AF_INET6, 'fd42:220::10'), (socket.AF_INET6, 'fd42:221::10')]:
-        sock = socket.socket(family, socket.SOCK_DGRAM)
-        if family == socket.AF_INET6:
-            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-        sock.bind((address, 15353))
+    def dns_reply(query, peer, transport):
+        if len(query)<17:return None
+        position,labels=12,[]
+        while position<len(query) and query[position]:
+            size=query[position]
+            if size>63 or position+1+size>=len(query):return None
+            labels.append(query[position+1:position+1+size].decode('ascii'))
+            position+=size+1
+        if position+5>len(query):return None
+        name='.'.join(labels).lower()
+        kind=struct.unpack('!H',query[position+1:position+3])[0]
+        question=query[12:position+5]
+        source=ipaddress.ip_address(peer[0])
+        company=1 if source in ipaddress.ip_network('10.211.0.0/24') or source in ipaddress.ip_network('fd42:211::/64') else 2 if source in ipaddress.ip_network('10.212.0.0/24') or source in ipaddress.ip_network('fd42:212::/64') else 0
+        record(transport,peer[0],name)
+        protected=name=='corp.test' or name.endswith('.corp.test')
+        flags=0x8182 if '.failure.' in '.'+name else 0x8183 if '.nxdomain.' in '.'+name else 0x8180
+        answer=b'';count=0
+        family_empty='.nodata.' in '.'+name or protected and ((kind==1 and '.v6.' in '.'+name+'.') or (kind==28 and '.v4.' in '.'+name+'.'))
+        if kind in (1,28) and flags==0x8180 and not family_empty:
+            if protected:
+                address=(f'10.{219+company}.0.10' if company and '.public.' not in '.'+name else '1.1.1.1') if kind==1 else (f'fd42:{219+company}::10' if company else '2606:4700::1111')
+            else:address=f'198.18.{company}.1' if kind==1 else f'fd43::{company+1}'
+            result=socket.inet_pton(socket.AF_INET if kind==1 else socket.AF_INET6,address)
+            owner=b'\xc0\x0c';ttl=300 if protected else 0
+            if '.alias.' in '.'+name+'.':
+                canonical=b'\x09canonical\x03dev\x04corp\x04test\0'
+                answer=owner+struct.pack('!HHIH',5,1,ttl,len(canonical))+canonical
+                owner=canonical;count=1
+            answer+=owner+struct.pack('!HHIH',kind,1,ttl,len(result))+result;count+=1
+        return query[:2]+struct.pack('!5H',flags,1,count,0,0)+question+answer
 
-        def answer(sock=sock):
-            while True:
-                query, peer = sock.recvfrom(4096)
-                if len(query) < 17:
-                    continue
-                position, labels = 12, []
-                while query[position]:
-                    size = query[position]
-                    labels.append(query[position + 1:position + 1 + size].decode())
-                    position += size + 1
-                question = query[12:position + 5]
-                kind = struct.unpack('!H', query[position + 1:position + 3])[0]
-                source = ipaddress.ip_address(peer[0])
-                company = 1 if source in ipaddress.ip_network('10.211.0.0/24') or source in ipaddress.ip_network('fd42:211::/64') else 2 if source in ipaddress.ip_network('10.212.0.0/24') or source in ipaddress.ip_network('fd42:212::/64') else 0
-                result = socket.inet_pton(socket.AF_INET if kind == 1 else socket.AF_INET6, f'198.18.{company}.1' if kind == 1 else f'fd43::{company + 1}')
-                packet = query[:2] + struct.pack('!5H', 0x8180, 1, 1, 0, 0) + question
-                packet += b'\xc0\x0c' + struct.pack('!HHIH', kind, 1, 0, len(result)) + result
-                record('udp', peer[0], '.'.join(labels))
-                sock.sendto(packet, peer)
-
-        threading.Thread(target=answer, daemon=True).start()
+    endpoints=[(socket.AF_INET,a,p) for a,p in [('10.220.0.10',15353),('10.221.0.10',15353),('1.1.1.1',53)]]
+    endpoints += [(socket.AF_INET6,a,p) for a,p in [('fd42:220::10',15353),('fd42:221::10',15353),('2606:4700::1111',53)]]
+    for family,address,port in endpoints:
+        for transport in ['udp','tcp']:
+            sock=socket.socket(family,socket.SOCK_DGRAM if transport=='udp' else socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+            if family==socket.AF_INET6:sock.setsockopt(socket.IPPROTO_IPV6,socket.IPV6_V6ONLY,1)
+            sock.bind((address,port))
+            if transport=='udp':
+                def answer(sock=sock):
+                    while True:
+                        query,peer=sock.recvfrom(65535)
+                        result=dns_reply(query,peer,'udp')
+                        if result:sock.sendto(result,peer)
+            else:
+                sock.listen()
+                def answer(sock=sock):
+                    while True:
+                        connection,peer=sock.accept()
+                        def exchange(connection=connection,peer=peer):
+                            with connection:
+                                connection.settimeout(8)
+                                try:
+                                    while True:
+                                        head=receive(connection,2)
+                                        query=receive(connection,struct.unpack('!H',head)[0])
+                                        result=dns_reply(query,peer,'dns-tcp')
+                                        if result:connection.sendall(struct.pack('!H',len(result))+result)
+                                except (OSError,EOFError):pass
+                        threading.Thread(target=exchange,daemon=True).start()
+            threading.Thread(target=answer,daemon=True).start()
     signal.pause()
 
 
@@ -98,6 +134,34 @@ def udp_client(port, marker):
         packet = sock.recv(4096)
     assert packet[:2] == query[:2] and len(packet) >= len(query) + 16
     print(json.dumps(dict(answer=socket.inet_ntop(socket.AF_INET, packet[-4:]))))
+
+
+def receive(connection,size):
+    result=b''
+    while len(result)<size:
+        part=connection.recv(size-len(result))
+        if not part:raise EOFError('connection closed')
+        result+=part
+    return result
+
+
+def dns_client(mode,name,kind):
+    kind=int(kind);query=dns_query(name,kind)
+    if mode=='udp':
+        with socket.socket(socket.AF_INET,socket.SOCK_DGRAM) as connection:
+            connection.settimeout(6);connection.sendto(query,('127.0.0.1',15360));answer=connection.recv(65535)
+    else:
+        with socket.create_connection(('127.0.0.1',10880),timeout=6) as connection:
+            connection.sendall(bytes([5,1,0]));assert receive(connection,2)==bytes([5,0])
+            connection.sendall(bytes([5,1,0,1,1,1,1,1,0,53]));head=receive(connection,4)
+            assert head[:3]==bytes([5,0,0]);receive(connection,6 if head[3]==1 else 18)
+            connection.sendall(struct.pack('!H',len(query))+query)
+            answer=receive(connection,struct.unpack('!H',receive(connection,2))[0])
+    assert len(answer)>=12 and answer[:2]==query[:2]
+    count=struct.unpack('!H',answer[6:8])[0]
+    address=None
+    if count and kind in (1,28):address=socket.inet_ntop(socket.AF_INET if kind==1 else socket.AF_INET6,answer[-(4 if kind==1 else 16):])
+    print(json.dumps(dict(rcode=answer[3]&15,answer=address)))
 
 
 def fault_proxy(flag):
@@ -214,12 +278,12 @@ def main(binary, panel_root):
         ns('resource', 'ip', 'addr', 'add', '10.220.0.200/32', 'dev', 'lo')
         ns('resource','ip','addr','add','1.1.1.1/32','dev','lo')
         ns('resource','ip','-6','addr','add','2606:4700::1111/128','dev','lo','nodad')
-        ns('gateway','ip','route','add','1.1.1.1/32','via','10.210.0.2')
+        for name,transit in [('gateway',210),('a',211),('b',212)]:ns(name,'ip','route','add','1.1.1.1/32','via',f'10.{transit}.0.2')
         ns('gateway','ip','-6','route','add','2606:4700::1111/128','via','fd42:210::2')
 
         events = work / 'events.jsonl'
         resource_process = spawn('resource', ['python3', __file__, '--resource', events], 'resources')
-        capture = spawn('resource',['tcpdump','-ni','any','-l','tcp port 18080 or udp port 15353'],'resource-packets')
+        capture = spawn('resource',['tcpdump','-ni','any','-l','tcp port 18080 or port 15353 or port 53'],'resource-packets')
         ids = {key: str(uuid.uuid4()) for key in ['ingress', 'a', 'b']}
 
         def start_xray(name, config):
@@ -277,6 +341,9 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
         inbounds=[dict(tag='client-socks',listen='127.0.0.1',port=10880,protocol='socks',settings=dict(auth='noauth',udp=True))]
         for port,address in [(15354,'10.220.0.10'),(15355,'10.221.0.10'),(15356,'fd42:220::10'),(15357,'fd42:221::10')]:
             inbounds.append(dict(tag=f'udp-{port}',listen='127.0.0.1',port=port,protocol='dokodemo-door',settings=dict(address=address,port=15353,network='udp')))
+        for port,address in [(15358,'v4.corp.test'),(15359,'v6.corp.test'),(15361,'v4.dev.corp.test'),(15362,'v6.dev.corp.test')]:
+            inbounds.append(dict(tag=f'domain-{port}',listen='127.0.0.1',port=port,protocol='dokodemo-door',settings=dict(address=address,port=15353,network='udp')))
+        inbounds.append(dict(tag='dns-client',listen='127.0.0.1',port=15360,protocol='dokodemo-door',settings=dict(address='1.1.1.1',port=53,network='udp')))
         client=start_xray('client',dict(log=dict(loglevel='warning'),inbounds=inbounds,outbounds=[outbound('10.215.0.1',19000,ids['ingress'])]))
         with installed.open('xb') as destination:
             installed_created=True
@@ -408,12 +475,140 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
         changed=json.loads(json.dumps(saved_before_fault));changed['log']['loglevel']='error'
         api('xray/update',dict(xraySetting=json.dumps(changed),outboundTestUrl=settings['outboundTestUrl']))
         drift=control('routing','apply',drift_plan,success=False)
-        assert 'drift' in drift.stderr
+        assert 'drift' in drift.stderr,drift.stderr
         current=api('xray/',{})
         if isinstance(current,str):current=json.loads(current)
         assert current['xraySetting']==changed
         api('xray/update',dict(xraySetting=json.dumps(saved_before_fault),outboundTestUrl=settings['outboundTestUrl']))
         print('real panel drift rejection, failed acknowledgement, safe restoration and intervening-edit protection passed')
+        # Configure DNS through the public CLI and test actual VLESS traffic.
+        current=api('xray/',{})
+        if isinstance(current,str):current=json.loads(current)
+        dns_baseline=current['xraySetting']
+        foreign_dns=dict(servers=['1.1.1.1',dict(address='tcp://[::ffff:192.168.1.53]:15353',domains=['full:retained-dns.example.test'],skipFallback=True)],hosts={'retained.example.test':'192.0.2.9'},disableCache=False,disableFallbackIfMatch=True)
+        dns_baseline['dns']=foreign_dns
+        dns_baseline['routing']['domainStrategy']='AsIs'
+        api('xray/update',dict(xraySetting=json.dumps(dns_baseline),outboundTestUrl=settings['outboundTestUrl']))
+
+        def probes(index,name):
+            return dict(tcp_ipv4=dict(url=f'http://10.{index}.0.10:18080/check'),tcp_ipv6=dict(url=f'http://[fd42:{index}::10]:18080/check'),udp_ipv4=dict(server=f'10.{index}.0.10:15353',query_name='probe.example.test',query_type='A'),udp_ipv6=dict(server=f'[fd42:{index}::10]:15353',query_name='probe.example.test',query_type='AAAA'),dns=dict(query_name=name,query_type='A'))
+
+        for name,server,zone,index in [('a','udp://10.220.0.10:15353','corp.test',220),('b','tcp://10.220.0.10:15353','dev.corp.test',221)]:
+            control('connection','update',connections[name],'--dns',server)
+            control('group','update',groups[name],'--probe-file','-',payload=probes(index,'health.'+zone))
+        domain_rules=[control('rule','create','--group',groups[group],'--destination',domain)['data']['id'] for group,domain in [('a','corp.test'),('b','dev.corp.test'),('b','full:corp.test')]]
+        # Domain-only groups must not need synthetic CIDR rules for their probes.
+        for destination in ['10.220.0.0/24','fd42:220::/64']:control('rule','delete',rules[destination])
+        for incompatible in [dict(foreign_dns,disableFallback=True),dict(foreign_dns,servers=[dict(address='1.1.1.1',domains=['full:retained-dns.example.test'],skipFallback=True)]),dict(foreign_dns,servers=['1.1.1.1',dict(address='tcp://[::ffff:192.168.1.53]:5353',skipFallback=True)])]:
+            changed=json.loads(json.dumps(dns_baseline));changed['dns']=incompatible
+            api('xray/update',dict(xraySetting=json.dumps(changed),outboundTestUrl=settings['outboundTestUrl']))
+            before=api('xray/',{})
+            rejected=control('routing','preview',success=False)
+            assert 'DNS' in rejected.stderr
+            assert api('xray/',{})==before,'rejected DNS preview changed panel settings'
+        api('xray/update',dict(xraySetting=json.dumps(dns_baseline),outboundTestUrl=settings['outboundTestUrl']))
+        preview=control('routing','preview')['data'];result=control('routing','apply',preview['plan_id'])['data']
+        assert result['state']=='applied',result
+        assert all(v['dns']=='verified' for v in result['capabilities'].values()),result
+
+        def lookup(name,kind=1,mode='udp',expected=None,rcode=0):
+            response=run('ip','netns','exec',names['client'],'python3',__file__,'--dns-query',mode,name,str(kind))
+            if rcode is None:
+                assert response.returncode!=0 or json.loads(response.stdout)['rcode']!=0 or json.loads(response.stdout)['answer'] is None,(name,'DNS unexpectedly succeeded')
+                return
+            assert response.returncode==0,(name,response.stderr)
+            value=json.loads(response.stdout);assert value['rcode']==rcode,(name,value)
+            if expected is not None:assert value['answer']==expected,(name,value,expected)
+
+        def named_tcp(name,peer,ip=None,positive=True):
+            marker='/'+secrets.token_hex(12)
+            host=ip or name
+            if ':' in host:host='['+host+']'
+            args=['ip','netns','exec',names['client'],'curl','--noproxy','','--socks5-hostname','127.0.0.1:10880','--max-time','6','-fsS']
+            if ip:args+=['-H','Host: '+name]
+            response=run(*args,f'http://{host}:18080{marker}')
+            if positive:assert response.returncode==0 and json.loads(response.stdout)['peer']==peer,(name,response.stderr)
+            else:assert response.returncode!=0,(name,'protected domain escaped')
+            return marker
+
+        for mode in ['udp','tcp']:
+            lookup('v4.corp.test',mode=mode,expected='10.220.0.10')
+            lookup('v6.corp.test',kind=28,mode=mode,expected='fd42:220::10')
+            lookup('v4.dev.corp.test',mode=mode,expected='10.221.0.10')
+            lookup('corp.test',mode=mode,expected='10.221.0.10')
+            lookup('v4.alias.corp.test',mode=mode,expected='10.220.0.10')
+            lookup('unprotected.example.test',mode=mode,expected='198.18.0.1')
+        named_tcp('v4.corp.test','10.211.0.1');named_tcp('v6.corp.test','fd42:211::1')
+        named_tcp('v4.dev.corp.test','10.212.0.1');named_tcp('v6.dev.corp.test','fd42:212::1')
+        for port,answer in [(15358,'198.18.1.1'),(15359,'198.18.1.1'),(15361,'198.18.2.1'),(15362,'198.18.2.1')]:udp(port,answer)
+        # Numeric-only traffic is not assigned a domain from a previous DNS answer.
+        lookup('public.v4.corp.test',expected='1.1.1.1')
+        named_tcp('public.v4.corp.test','10.211.0.1')
+        tcp('1.1.1.1','10.210.0.1')
+        for destination in ['10.220.0.0/24','fd42:220::/64']:rules[destination]=control('rule','create','--group',groups['a'],'--destination',destination)['data']['id']
+        preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+        named_tcp('v4.dev.corp.test','10.212.0.1',ip='10.220.0.10')
+        named_tcp('v6.dev.corp.test','fd42:212::1',ip='fd42:220::10')
+        refused=secrets.token_hex(10)+'.corp.test';lookup(refused,kind=16,rcode=5)
+        refused_plain=secrets.token_hex(10)+'.example.test';lookup(refused_plain,kind=16,mode='tcp',rcode=5)
+        failure=secrets.token_hex(10)+'.failure.corp.test';lookup(failure,rcode=None)
+        recorded=[json.loads(line) for line in events.read_text().splitlines()]
+        assert not any(e['marker'] in [refused,refused_plain] for e in recorded),'unsupported protected DNS escaped'
+        failed_queries=[e for e in recorded if e['marker']==failure]
+        assert failed_queries and all(e['peer'] in ['10.211.0.1','fd42:211::1'] for e in failed_queries),'failed protected DNS reached another resolver'
+        for outcome in ['nxdomain','nodata']:
+            marker=secrets.token_hex(10)+'.'+outcome+'.corp.test';lookup(marker,rcode=None)
+            replies=[json.loads(line) for line in events.read_text().splitlines() if json.loads(line)['marker']==marker]
+            assert replies and all(e['peer'] in ['10.211.0.1','fd42:211::1'] for e in replies),'DNS failure used another resolver'
+        # Missing DNS blocks the more-specific group instead of selecting its parent.
+        control('connection','update',connections['b'],'--dns','-')
+        preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+        lookup('missing.v4.dev.corp.test',rcode=5)
+        named_tcp('v4.dev.corp.test',None,positive=False)
+        lookup('v4.corp.test',expected='10.220.0.10')
+        control('connection','update',connections['b'],'--dns','tcp://[fd42:220::10]:15353')
+        preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+        lookup('v4.dev.corp.test',expected='10.221.0.10')
+        # Reusing a name with a long TTL must use the new connection's DNS context.
+        reserve=control('connection','import','--group',groups['a'],'--name','DNS reserve','--protocol','vless','--file','-','--dns','udp://[fd42:220::10]:15353',payload=json.dumps(outbound('10.214.0.2',19002,ids['b'])))['data']['id']
+        cached='cached.v4.corp.test';lookup(cached,expected='10.220.0.10')
+        control('group','update',groups['a'],'--primary',reserve)
+        recovery_plan=control('routing','preview')['data']['plan_id'];flag.write_text('fail_after_save')
+        control('routing','apply',recovery_plan,success=False)
+        assert control('routing','status')['data']['last_observation']['state']=='restored'
+        lookup(cached,expected='10.220.0.10')
+        preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+        lookup(cached,expected='10.221.0.10');named_tcp('v4.corp.test','10.212.0.1')
+        control('group','update',groups['a'],'--primary',connections['a'])
+        preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
+        lookup(cached,expected='10.220.0.10');control('connection','delete',reserve)
+        # DNS failure cannot fall back to the reachable direct resolver or group B.
+        exits['a'].terminate();exits['a'].wait(timeout=5)
+        down=secrets.token_hex(10)+'.v4.corp.test';lookup(down,rcode=None)
+        lookup('reachable.example.test',expected='198.18.0.1')
+        lookup('v4.dev.corp.test',expected='10.221.0.10')
+        recorded=[json.loads(line) for line in events.read_text().splitlines()]
+        assert not any(e['marker']==down for e in recorded),'protected DNS escaped after primary failure'
+        exits['a']=spawn('a',[xray,'run','-config',work/'a.json'],'xray-a-restarted',cwd=panel_root)
+        deadline=time.monotonic()+5
+        while run('ip','netns','exec',names['gateway'],'python3','-c',"import socket;socket.create_connection(('10.213.0.2',19001),timeout=0.2).close()").returncode:
+            assert exits['a'].poll() is None and time.monotonic()<deadline;time.sleep(0.1)
+        lookup('v4.corp.test',expected='10.220.0.10')
+        current=api('xray/',{})
+        if isinstance(current,str):current=json.loads(current)
+        assert current['xraySetting']['dns']['hosts']==foreign_dns['hosts']
+        assert current['xraySetting']['dns']['disableCache'] is False
+        assert '1.1.1.1' in current['xraySetting']['dns']['servers']
+        assert foreign_dns['servers'][1] in current['xraySetting']['dns']['servers']
+        assert any(rule.get('ruleTag')=='xui-dns-allow' and '192.168.1.53' in rule['ip'] and rule['port']=='15353' for rule in current['xraySetting']['routing']['rules'])
+        checked('systemctl','restart',unit.name)
+        deadline=time.monotonic()+10
+        while run(str(installed),'status','--socket',str(runtime/'control.sock')).returncode:
+            assert time.monotonic()<deadline;time.sleep(0.1)
+        lookup(cached,expected='10.220.0.10')
+        print('domain-only groups, exact/suffix priority, sniffed names, A/AAAA/CNAME, TCP/UDP DNS, resolver isolation, DNS recovery, primary switch, restart and no DNS leaks passed')
+        for rule in domain_rules:control('rule','delete',rule)
+        preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
         nested=control('rule','create','--group',groups['b'],'--destination','10.220.0.128/25')['data']['id']
         preview=control('routing','preview')['data'];control('routing','apply',preview['plan_id'])
         tcp('10.220.0.200','10.212.0.1')
@@ -485,6 +680,7 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
 if __name__=='__main__':
     if len(sys.argv)>1 and sys.argv[1]=='--resource':resource(sys.argv[2])
     elif len(sys.argv)>1 and sys.argv[1]=='--udp':udp_client(sys.argv[2],sys.argv[3])
+    elif len(sys.argv)>1 and sys.argv[1]=='--dns-query':dns_client(*sys.argv[2:])
     elif len(sys.argv)>1 and sys.argv[1]=='--proxy':fault_proxy(sys.argv[2])
     else:
         parser=argparse.ArgumentParser(description=__doc__)

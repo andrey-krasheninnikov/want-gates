@@ -24,8 +24,8 @@ pub fn run(kind: &str, mut args: impl Iterator<Item = OsString>) -> io::Result<(
         ("panel", "preflight") | ("routing", "preview" | "status" | "apply" | "recover") => &[],
         ("rule", "show" | "delete") => &[],
         ("group", "list" | "show" | "delete") => &[],
-        ("connection", "import") => &["--name", "--group", "--protocol", "--file"],
-        ("connection", "update") => &["--name", "--group", "--file"],
+        ("connection", "import") => &["--name", "--group", "--protocol", "--file", "--dns"],
+        ("connection", "update") => &["--name", "--group", "--file", "--dns"],
         ("connection", "list") => &["--group", "--sort"],
         ("connection", "show" | "delete") => &[],
         _ => return Err(invalid("unsupported management action; run wgates --help")),
@@ -80,6 +80,7 @@ pub fn run(kind: &str, mut args: impl Iterator<Item = OsString>) -> io::Result<(
         ("--sort", "sort"),
         ("--destination", "destination"),
         ("--primary", "primary"),
+        ("--dns", "dns"),
     ] {
         if let Some(value) = options.get(option) {
             request[field] = json!(
@@ -91,6 +92,9 @@ pub fn run(kind: &str, mut args: impl Iterator<Item = OsString>) -> io::Result<(
     }
     if kind == "group" && action == "create" && request.get("name").is_none() {
         return Err(invalid("--name is required"));
+    }
+    if request["dns"] == "-" {
+        request["dns"] = Value::Null;
     }
     if request["primary"] == "-" {
         request["primary"] = Value::Null;

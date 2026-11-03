@@ -11,6 +11,8 @@ These terms describe the gateway, its routing policy and operator actions.
 | Primary | The preferred connection within a group. |
 | Fallback | A reserve connection in the same group. Reserves have an explicit order and must satisfy the traffic's required capabilities. |
 | Routing rule | A domain, subdomain, IP address, or CIDR destination assigned to a group. Ambiguous rules of equal specificity are rejected. |
+| Domain rule | A routing rule for a named domain and its subdomains. |
+| Exact domain rule | A routing rule for one domain name without its subdomains. |
 | Unmatched traffic | Traffic that does not match a Want Gates routing rule. Its default path is direct from the gateway. |
 | Protected traffic | Traffic assigned to a group. It must not leave directly or through another group when the intended path is unavailable. |
 | Capability | A connection's verified support for TCP, UDP, IPv4, or IPv6. Missing support must not cause direct fallback. |

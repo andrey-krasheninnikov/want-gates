@@ -1,6 +1,6 @@
-# IP routing through VLESS
+# Domain and IP routing through VLESS
 
-Want Gates manages IP/CIDR routing beside MHSanaei/3x-ui 3.8.5 with Xray
+Want Gates manages domain and IP/CIDR routing beside MHSanaei/3x-ui 3.8.5 with Xray
 26.9.9. It controls the shared policy of enabled local VLESS inbounds. Rules
 select a group; its explicit primary supplies the outgoing VLESS connection.
 No fallback or continuous health monitoring runs in this slice.
@@ -38,9 +38,89 @@ or deleting the connection. Rules also prevent deleting their group.
 `wgates rule list [--group GROUP_ID]`, `show`, `update`, and `delete` use the
 same stable-ID and revision rules as connections. Updates accept `--group` and
 `--destination`. An individual address becomes `/32` or `/128`; CIDRs are
-canonicalized. Duplicate networks are rejected. More-specific prefixes take
+canonicalized. Duplicate networks identify their conflicting groups and are
+rejected. More-specific prefixes take
 priority, including their blocking rules. IPv4-mapped IPv6 notation is rejected;
 use IPv4 notation instead.
+
+## Domain rules and connection DNS
+
+```sh
+wgates rule create --group GROUP_ID --destination corp.example
+wgates rule create --group OTHER_GROUP_ID --destination dev.corp.example
+wgates rule create --group OTHER_GROUP_ID --destination full:corp.example
+wgates connection update CONNECTION_ID --dns udp://10.20.0.53:53
+wgates routing preview
+wgates routing apply PLAN_ID
+```
+
+A bare domain covers itself and subdomains. `full:` matches only that name.
+Names are lowercased, converted to IDNA and stripped of one final dot. Longer
+names take priority; an exact rule outranks a suffix rule at the same name.
+Duplicate canonical rules are rejected with both groups' names and IDs.
+Wildcard, regex and URL destination syntax are not supported.
+
+A matching domain rule takes priority over IP/CIDR, including its blocking
+behavior. Xray can use the domain supplied as a VLESS destination or recovered
+through configured sniffing. Safe `routeOnly` sniffing keeps the original IP
+while choosing the domain's group. Without a name, only IP/CIDR rules apply;
+a previous DNS answer does not assign later numeric traffic to a domain.
+Encrypted or unavailable names cannot be inferred. Supply IP/CIDR rules for
+traffic that carries no usable domain.
+
+Each connection accepts one `udp://IP:port` or `tcp://IP:port` resolver, including
+bracketed IPv6. Set it during import with `--dns URI` or update it later.
+`--dns -` clears it. Hostname endpoints, credentials, DoH/DoT and resolver lists
+are not supported. DNS settings are ordinary connection metadata, separate from
+the secret VLESS profile. A change takes effect only after preview and apply.
+
+For groups with domain rules, configure a `dns` probe in the group probe file:
+
+```json
+{"dns":{"query_name":"health.corp.example","query_type":"A"}}
+```
+
+The query name must select that group. The probe uses its configured resolver
+through the primary and checks an A or AAAA answer. Missing DNS, a missing probe,
+a failed check or an unverified resolver transport blocks the domain path.
+IP rules retain their separate transport observations. A DNS observation proves
+that probe's lookup, not the existence of every name in a zone.
+
+Managed VLESS ingress intercepts ordinary TCP/UDP DNS on destination port 53.
+Protected A/AAAA queries use only the selected connection's resolver; CNAME
+chains are handled while resolving those types. A failed lookup does not try
+a parent group's, another company's or the panel's resolver. Unprotected A/AAAA
+queries retain the panel DNS context, including its implicit system resolver
+when no servers were configured. All other query types return REFUSED on this
+intercepted path, including CNAME-type, SRV, TXT, MX and HTTPS queries.
+
+Managed resolvers disable caching and stale answers. Switching primary selects
+its own resolver and tag, even when two connections use the same resolver IP.
+Named outgoing requests force local resolution in this DNS context and send
+only an eligible IP family to VLESS. Sniffed numeric destinations retain their
+original IP and are checked against the selected group's transport capability.
+DNS outside the VLESS tunnel, arbitrary encrypted DNS, and client caches remain
+outside this policy. Configure clients to send protected lookups through VLESS.
+
+Domain preflight requires `routing.domainStrategy: AsIs` and the default or
+`UseIP` global DNS query strategy. It rejects DNS scripts, system hosts,
+protected-name hosts overrides and unbounded hosts patterns. Panel DNS must
+allow fallback and retain a server without `skipFallback`; an empty server list
+keeps its implicit system resolver. Otherwise Xray could select a company
+resolver for an unmatched name. A VLESS server
+name must not overlap a protected domain, which could create a bootstrap cycle.
+Reconcile incompatible settings in the panel; Want Gates does not silently
+replace them. Existing DNS servers and other DNS fields retain their values.
+The panel's automatic `xui-dns-allow` normalization is included in preview and
+saved readback. Managed DNS tag routes terminate before those direct exceptions.
+With the panel's `geoip:private` block, all private DNS endpoints must share one
+port. The pinned panel emits duplicate `xui-dns-allow` tags for different ports,
+which Xray rejects. Preview rejects that combination before changing the panel.
+
+Preview includes group/connection resolver settings and panel DNS allow-rule
+changes without exposing profiles or probe credentials. Apply and recovery
+verify DNS alongside traffic and saved settings. Inspect the `dns` result inside
+each group's capability observations in `routing status` after a partial result.
 
 Preflight requires the pinned versions, accessible administrative endpoints and
 a running Xray without a reported pending error. Preview rejects routing
@@ -71,7 +151,9 @@ A probe file can contain these four optional entries:
 }
 ```
 
-Probe addresses must select that group under the most-specific desired rule.
+Probe IP addresses do not require destination rules. Private per-group SOCKS
+credentials bind these transport checks to the selected primary; ordinary
+managed routing and DNS interception are verified separately.
 Use unauthenticated resources: probe settings are ordinary group metadata.
 HTTP probes require literal IPs, no credentials, query or fragment, and a final
 status from 200 to 599; the default expected status is 200. They follow no
@@ -98,12 +180,13 @@ These observations are not a continuous health guarantee.
 The managed direct outbound retains Xray's default behavior. Xray 26.9.9 has a
 private-target guard for VLESS-originated freedom traffic. An outgoing VPN
 server must permit the private destinations being tested. Want Gates does not
-reconfigure that remote server or disable its safeguards. Domain routing and
-protected-name DNS policy remain separate work; this slice routes IP targets.
+reconfigure that remote server or disable its safeguards. Protected-name DNS uses the selected connection; Want Gates does not change
+the outgoing server's private-target safeguards.
 
 ## Apply, drift and recovery
 
-Want Gates changes only its prefixed inbounds, outbounds and routing rules.
+Want Gates changes its prefixed inbounds, outbounds, DNS servers and routing
+rules, plus the panel-owned DNS normalization described above.
 The panel's API rule stays first. Managed VLESS policy then takes priority,
 followed by a direct route for unmatched traffic from those inbounds. Other
 inbounds and unrelated saved objects retain their settings and relative order.
@@ -188,6 +271,9 @@ The network fixture uses independent client, gateway, two VPN and resource
 namespaces. It checks actual TCP/UDP over IPv4/IPv6, nested CIDRs, unmatched
 direct, partial capability blocking, a stopped primary, source-address evidence,
 real panel drift/failure/recovery, preservation, private files and restart.
+It also checks domain-only groups, exact and suffix priority, sniffed names,
+A/AAAA/CNAME, intercepted UDP/TCP DNS, missing and failed resolvers, primary DNS
+context changes, DNS recovery and absence of direct or cross-group DNS leaks.
 It uses RAW VLESS with test identities. Other transport/profile combinations
 remain subject to individual connection verification. Each fixture removes its accounts, units, processes, files and namespaces.
 Remove the task-owned container and its disposable data after testing; preserve
