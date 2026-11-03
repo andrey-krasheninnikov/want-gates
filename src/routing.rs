@@ -25,6 +25,8 @@ pub type Matrix = BTreeMap<String, BTreeMap<String, String>>;
 pub struct Input {
     pub config: Config,
     pub profiles: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub native: crate::native::Generations,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,6 +50,8 @@ struct Plan {
     candidate: Snapshot,
     proxy: Proxy,
     ingress: Vec<String>,
+    #[serde(default)]
+    native_intents: BTreeMap<String, String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -69,6 +73,12 @@ struct Working {
     health: BTreeMap<String, crate::health::Observation>,
     #[serde(default)]
     health_error: Option<String>,
+    #[serde(default)]
+    native: crate::native::Generations,
+    #[serde(default)]
+    native_observations: BTreeMap<String, crate::native::Observation>,
+    #[serde(default)]
+    native_retired: crate::native::Generations,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -78,6 +88,8 @@ struct ConnectionObservation {
     observed_at: u64,
     source: String,
     results: BTreeMap<String, String>,
+    #[serde(default)]
+    native_context: Option<String>,
 }
 type ConnectionObservations = BTreeMap<String, ConnectionObservation>;
 fn connection_binding(config: &Config, connection: &store::Connection) -> io::Result<String> {
@@ -96,6 +108,7 @@ fn record_connection(
     connection: &store::Connection,
     results: BTreeMap<String, String>,
     source: &str,
+    native_context: Option<String>,
 ) -> io::Result<()> {
     let mut records: ConnectionObservations =
         optional(&root.join("connections.json"))?.unwrap_or_default();
@@ -110,6 +123,7 @@ fn record_connection(
                 .as_secs(),
             source: source.into(),
             results,
+            native_context,
         },
     );
     private_write(&root.join("connections.json"), &records)
@@ -118,17 +132,30 @@ fn connection_verification(
     config: &Config,
     connection: &store::Connection,
     record: Option<&ConnectionObservation>,
+    native_context: Option<&str>,
 ) -> Value {
-    let stale = record
-        .is_some_and(|r| connection_binding(config, connection).is_ok_and(|b| b != r.binding));
+    let stale = record.is_some_and(|r| {
+        connection_binding(config, connection).is_ok_and(|b| b != r.binding)
+            || connection.protocol == "openvpn"
+                && (native_context.is_none() || r.native_context.as_deref() != native_context)
+    });
     let results = record.map(|r| &r.results);
     json!({"observed_at":record.map(|r|r.observed_at),"source":record.map(|r|&r.source),"stale":stale,
         "capabilities":crate::capability::observations(&connection.allowed_capabilities, results, stale),
         "dns":crate::capability::observation(if stale{"inputs_changed"}else{results.and_then(|r|r.get("dns")).map(String::as_str).unwrap_or("not_checked")})})
 }
-fn connection_reports(root: &Path, config: &Config) -> io::Result<Value> {
+fn connection_reports(
+    root: &Path,
+    config: &Config,
+    native: &crate::native::Client,
+) -> io::Result<Value> {
     let records: ConnectionObservations =
         optional(&root.join("connections.json"))?.unwrap_or_default();
+    let working: Option<Working> = optional(&root.join("working.json"))?;
+    let observations = working
+        .as_ref()
+        .and_then(|w| crate::native::observe(native, &w.native).ok())
+        .unwrap_or_default();
     Ok(Value::Object(
         config
             .connections
@@ -136,7 +163,24 @@ fn connection_reports(root: &Path, config: &Config) -> io::Result<Value> {
             .map(|c| {
                 (
                     c.id.clone(),
-                    connection_verification(config, c, records.get(&c.id)),
+                    connection_verification(
+                        config,
+                        c,
+                        records.get(&c.id),
+                        working
+                            .as_ref()
+                            .and_then(|w| {
+                                crate::native::verification_context(
+                                    &w.native,
+                                    &observations,
+                                    config,
+                                    &c.id,
+                                )
+                                .ok()
+                                .flatten()
+                            })
+                            .as_deref(),
+                    ),
                 )
             })
             .collect(),
@@ -457,6 +501,23 @@ pub(crate) fn allowed(matrix: &Matrix, group: &str, capability: &str) -> bool {
         .and_then(|c| c.get(capability))
         .is_some_and(|s| s == "verified" || s == "candidate")
 }
+pub(crate) fn outbound(input: &Input, id: &str, diagnostic: bool) -> Value {
+    if input
+        .config
+        .connections
+        .iter()
+        .any(|c| c.id == id && c.protocol == "openvpn")
+    {
+        input
+            .native
+            .get(id)
+            .map(|p| p.outbound(diagnostic))
+            .unwrap_or_else(|| json!({"protocol":"blackhole","settings":{}}))
+    } else {
+        input.profiles[id].clone()
+    }
+}
+
 fn render(
     input: &Input,
     base: &Snapshot,
@@ -480,10 +541,20 @@ fn render(
         json!({"tag":"wgates-direct","protocol":"freedom","settings":{}}),
         json!({"tag":"wgates-block","protocol":"blackhole","settings":{}}),
     ]);
-    for (id, profile) in &input.profiles {
-        let mut profile = profile.clone();
+    for id in input.profiles.keys() {
+        let mut profile = outbound(input, id, false);
         profile["tag"] = json!(format!("wgates-out-{id}"));
         outbounds.push(profile);
+        if let Some(connection) = input
+            .config
+            .connections
+            .iter()
+            .find(|c| c.id == *id && c.protocol == "openvpn")
+        {
+            let mut diagnostic = outbound(input, id, true);
+            diagnostic["tag"] = json!(crate::native::diagnostic_tag(connection));
+            outbounds.push(diagnostic);
+        }
     }
     if template.get("inbounds").is_none() {
         template["inbounds"] = json!([]);
@@ -527,7 +598,7 @@ fn render(
                     &connection.allowed_capabilities,
                     &format!("{protocol}_ipv{family}"),
                 );
-                rules.push(json!({"type":"field","ruleTag":format!("wgates-check-{}-{protocol}-ipv{family}",connection.id),"inboundTag":[PROBE_TAG],"user":[user],"network":protocol,"ip":[network],"outboundTag":if permitted{format!("wgates-out-{}",connection.id)}else{"wgates-block".into()}}));
+                rules.push(json!({"type":"field","ruleTag":format!("wgates-check-{}-{protocol}-ipv{family}",connection.id),"inboundTag":[PROBE_TAG],"user":[user],"network":protocol,"ip":[network],"outboundTag":if permitted{crate::native::diagnostic_tag(connection)}else{"wgates-block".into()}}));
             }
         }
         rules.push(json!({"type":"field","ruleTag":format!("wgates-check-{}-block",connection.id),"inboundTag":[PROBE_TAG],"user":[user],"outboundTag":"wgates-block"}));
@@ -597,9 +668,10 @@ pub struct Service {
     health_due: BTreeMap<String, std::time::Instant>,
     active_plan: Option<String>,
     reload_health: bool,
+    native: crate::native::Client,
 }
 impl Service {
-    pub fn new(state: &Path, stopping: Arc<AtomicBool>) -> io::Result<Self> {
+    pub fn new(state: &Path, stopping: Arc<AtomicBool>, native_socket: &Path) -> io::Result<Self> {
         let root = state.join("routing");
         match std::fs::symlink_metadata(&root) {
             Ok(_) => secure_directory(&root, 0o700, 0o077)?,
@@ -633,6 +705,7 @@ impl Service {
             health_due,
             active_plan,
             reload_health: true,
+            native: crate::native::Client::new(native_socket),
         })
     }
     pub fn busy(&self) -> bool {
@@ -661,6 +734,8 @@ impl Service {
             "panel.preflight" | "routing.preview" | "routing.status" => &[],
             "routing.apply" | "routing.recover" => &["plan_id"],
             "connection.verify" => &["id"],
+            "connection.login" => &["id", "credentials", "remember"],
+            "connection.logout" | "connection.restart" | "connection.forget-auth" => &["id"],
             _ => return Err(invalid("unsupported routing command")),
         };
         if request.as_object().is_none_or(|m| {
@@ -669,11 +744,51 @@ impl Service {
         }) {
             return Err(invalid("unexpected local API request field"));
         }
+        if matches!(
+            command,
+            "connection.login"
+                | "connection.logout"
+                | "connection.restart"
+                | "connection.forget-auth"
+        ) {
+            let working = optional::<Working>(&self.root.join("working.json"))?;
+            let connection = store
+                .config()
+                .connections
+                .iter()
+                .find(|c| request["id"] == c.id)
+                .ok_or_else(|| invalid("connection not found"))?;
+            if connection.protocol != "openvpn" {
+                return Err(invalid(
+                    "native authentication is available only for OpenVPN",
+                ));
+            }
+            if working.as_ref().is_none_or(|w| {
+                !w.config
+                    .connections
+                    .iter()
+                    .any(|c| c.id == connection.id && c.profile_ref == connection.profile_ref)
+            }) {
+                return Err(invalid(
+                    "native authentication requires a current routing preview and apply",
+                ));
+            }
+        }
         if command == "routing.status" {
             let saved: Value = optional(&self.root.join("status.json"))?
                 .unwrap_or(json!({"state":"unapplied","running_revision":null}));
+            let working: Option<Working> = optional(&self.root.join("working.json"))?;
+            let retired: Vec<_> = working
+                .as_ref()
+                .map(|w| {
+                    w.native_retired
+                        .values()
+                        .map(|p| json!({"connection_id":p.id,"generation":p.generation}))
+                        .collect()
+                })
+                .unwrap_or_default();
             return Ok(Some(
-                json!({"data":{"desired_revision":store.config().revision,"busy":self.busy(),"recovery_required":optional::<Journal>(&self.root.join("journal.json"))?.as_ref().is_some_and(pending) && !self.busy(),"last_observation":saved,"health_schedule":self.health_due.iter().map(|(group,due)|json!({"group_id":group,"due_in_seconds":due.saturating_duration_since(std::time::Instant::now()).as_secs(),"overdue_seconds":std::time::Instant::now().saturating_duration_since(*due).as_secs()})).collect::<Vec<_>>(),"health":optional::<Working>(&self.root.join("working.json"))?.map(|w|w.health_report()),"connection_verifications":connection_reports(&self.root,store.config()).unwrap_or_else(|_|json!({"state":"unknown","reason":"observation_state_unreadable"}))}}),
+                json!({"data":{"native_retained":retired,"desired_revision":store.config().revision,"busy":self.busy(),"recovery_required":optional::<Journal>(&self.root.join("journal.json"))?.as_ref().is_some_and(pending) && !self.busy(),"last_observation":saved,"health_schedule":self.health_due.iter().map(|(group,due)|json!({"group_id":group,"due_in_seconds":due.saturating_duration_since(std::time::Instant::now()).as_secs(),"overdue_seconds":std::time::Instant::now().saturating_duration_since(*due).as_secs()})).collect::<Vec<_>>(),"health":optional::<Working>(&self.root.join("working.json"))?.map(|w|w.health_report()),"connection_verifications":connection_reports(&self.root,store.config(), &self.native).unwrap_or_else(|_|json!({"state":"unknown","reason":"observation_state_unreadable"}))}}),
             ));
         }
         if self.busy() {
@@ -699,6 +814,7 @@ impl Service {
             return Ok(Some(json!({"data":{"configured":true}})));
         }
         let input = store.routing_input()?;
+        let native = self.native.clone();
         let mut stream = stream.try_clone()?;
         let (root, command, request, busy, stopping) = (
             self.root.clone(),
@@ -718,7 +834,7 @@ impl Service {
                     }
                 }
                 let _guard = Guard(busy);
-                let result = execute(&root, &command, &request, input, stopping);
+                let result = execute(&root, &command, &request, input, stopping, &native);
                 let response = match result {
                     Ok(data) => json!({"api_version":API_VERSION,"data":data}),
                     Err(e) => json!({"api_version":API_VERSION,"error":e.to_string()}),
@@ -741,9 +857,29 @@ fn execute(
     root: &Path,
     command: &str,
     request: &Value,
-    input: Input,
+    mut input: Input,
     stopping: Arc<AtomicBool>,
+    native: &crate::native::Client,
 ) -> io::Result<Value> {
+    if matches!(
+        command,
+        "connection.login" | "connection.logout" | "connection.restart" | "connection.forget-auth"
+    ) {
+        let working: Working = read(&root.join("working.json"))?;
+        let prepared = working
+            .native
+            .get(store::text(&request["id"])?)
+            .ok_or_else(|| {
+                invalid("native authentication requires a current routing preview and apply")
+            })?;
+        let mut operation = json!({"command":command.strip_prefix("connection.").unwrap(),"generation":prepared.generation});
+        for field in ["credentials", "remember"] {
+            if let Some(value) = request.get(field) {
+                operation[field] = value.clone();
+            }
+        }
+        return native.call(operation);
+    }
     let settings: Settings = read(&root.join("panel.json"))?;
     let panel_digest = digest(&settings)?;
     let client = Client::new(settings, stopping)?;
@@ -772,7 +908,7 @@ fn execute(
             .filter(|w| {
                 w.prepared_digest
                     .as_ref()
-                    .is_some_and(|d| digest(&input).is_ok_and(|v| &v == d))
+                    .is_some_and(|d| crate::native::desired_digest(&input).is_ok_and(|v| &v == d))
                     && w.panel_digest.as_ref() == Some(&panel_digest)
                     && w.proxy.connection_users.contains_key(&connection.id)
             })
@@ -785,14 +921,34 @@ fn execute(
                 "observed panel drift; preview and apply before verification",
             ));
         }
-        let results = crate::probe::connection(&client, &input.config, connection, &working.proxy)?;
+        let native_observations = crate::native::observe(native, &working.native)?;
+        let effective = crate::native::effective(&input.config, &native_observations);
+        let effective_connection = effective
+            .connections
+            .iter()
+            .find(|c| c.id == connection.id)
+            .unwrap();
+        let results =
+            crate::probe::connection(&client, &effective, effective_connection, &working.proxy)?;
         if client.read()? != working.snapshot {
             return Err(invalid(
                 "observed panel drift during verification; observations were not saved",
             ));
         }
-        record_connection(root, &input.config, connection, results, "connection")?;
-        let reports = connection_reports(root, &input.config)?;
+        record_connection(
+            root,
+            &input.config,
+            connection,
+            results,
+            "connection",
+            crate::native::verification_context(
+                &working.native,
+                &native_observations,
+                &input.config,
+                &connection.id,
+            )?,
+        )?;
+        let reports = connection_reports(root, &input.config, native)?;
         return Ok(
             json!({"connection_id":connection.id,"verification":reports[&connection.id],"policy_effect":"observations_only"}),
         );
@@ -849,15 +1005,47 @@ fn execute(
             &ingress,
             &initial_matrix(&input.config),
         )?;
+        let previous: Option<Working> = optional(&root.join("working.json"))?;
+        let mut native_intents = BTreeMap::new();
+        if input
+            .config
+            .connections
+            .iter()
+            .any(|c| c.protocol == "openvpn")
+        {
+            native.call(json!({"command":"preflight"}))?;
+        }
+        for connection in input
+            .config
+            .connections
+            .iter()
+            .filter(|c| c.protocol == "openvpn")
+        {
+            let generation = previous
+                .as_ref()
+                .and_then(|w| {
+                    w.config
+                        .connections
+                        .iter()
+                        .find(|old| {
+                            old.id == connection.id && old.profile_ref == connection.profile_ref
+                        })
+                        .and_then(|_| w.native.get(&connection.id))
+                })
+                .map(|p| p.generation.clone())
+                .unwrap_or(random_id()?);
+            native_intents.insert(connection.id.clone(), generation);
+        }
         let plan = Plan {
             id: random_id()?,
-            desired_digest: digest(&input)?,
+            desired_digest: crate::native::desired_digest(&input)?,
             panel_digest,
             input,
             base,
             candidate,
             proxy,
             ingress,
+            native_intents,
         };
         private_write(&root.join("plan.json"), &plan)?;
         return Ok(
@@ -877,13 +1065,15 @@ fn execute(
                 "completed apply cannot be recovered; create a new preview",
             ));
         }
-        return recover(root, &client, &mut journal);
+        return recover(root, &client, &mut journal, native);
     }
     let plan: Plan = read(&root.join("plan.json"))?;
     if request["plan_id"].as_str() != Some(&plan.id) {
         return Err(invalid("unknown or superseded plan; preview again"));
     }
-    if digest(&input)? != plan.desired_digest || panel_digest != plan.panel_digest {
+    if crate::native::desired_digest(&input)? != plan.desired_digest
+        || panel_digest != plan.panel_digest
+    {
         return Err(invalid(
             "desired state or panel credentials changed; preview again",
         ));
@@ -938,15 +1128,63 @@ fn execute(
         &json!({"state":"applying","plan_id":journal.plan.id,"desired_revision":input.config.revision,"running_revision":journal.previous.as_ref().map(|w|w.config.revision)}),
     )?;
     let result = (|| -> io::Result<Value> {
+        for connection in input
+            .config
+            .connections
+            .iter()
+            .filter(|c| c.protocol == "openvpn")
+        {
+            let generation = journal
+                .plan
+                .native_intents
+                .get(&connection.id)
+                .ok_or_else(|| invalid("plan predates native preparation; preview again"))?;
+            let value = native.call(json!({"command":"prepare","id":connection.id,"generation":generation,"profile":input.profiles[&connection.id]}))?;
+            let prepared: crate::native::Prepared =
+                serde_json::from_value(value).map_err(|_| invalid("invalid native preparation"))?;
+            if prepared.id != connection.id
+                || prepared.generation != *generation
+                || prepared.profile_digest != digest(&input.profiles[&connection.id])?
+            {
+                return Err(invalid(
+                    "native preparation does not match requested profile",
+                ));
+            }
+            input.native.insert(connection.id.clone(), prepared);
+            journal.plan.input.native = input.native.clone();
+            private_write(&root.join("journal.json"), &journal)?;
+        }
+        let mut native_observations = crate::native::observe(native, &input.native)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while native_observations
+            .values()
+            .any(|o| o.authentication == "connecting")
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            native_observations = crate::native::observe(native, &input.native)?;
+        }
+        let effective_input = Input {
+            config: crate::native::effective(&input.config, &native_observations),
+            ..input.clone()
+        };
+        journal.plan.candidate = render(
+            &effective_input,
+            &journal.plan.base,
+            &journal.plan.proxy,
+            &journal.plan.ingress,
+            &initial_matrix(&effective_input.config),
+        )?;
+        private_write(&root.join("journal.json"), &journal)?;
         let candidate = journal.plan.candidate.clone();
         submit(root, &client, &mut journal, &candidate)?;
         wait_routes(
             &client,
-            &input.config,
-            &initial_matrix(&input.config),
+            &effective_input.config,
+            &initial_matrix(&effective_input.config),
             &journal.plan.ingress,
         )?;
-        let mut legacy = input.config.clone();
+        let mut legacy = effective_input.config.clone();
         legacy.rules.retain(|r| {
             !input
                 .config
@@ -954,10 +1192,51 @@ fn execute(
                 .iter()
                 .any(|g| g.id == r.group_id && g.healthcheck.is_some())
         });
+        legacy.rules.retain(|rule| {
+            effective_input
+                .config
+                .groups
+                .iter()
+                .find(|g| g.id == rule.group_id)
+                .and_then(|g| crate::domain::connection(&effective_input.config, g))
+                .is_none_or(|c| c.protocol != "openvpn")
+        });
         let mut matrix = crate::probe::check(&client, &legacy, &journal.plan.proxy, None)?;
+        for group in effective_input.config.groups.iter().filter(|g| {
+            g.healthcheck.is_none()
+                && effective_input
+                    .config
+                    .rules
+                    .iter()
+                    .any(|r| r.group_id == g.id)
+        }) {
+            if let Some(connection) = crate::domain::connection(&effective_input.config, group)
+                && connection.protocol == "openvpn"
+            {
+                let mut results = if let Some(reason) =
+                    crate::native::readiness(connection, &native_observations)
+                {
+                    crate::native::blocked(connection, reason, false)
+                } else {
+                    crate::probe::connection(
+                        &client,
+                        &effective_input.config,
+                        connection,
+                        &journal.plan.proxy,
+                    )?
+                };
+                if !crate::domain::rules(&effective_input.config)
+                    .iter()
+                    .any(|(_, r)| r.group_id == group.id)
+                {
+                    results.remove("dns");
+                }
+                matrix.insert(group.id.clone(), results);
+            }
+        }
         let mut health = BTreeMap::new();
         let mut verifications = BTreeMap::new();
-        for connection in &input.config.connections {
+        for connection in &effective_input.config.connections {
             let group = input
                 .config
                 .groups
@@ -965,17 +1244,43 @@ fn execute(
                 .find(|g| g.id == connection.group_id)
                 .unwrap();
             if let Some(policy) = &group.healthcheck {
-                let admitted = crate::probe::connection(
-                    &client,
-                    &input.config,
-                    connection,
-                    &journal.plan.proxy,
-                )?;
-                let results =
-                    crate::probe::health(&client, &input.config, connection, &journal.plan.proxy)?;
+                let (admitted, results) = if let Some(reason) =
+                    crate::native::readiness(connection, &native_observations)
+                {
+                    (
+                        crate::native::blocked(connection, reason, false),
+                        crate::native::blocked(connection, reason, true),
+                    )
+                } else {
+                    (
+                        crate::probe::connection(
+                            &client,
+                            &effective_input.config,
+                            connection,
+                            &journal.plan.proxy,
+                        )?,
+                        crate::probe::health(
+                            &client,
+                            &effective_input.config,
+                            connection,
+                            &journal.plan.proxy,
+                        )?,
+                    )
+                };
                 verifications.insert(connection.id.clone(), admitted.clone());
                 let mut record = crate::health::Observation {
                     admitted: admitted.clone(),
+                    was_down: connection.protocol == "openvpn"
+                        && journal.previous.as_ref().is_some_and(|previous| {
+                            previous.native.contains_key(&connection.id)
+                                && previous
+                                    .native_observations
+                                    .get(&connection.id)
+                                    .zip(native_observations.get(&connection.id))
+                                    .is_none_or(|(old, current)| {
+                                        old.session != current.session || old.dns != current.dns
+                                    })
+                        }),
                     ..Default::default()
                 };
                 if let Some(previous) = &journal.previous
@@ -987,8 +1292,18 @@ fn execute(
                     && let Some(old_group) =
                         previous.config.groups.iter().find(|g| g.id == group.id)
                     && connection_binding(&previous.config, old_connection)?
-                        == connection_binding(&input.config, connection)?
+                        == connection_binding(&effective_input.config, connection)?
                     && digest(&old_group.healthcheck)? == digest(&group.healthcheck)?
+                    && (connection.protocol != "openvpn"
+                        || previous
+                            .native_observations
+                            .get(&connection.id)
+                            .zip(native_observations.get(&connection.id))
+                            .is_some_and(|(old, current)| {
+                                old.session == current.session
+                                    && old.dns == current.dns
+                                    && current.authentication == "authenticated"
+                            }))
                     && let Some(old) = previous.health.get(&connection.id)
                 {
                     record = old.clone();
@@ -1006,12 +1321,13 @@ fn execute(
             }
         }
         let selected = select(&input.config, &health);
-        let effective = effective_config(&input.config, &selected);
+        let effective = effective_config(&effective_input.config, &selected);
         select_matrix(&input.config, &selected, &health, &mut matrix);
         let final_snapshot = render(
             &Input {
                 config: effective.clone(),
                 profiles: input.profiles.clone(),
+                native: input.native.clone(),
             },
             &journal.plan.base,
             &journal.plan.proxy,
@@ -1021,6 +1337,13 @@ fn execute(
         if final_snapshot != candidate {
             submit(root, &client, &mut journal, &final_snapshot)?;
         }
+        crate::native::admit(
+            native,
+            &input.native,
+            &native_observations,
+            &effective,
+            &matrix,
+        )?;
         verify(
             &client,
             &final_snapshot,
@@ -1030,20 +1353,39 @@ fn execute(
             &journal.plan.ingress,
             Some(&health),
         )?;
-        let working = Working {
+        let mut working = Working {
             plan_id: journal.plan.id.clone(),
             config: input.config.clone(),
             snapshot: final_snapshot.clone(),
             proxy: journal.plan.proxy.clone(),
             matrix,
-            prepared_digest: Some(digest(&input)?),
+            prepared_digest: Some(crate::native::desired_digest(&input)?),
             panel_digest: Some(panel_digest.clone()),
             profiles: input.profiles.clone(),
             selected,
             health,
             health_error: None,
+            native: input.native.clone(),
+            native_observations,
+            native_retired: journal
+                .previous
+                .as_ref()
+                .map(|w| {
+                    w.native_retired
+                        .iter()
+                        .chain(w.native.iter())
+                        .filter(|(_, p)| {
+                            !input
+                                .native
+                                .values()
+                                .any(|current| current.generation == p.generation)
+                        })
+                        .map(|(_, p)| (p.generation.clone(), p.clone()))
+                        .collect()
+                })
+                .unwrap_or_default(),
         };
-        let report = observation(
+        let mut report = observation(
             &working.plan_id,
             &working.config,
             &working.snapshot,
@@ -1051,7 +1393,19 @@ fn execute(
         );
         for connection in &input.config.connections {
             if let Some(results) = verifications.get(&connection.id) {
-                record_connection(root, &input.config, connection, results.clone(), "apply")?;
+                record_connection(
+                    root,
+                    &input.config,
+                    connection,
+                    results.clone(),
+                    "apply",
+                    crate::native::verification_context(
+                        &working.native,
+                        &working.native_observations,
+                        &input.config,
+                        &connection.id,
+                    )?,
+                )?;
             }
         }
         let effective = working.effective_config();
@@ -1059,18 +1413,44 @@ fn execute(
             if let Some(connection) = crate::domain::connection(&input.config, group)
                 && let Some(results) = working.matrix.get(&group.id)
             {
-                record_connection(root, &input.config, connection, results.clone(), "apply")?;
+                record_connection(
+                    root,
+                    &input.config,
+                    connection,
+                    results.clone(),
+                    "apply",
+                    crate::native::verification_context(
+                        &working.native,
+                        &working.native_observations,
+                        &input.config,
+                        &connection.id,
+                    )?,
+                )?;
             }
         }
         private_write(&root.join("working.json"), &working)?;
         private_write(&root.join("status.json"), &report)?;
         journal.phase = "complete".to_owned();
         private_write(&root.join("journal.json"), &journal)?;
+        let cleanup = cleanup_retired(root, &client, native, &mut working);
+        report["native_cleanup_required"] = json!(!working.native_retired.is_empty());
+        if cleanup.is_err() {
+            report["native_cleanup_reason"] = json!(
+                "owned native resources retained; inspect status and apply again after reconciliation"
+            );
+        }
+        private_write(&root.join("status.json"), &report)?;
         Ok(report)
     })();
     match result {
         Ok(value) => Ok(value),
         Err(error) => {
+            if journal.submitted.is_empty() && !journal.plan.native_intents.is_empty() {
+                recovery_required(root, &mut journal)?;
+                return Err(io::Error::other(format!(
+                    "native preparation failed: {error}; inspect routing status and recover the recorded plan"
+                )));
+            }
             if journal.submitted.is_empty() {
                 journal.phase = "rejected".to_owned();
                 private_write(&root.join("journal.json"), &journal)?;
@@ -1086,7 +1466,7 @@ fn execute(
                     "apply interrupted; inspect routing status and recover the recorded plan",
                 ));
             }
-            match recover(root, &client, &mut journal) {
+            match recover(root, &client, &mut journal, native) {
                 Ok(report) => Err(io::Error::other(format!(
                     "apply failed: {error}; recovery state: {}",
                     report["state"].as_str().unwrap_or("unknown")
@@ -1282,10 +1662,33 @@ fn recovery_required(root: &Path, journal: &mut Journal) -> io::Result<()> {
     private_write(
         &root.join("status.json"),
         &json!({"state":"recovery_required","plan_id":journal.plan.id,
-        "desired_revision":journal.plan.input.config.revision,"running_revision":null,"mismatch":true,"saved":"unknown","running":"unknown"}),
+        "desired_revision":journal.plan.input.config.revision,"running_revision":null,"mismatch":true,"saved":"unknown","running":"unknown","native_preparation":journal.plan.native_intents}),
     )
 }
-fn recover(root: &Path, client: &Client, journal: &mut Journal) -> io::Result<Value> {
+fn cleanup_retired(
+    root: &Path,
+    client: &Client,
+    native: &crate::native::Client,
+    working: &mut Working,
+) -> io::Result<()> {
+    let generations: Vec<_> = working.native_retired.keys().cloned().collect();
+    for generation in generations {
+        if client.read()? != working.snapshot {
+            return Err(invalid("observed panel drift; native cleanup stopped"));
+        }
+        crate::native::release(native, &working.native_retired[&generation])?;
+        working.native_retired.remove(&generation);
+        private_write(&root.join("working.json"), working)?;
+    }
+    Ok(())
+}
+
+fn recover(
+    root: &Path,
+    client: &Client,
+    journal: &mut Journal,
+    native: &crate::native::Client,
+) -> io::Result<Value> {
     recovery_required(root, journal)?;
     let actual = client.read()?;
     if actual != journal.plan.base {
@@ -1309,7 +1712,47 @@ fn recover(root: &Path, client: &Client, journal: &mut Journal) -> io::Result<Va
                 .unwrap_or_else(|| io::Error::other("saved restoration could not be confirmed")));
         }
     }
+    if !journal.plan.native_intents.is_empty() {
+        let inventory = native.call(json!({"command":"list"}))?;
+        let inventory = inventory
+            .as_array()
+            .ok_or_else(|| invalid("invalid native inventory"))?;
+        for (id, generation) in &journal.plan.native_intents {
+            if journal
+                .previous
+                .as_ref()
+                .is_some_and(|w| w.native.values().any(|p| &p.generation == generation))
+            {
+                continue;
+            }
+            if let Some(value) = inventory
+                .iter()
+                .find(|v| v["prepared"]["generation"] == *generation)
+            {
+                let prepared: crate::native::Prepared =
+                    serde_json::from_value(value["prepared"].clone())
+                        .map_err(|_| invalid("invalid native preparation"))?;
+                if &prepared.id != id
+                    || prepared.profile_digest != digest(&journal.plan.input.profiles[id])?
+                {
+                    return Err(invalid(
+                        "native recovery resource does not match the recorded profile",
+                    ));
+                }
+                if client.read()? != journal.plan.base {
+                    return Err(invalid(
+                        "panel changed before native cleanup; no resource release attempted",
+                    ));
+                }
+                crate::native::release(native, &prepared)?;
+            }
+        }
+    }
     let runtime_error = if let Some(previous) = &journal.previous {
+        (|| -> io::Result<()> {
+        let observations = crate::native::observe(native, &previous.native)?;
+        if observations.iter().any(|(id,state)|previous.native_observations.get(id).is_none_or(|old|old.session!=state.session || old.dns!=state.dns)) { return Err(invalid("previous native session changed; resource verification requires a fresh preview and apply")); }
+        crate::native::admit(native, &previous.native, &observations, &previous.effective_config(), &previous.matrix)?;
         verify(
             client,
             &journal.plan.base,
@@ -1319,6 +1762,7 @@ fn recover(root: &Path, client: &Client, journal: &mut Journal) -> io::Result<Va
             &journal.plan.ingress,
             None,
         )
+        })()
         .err()
         .map(|error| error.to_string())
     } else {
@@ -1365,6 +1809,11 @@ impl Service {
                 .is_some_and(pending);
             Ok((pending, optional(&self.root.join("working.json"))?))
         })();
+        let native_live = inspected
+            .as_ref()
+            .ok()
+            .and_then(|(_, w)| w.as_ref())
+            .map(|w| crate::native::observe(&self.native, &w.native));
         let records: io::Result<Option<ConnectionObservations>> =
             optional(&self.root.join("connections.json"));
         let describe = |value: &mut Value| {
@@ -1430,7 +1879,31 @@ impl Service {
                             let record = records.as_ref().and_then(|r| r.get(&connection.id));
                             object.insert(
                                 "verification".into(),
-                                connection_verification(config, connection, record),
+                                connection_verification(
+                                    config,
+                                    connection,
+                                    record,
+                                    inspected
+                                        .as_ref()
+                                        .ok()
+                                        .and_then(|(_, w)| w.as_ref())
+                                        .and_then(|w| {
+                                            native_live
+                                                .as_ref()
+                                                .and_then(|r| r.as_ref().ok())
+                                                .and_then(|live| {
+                                                    crate::native::verification_context(
+                                                        &w.native,
+                                                        live,
+                                                        config,
+                                                        &connection.id,
+                                                    )
+                                                    .ok()
+                                                    .flatten()
+                                                })
+                                        })
+                                        .as_deref(),
+                                ),
                             );
                             if let Some(record) = record {
                                 let authentication = if connection_binding(config, connection)
@@ -1461,6 +1934,63 @@ impl Service {
                             object.insert("authentication".into(), json!("unknown"));
                         }
                     }
+                }
+            }
+            if let Some(object) = value.as_object_mut()
+                && object.get("protocol").is_some_and(|v| v == "openvpn")
+            {
+                let id = object
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
+                match &native_live {
+                    Some(Ok(observations)) => {
+                        if let Some(observation) = observations.get(&id) {
+                            object
+                                .insert("authentication".into(), json!(observation.authentication));
+                            object.insert("native_runtime".into(), json!(observation));
+                            let current = inspected
+                                .as_ref()
+                                .ok()
+                                .and_then(|(_, w)| w.as_ref())
+                                .and_then(|w| w.native_observations.get(&id))
+                                .is_some_and(|old| {
+                                    old.session == observation.session && old.dns == observation.dns
+                                });
+                            if !observation.admitted
+                                || !current
+                                || observation.authentication != "authenticated"
+                            {
+                                object.insert("capabilities".into(), json!([]));
+                                object.insert("runtime".into(), json!("unavailable"));
+                                object.insert(
+                                    "runtime_reason".into(),
+                                    json!("native_session_requires_verification"),
+                                );
+                            }
+                            object.insert(
+                                "effective_dns".into(),
+                                json!(
+                                    config
+                                        .connections
+                                        .iter()
+                                        .find(|c| c.id == id)
+                                        .and_then(|c| c.dns.clone())
+                                        .or_else(|| observation.dns.clone())
+                                ),
+                            );
+                        }
+                    }
+                    Some(Err(_)) => {
+                        object.insert("authentication".into(), json!("unknown"));
+                        object.insert(
+                            "native_runtime".into(),
+                            json!({"reason":"native_runtime_unavailable"}),
+                        );
+                        object.insert("capabilities".into(), json!([]));
+                    }
+                    None => {}
                 }
             }
         };
@@ -1533,7 +2063,10 @@ fn select_matrix(
 }
 impl Working {
     fn effective_config(&self) -> Config {
-        effective_config(&self.config, &self.selected)
+        effective_config(
+            &crate::native::effective(&self.config, &self.native_observations),
+            &self.selected,
+        )
     }
     fn health_report(&self) -> Value {
         json!({"plan_id":self.plan_id,"running_revision":self.config.revision,"error":self.health_error,
@@ -1609,11 +2142,12 @@ impl Service {
         let root = self.root.clone();
         let busy = self.busy.clone();
         let stopping = self.stopping.clone();
+        let native = self.native.clone();
         busy.store(true, Ordering::Relaxed);
         match thread::Builder::new()
             .name("healthcheck".into())
             .spawn(move || {
-                let result = health_cycle(&root, working, due, stopping.clone());
+                let result = health_cycle(&root, working, due, stopping.clone(), &native);
                 if let Err(error) = result {
                     eprintln!("wgates: healthcheck stopped: {error}");
                     if !stopping.load(Ordering::Relaxed)
@@ -1636,6 +2170,7 @@ fn health_cycle(
     mut working: Working,
     due: Vec<String>,
     stopping: Arc<AtomicBool>,
+    native: &crate::native::Client,
 ) -> io::Result<()> {
     let settings: Settings = read(&root.join("panel.json"))?;
     if working.panel_digest.as_ref() != Some(&digest(&settings)?) {
@@ -1648,7 +2183,55 @@ fn health_cycle(
     if client.read()? != working.snapshot {
         return Err(invalid("observed panel drift; automatic writes stopped"));
     }
-    for connection in &working.config.connections {
+    let observations = crate::native::observe(native, &working.native)?;
+    let native_changed = observations.iter().any(|(id, state)| {
+        working
+            .native_observations
+            .get(id)
+            .is_none_or(|old| old.session != state.session || old.dns != state.dns)
+    });
+    let mut matrix = working.matrix.clone();
+    for (id, state) in &observations {
+        let changed = working
+            .native_observations
+            .get(id)
+            .is_none_or(|old| old.session != state.session || old.dns != state.dns);
+        if (changed || state.authentication != "authenticated")
+            && let Some(connection) = working.config.connections.iter().find(|c| c.id == *id)
+            && let Some(group) = working.config.groups.iter().find(|g| {
+                g.id == connection.group_id
+                    && g.healthcheck.is_none()
+                    && g.primary.as_ref() == Some(id)
+            })
+            && matrix.contains_key(&group.id)
+        {
+            let mut blocked =
+                crate::native::blocked(connection, "native_session_requires_verification", false);
+            if !crate::domain::rules(&working.config)
+                .iter()
+                .any(|(_, rule)| rule.group_id == group.id)
+            {
+                blocked.remove("dns");
+            }
+            matrix.insert(group.id.clone(), blocked);
+        }
+        if working
+            .native_observations
+            .get(id)
+            .is_some_and(|old| old.session != state.session || old.dns != state.dns)
+            && let Some(record) = working.health.get_mut(id)
+        {
+            record.available = false;
+            record.fresh = false;
+            record.successes = 0;
+            record.failures = 0;
+            record.was_down = true;
+            record.admitted.clear();
+        }
+    }
+    working.native_observations = observations;
+    let config = crate::native::effective(&working.config, &working.native_observations);
+    for connection in &config.connections {
         if !due.contains(&connection.group_id) {
             continue;
         }
@@ -1659,7 +2242,13 @@ fn health_cycle(
             .find(|g| g.id == connection.group_id)
             .unwrap();
         let check = group.healthcheck.as_ref().unwrap();
-        let results = crate::probe::health(&client, &working.config, connection, &working.proxy)?;
+        let results = if let Some(reason) =
+            crate::native::readiness(connection, &working.native_observations)
+        {
+            crate::native::blocked(connection, reason, true)
+        } else {
+            crate::probe::health(&client, &config, connection, &working.proxy)?
+        };
         working
             .health
             .get_mut(&connection.id)
@@ -1672,29 +2261,34 @@ fn health_cycle(
         ));
     }
     let selected = select(&working.config, &working.health);
-    let mut matrix = working.matrix.clone();
     select_matrix(&working.config, &selected, &working.health, &mut matrix);
-    if selected == working.selected && matrix == working.matrix {
+    if selected == working.selected && matrix == working.matrix && !native_changed {
         private_write(&root.join("working.json"), &working)?;
         return Ok(());
     }
-    let effective = effective_config(&working.config, &selected);
+    let effective = effective_config(&config, &selected);
     let input = Input {
         config: effective.clone(),
         profiles: working.profiles.clone(),
+        native: working.native.clone(),
     };
     let ingress = ingress(&working.snapshot)?;
     let candidate = render(&input, &working.snapshot, &working.proxy, &ingress, &matrix)?;
     let previous: Working = read(&root.join("working.json"))?;
     let plan = Plan {
         id: random_id()?,
-        desired_digest: digest(&input)?,
+        desired_digest: crate::native::desired_digest(&input)?,
         panel_digest: working.panel_digest.clone().unwrap(),
         input,
         base: working.snapshot.clone(),
         candidate: candidate.clone(),
         proxy: working.proxy.clone(),
         ingress: ingress.clone(),
+        native_intents: working
+            .native
+            .iter()
+            .map(|(id, p)| (id.clone(), p.generation.clone()))
+            .collect(),
     };
     let mut journal = Journal {
         plan,
@@ -1705,6 +2299,13 @@ fn health_cycle(
     private_write(&root.join("journal.json"), &journal)?;
     let result = (|| -> io::Result<()> {
         submit(root, &client, &mut journal, &candidate)?;
+        crate::native::admit(
+            native,
+            &working.native,
+            &working.native_observations,
+            &effective,
+            &matrix,
+        )?;
         verify(
             &client,
             &candidate,
@@ -1734,7 +2335,7 @@ fn health_cycle(
         if client.cancelled() {
             recovery_required(root, &mut journal)?;
         } else {
-            let _ = recover(root, &client, &mut journal);
+            let _ = recover(root, &client, &mut journal, native);
         }
         return Err(io::Error::other(format!(
             "automatic switch failed: {error}; inspect routing status and recover the recorded plan if required"

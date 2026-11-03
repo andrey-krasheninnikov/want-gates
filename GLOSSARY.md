@@ -26,6 +26,7 @@ These terms describe the gateway, its routing policy and operator actions.
 | Failover | Selecting an eligible fallback when a preferred connection is unavailable. |
 | Failback | Returning new connections to a recovered connection with higher priority after the required successful healthchecks. Existing sessions may be interrupted by path changes or Xray restarts. |
 | Native generation | One prepared version of a system VPN connection. Its identity separates current access evidence from earlier processes and profiles. |
+| Native session | One authentication lifecycle within a prepared native connection, with separate evidence of resource access. |
 | Effective DNS | The resolver currently selected for a connection: its explicit DNS setting or a supported resolver supplied by its VPN server. |
 | Network namespace | An isolated Linux network environment for an individual system VPN client, with separate interfaces, routes, and DNS handling. |
 | Structural validation | Checking profile syntax and required field structure without executing Xray or proving compatibility, authentication, or connectivity. |

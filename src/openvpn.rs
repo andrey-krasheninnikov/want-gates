@@ -279,16 +279,8 @@ fn validate(profile: &Profile) -> io::Result<()> {
         }
         let args = &option[1..];
         let valid = match key {
-            "client"
-            | "nobind"
-            | "persist-key"
-            | "persist-tun"
-            | "remote-random"
-            | "remote-random-hostname"
-            | "auth-nocache"
-            | "float"
-            | "fast-io"
-            | "push-peer-info" => args.is_empty(),
+            "client" | "nobind" | "persist-key" | "persist-tun" | "remote-random"
+            | "auth-nocache" | "float" | "fast-io" | "push-peer-info" => args.is_empty(),
             "dev" => args == ["tun"],
             "proto" => {
                 args.len() == 1
@@ -420,11 +412,11 @@ fn validate(profile: &Profile) -> io::Result<()> {
             "OpenVPN certificate and key must be supplied together",
         ));
     }
-    if profile
-        .inline
-        .values()
-        .any(|s| s.trim().is_empty() || s.contains('\0'))
-    {
+    if profile.inline.values().any(|s| {
+        s.trim().is_empty()
+            || s.contains('\0')
+            || s.lines().any(|line| line.trim_start().starts_with('<'))
+    }) {
         return Err(invalid("invalid OpenVPN inline data"));
     }
     Ok(())

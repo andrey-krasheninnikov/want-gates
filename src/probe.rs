@@ -332,7 +332,7 @@ fn transport_at(
                                 email,
                                 "tcp",
                                 port,
-                            )? != format!("wgates-out-{}", &connection.id)
+                            )? != crate::native::diagnostic_tag(connection)
                             {
                                 return Err(invalid("runtime route does not select primary"));
                             }
@@ -360,7 +360,7 @@ fn transport_at(
                                 email,
                                 "udp",
                                 address.port(),
-                            )? != format!("wgates-out-{}", &connection.id)
+                            )? != crate::native::diagnostic_tag(connection)
                             {
                                 return Err(invalid("runtime route does not select primary"));
                             }
@@ -541,7 +541,7 @@ fn connection_at(
                             .map(String::as_str),
                         resolver.network,
                         resolver.address.port(),
-                    )? != format!("wgates-out-{}", connection.id)
+                    )? != crate::native::diagnostic_tag(connection)
                     {
                         return Err(invalid("DNS diagnostic route does not select connection"));
                     }
@@ -894,7 +894,7 @@ fn health_at(
             Some(user),
             resolver.network,
             resolver.address.port(),
-        )? != format!("wgates-out-{}", connection.id)
+        )? != crate::native::diagnostic_tag(connection)
         {
             return Err(invalid("healthcheck DNS route changed"));
         }
@@ -945,7 +945,7 @@ fn health_at(
                     .map(String::as_str),
                 "tcp",
                 port,
-            )? != format!("wgates-out-{}", connection.id)
+            )? != crate::native::diagnostic_tag(connection)
             {
                 return Err(invalid("healthcheck diagnostic route changed"));
             }

@@ -259,7 +259,7 @@ def checked(*args, **kwargs):
     return result
 
 
-def main(binary, panel_root):
+def main(binary, panel_root, native_acceptance=None):
     if sys.platform != 'linux' or os.geteuid() != 0:
         raise SystemExit('Run only as root on a disposable Linux systemd host.')
     repo = Path(__file__).resolve().parent.parent
@@ -410,6 +410,8 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
         uid=pwd.getpwnam(prefix).pw_uid
         text=(repo/'packaging/systemd/wgates.service').read_text().replace('wgates',prefix)
         text=text.replace('[Service]','[Service]\nNetworkNamespacePath=/run/netns/'+names['gateway'])
+        if native_acceptance is not None:
+            text=text.replace(' serve --socket ', f' serve --native-socket /run/{prefix}-native/control.sock --socket ')
         with unit.open('x') as file:
             unit_created=True
             file.write(text)
@@ -446,6 +448,9 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
             time.sleep(0.1)
         control('panel','configure','--file','-',payload=dict(url='http://127.0.0.1:20531/',token=token))
         control('panel','preflight')
+        if native_acceptance is not None:
+            native_acceptance(dict(ns=ns, spawn=spawn, control=control, api=api, work=work, installed=installed, xray=xray, prefix=prefix, events=events, names=names, ids=ids, outbound=outbound))
+            return
         groups,connections,rules={},{},{}
         for name,index,address,port in [('a',220,'10.213.0.2',19001),('b',221,'10.214.0.2',19002)]:
             group=control('group','create','--name',f'Company {name}')['data']['id'];groups[name]=group

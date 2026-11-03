@@ -778,7 +778,7 @@ fn protocol(value: &Value) -> io::Result<()> {
     match text(value)? {
         "vless" | "openvpn" => Ok(()),
         "forti" | "wireguard" | "netbird" => Err(invalid(
-            "protocol adapter unavailable; only VLESS profile import is implemented",
+            "protocol adapter unavailable; only VLESS and OpenVPN profile import are implemented",
         )),
         _ => Err(invalid("unsupported protocol")),
     }
@@ -860,6 +860,7 @@ impl Store {
         Ok(crate::routing::Input {
             config: self.config.clone(),
             profiles,
+            native: Default::default(),
         })
     }
 }

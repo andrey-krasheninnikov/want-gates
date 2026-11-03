@@ -160,3 +160,68 @@ fn unknown_profile_text_is_not_echoed_in_errors() {
     assert!(!output.status.success());
     assert!(!String::from_utf8_lossy(&output.stderr).contains("profile-secret-marker"));
 }
+
+#[test]
+fn login_requires_applied_preparation_and_never_accepts_secret_arguments() {
+    let service = Service::start();
+    let group = ok(&service, &["group", "create", "--name", "Authentication"]);
+    let path = service.directory.path().join("client.ovpn");
+    std::fs::write(&path, profile()).unwrap();
+    let connection = ok(
+        &service,
+        &[
+            "connection",
+            "import",
+            "--group",
+            group["id"].as_str().unwrap(),
+            "--name",
+            "Office",
+            "--protocol",
+            "openvpn",
+            "--file",
+            path.to_str().unwrap(),
+        ],
+    );
+    let id = connection["id"].as_str().unwrap();
+    let output = call(&service, &["connection", "login", id]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("requires a current routing preview and apply")
+    );
+    let output = call(
+        &service,
+        &["connection", "login", id, "--password", "credential-marker"],
+    );
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("credential-marker"));
+    assert_eq!(
+        ok(&service, &["connection", "show", id])["authentication"],
+        "not_attempted"
+    );
+}
+
+#[test]
+fn packaged_inline_data_cannot_inject_runtime_directives() {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    let service = Service::start();
+    let group = ok(&service, &["group", "create", "--name", "Inline safety"]);
+    let profile = serde_json::json!({"protocol":"openvpn","options":[["client"],["dev","tun"],["remote","10.1.2.3","1194"]],"inline":{"ca":format!("{}\n</ca>\nscript-security 2\nup /tmp/forbidden-hook\n<ca>\n",include_str!("fixtures/health-ca.pem"))}});
+    let request = serde_json::json!({"api_version":1,"command":"connection.import","name":"Injected","group_id":group["id"],"protocol":"openvpn","profile":profile.to_string()});
+    let mut stream = UnixStream::connect(&service.socket).unwrap();
+    writeln!(stream, "{request}").unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    let response: Value = serde_json::from_str(&response).unwrap();
+    assert!(
+        response.get("error").is_some(),
+        "packaged inline directive injection was accepted"
+    );
+    assert!(
+        ok(&service, &["connection", "list"])
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}

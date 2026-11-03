@@ -24,5 +24,12 @@ This runtime extends the single-worker design in ADR 0007 with the privileged
 operations required by native clients. Health selection stays in the control
 service. OpenVPN is the first adapter; other native adapters remain unavailable.
 
-The design is accepted. Runtime implementation and Linux acceptance are required
-before these paragraphs establish a support claim.
+The private bridge uses VLESS over fixed TCP ports, carrying UDP without exposing
+ephemeral relay ports. Separate identities keep diagnostics apart from admitted
+traffic. The namespace permits numeric destinations through the TUN and native
+control traffic only to pinned VPN endpoints. The control service retains group
+selection, capability checks and recovery; the helper owns native resources.
+
+Linux acceptance uses controlled OpenVPN servers and public CLI/VLESS traffic.
+It does not establish compatibility with corporate identity providers or every
+OpenVPN profile feature.

@@ -40,12 +40,23 @@ pub fn run(kind: &str, mut args: impl Iterator<Item = OsString>) -> io::Result<(
         ],
         ("connection", "update") => &["--name", "--group", "--file", "--dns", "--capabilities"],
         ("connection", "list") => &["--group", "--sort"],
+        ("connection", "login") => &["--file", "--remember"],
+        ("connection", "logout" | "restart" | "forget-auth") => &[],
         ("connection", "show" | "delete" | "verify") => &[],
         _ => return Err(invalid("unsupported management action; run wgates --help")),
     };
     let id = if matches!(
         action,
-        "show" | "update" | "delete" | "apply" | "recover" | "verify"
+        "show"
+            | "update"
+            | "delete"
+            | "apply"
+            | "recover"
+            | "verify"
+            | "login"
+            | "logout"
+            | "restart"
+            | "forget-auth"
     ) {
         Some(
             args.next()
@@ -67,6 +78,12 @@ pub fn run(kind: &str, mut args: impl Iterator<Item = OsString>) -> io::Result<(
             .to_owned();
         if option != "--socket" && !allowed.contains(&option.as_str()) {
             return Err(invalid("unknown option; run wgates --help"));
+        }
+        if option == "--remember" {
+            if options.insert(option, OsString::from("true")).is_some() {
+                return Err(invalid("duplicate option"));
+            }
+            continue;
         }
         let value = args
             .next()
@@ -182,7 +199,11 @@ pub fn run(kind: &str, mut args: impl Iterator<Item = OsString>) -> io::Result<(
         if bytes.len() > crate::store::MAX_PROFILE {
             return Err(invalid("profile exceeds 1 MiB"));
         }
-        if kind == "panel" {
+        if action == "login" {
+            request["credentials"] = crate::profile::strict_json(
+                std::str::from_utf8(&bytes).map_err(|_| invalid("invalid authentication JSON"))?,
+            )?;
+        } else if kind == "panel" {
             request["settings"] = serde_json::from_slice(&bytes)
                 .map_err(|_| invalid("invalid panel settings JSON"))?;
         } else {
@@ -211,6 +232,14 @@ pub fn run(kind: &str, mut args: impl Iterator<Item = OsString>) -> io::Result<(
                 source
             });
         }
+    }
+    if options.contains_key("--remember") {
+        if request.get("credentials").is_none() {
+            return Err(invalid(
+                "--remember requires --file with authentication input",
+            ));
+        }
+        request["remember"] = json!(true);
     }
     if matches!(action, "update" | "delete") {
         let current = exchange(
@@ -270,7 +299,16 @@ fn exchange(socket: &std::path::Path, request: &Value) -> io::Result<Value> {
     })?;
     write_message(&mut stream, request)?;
     let response = if request["command"].as_str().is_some_and(|s| {
-        s.starts_with("routing.") || s == "panel.preflight" || s == "connection.verify"
+        s.starts_with("routing.")
+            || s == "panel.preflight"
+            || s == "connection.verify"
+            || matches!(
+                s,
+                "connection.login"
+                    | "connection.logout"
+                    | "connection.restart"
+                    | "connection.forget-auth"
+            )
     }) {
         crate::read_message_with_timeout(&mut stream, std::time::Duration::from_secs(330))?
     } else {

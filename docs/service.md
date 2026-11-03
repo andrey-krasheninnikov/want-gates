@@ -1,9 +1,9 @@
 # Run the control service
 
-The service manages groups, VLESS profiles, domain/IP rules and connection DNS.
+The service manages groups, VLESS/OpenVPN profiles, domain/IP rules and connection DNS.
 Saving an object
 changes desired state only. Routing requires a preview and explicit apply
-through 3x-ui. See [routing and recovery](routing.md). Native authentication remains planned.
+through 3x-ui. See [routing and recovery](routing.md). See [native OpenVPN operation](openvpn.md) for helper installation and authentication.
 
 ## Build and commands
 
@@ -17,7 +17,7 @@ cargo build --locked --release
 
 Commands:
 
-- `wgates serve [--socket PATH] [--state-dir PATH]` runs the service.
+- `wgates serve [--socket PATH] [--state-dir PATH] [--native-socket PATH]` runs the service.
 - `wgates status [--socket PATH]` queries the service and prints one JSON object.
 - `wgates --version` prints the CLI version.
 
@@ -93,8 +93,7 @@ Names and sorting are case-sensitive. IDs remain stable across renaming, moves,
 and profile replacement. The protocol cannot be changed by an update.
 
 A group referenced by connections or rules cannot be deleted. A primary cannot
-be deleted or moved until its group reference is cleared or changed. Automatic
-fallback is not implemented.
+be deleted or moved until its group reference is cleared or changed. Automatic selection requires a configured group healthcheck; see [routing](routing.md).
 
 Connection lists sort by group name, connection name, and ID by default.
 `--sort name` sorts by connection name and ID. The CLI collects service pages
@@ -131,9 +130,9 @@ incomplete operations are unknown. Connection `verification` reports independent
 observations and staleness. VLESS `authentication` is `traffic_verified` after a
 matching successful observation, `unknown` after failure or invalidation, and
 `not_attempted` when no traffic check ran.
-Other protocol adapters report unavailable. No authentication sessions are
-created in this slice; future native adapters must isolate state per connection
-outside ordinary configuration.
+OpenVPN profiles use `--protocol openvpn`; see [profile and authentication limits](openvpn.md).
+OpenVPN reports native authentication separately from resource verification.
+Forti, WireGuard and NetBird adapters remain unavailable.
 
 ### Persistent state
 
@@ -187,7 +186,8 @@ A successful response is:
 Error responses contain `api_version` and an `error` string. Requests and
 responses are limited to 4 MiB, excluding the terminating newline. Request reads
 and ordinary responses have a two-second total deadline. The CLI allows 330
-seconds for routing operations, panel preflight and connection verification.
+seconds for routing operations, panel preflight, connection verification and native
+authentication/lifecycle commands.
 The CLI rejects incompatible versions, malformed or incomplete messages, and
 not-ready responses.
 
@@ -199,7 +199,8 @@ and socket. It does not confirm VPN, DNS, or 3x-ui connectivity.
 Management uses the same one-request-per-connection framing. Commands are
 `group.create`, `group.list`, `group.show`, `group.update`, `group.delete`,
 `connection.import`, `connection.list`, `connection.show`, `connection.update`,
-`connection.delete`, `connection.verify`, `rule.create`, `rule.list`, `rule.show`, `rule.update`,
+`connection.delete`, `connection.verify`, `connection.login`, `connection.logout`,
+`connection.restart`, `connection.forget-auth`, `rule.create`, `rule.list`, `rule.show`, `rule.update`,
 `rule.delete`, `panel.configure`, `panel.preflight`, `routing.preview`,
 `routing.apply`, `routing.status`, and `routing.recover`.
 
@@ -222,9 +223,16 @@ same pagination fields as other lists and an optional `group_id`.
 `panel.preflight`, `routing.preview`, and `routing.status` have no extra fields.
 `routing.apply` and `routing.recover` require `plan_id`.
 
+Native authentication and lifecycle commands require `id` and completed routing
+preparation. `connection.login` optionally takes `credentials` (the current
+`challenge_id` and fields for that action) and boolean `remember`. Login without
+credentials reads the action or resumes a stopped client. The other three commands
+have no extra fields. These actions do not change desired configuration or object
+revisions. Inspect state before retrying an action after a transport failure.
+
 Management responses wrap their result in `data`. Routing status includes
 `desired_revision`, `busy`, `recovery_required`, `last_observation`, and
-`connection_verifications`, applied `health`, and `health_schedule` with due/overdue
+`connection_verifications`, redacted `native_retained` identities, applied `health`, and `health_schedule` with due/overdue
 seconds. Health contains per-group selection, per-connection reasons and streaks,
 and an automation error when intervention is required. Private `routing/connections.json` retains the latest
 per-connection observations. `connection.verify` returns `connection_id`,
