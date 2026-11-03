@@ -1712,7 +1712,12 @@ fn recover(
                 .unwrap_or_else(|| io::Error::other("saved restoration could not be confirmed")));
         }
     }
-    if !journal.plan.native_intents.is_empty() {
+    if journal.plan.native_intents.values().any(|generation| {
+        !journal
+            .previous
+            .as_ref()
+            .is_some_and(|w| w.native.values().any(|p| &p.generation == generation))
+    }) {
         let inventory = native.call(json!({"command":"list"}))?;
         let inventory = inventory
             .as_array()
@@ -2183,7 +2188,7 @@ fn health_cycle(
     if client.read()? != working.snapshot {
         return Err(invalid("observed panel drift; automatic writes stopped"));
     }
-    let observations = crate::native::observe(native, &working.native)?;
+    let observations = crate::native::health_observations(native, &working.native)?;
     let native_changed = observations.iter().any(|(id, state)| {
         working
             .native_observations
@@ -2335,7 +2340,20 @@ fn health_cycle(
         if client.cancelled() {
             recovery_required(root, &mut journal)?;
         } else {
-            let _ = recover(root, &client, &mut journal, native);
+            let restored = recover(root, &client, &mut journal, native);
+            if crate::native::unavailable(&error)
+                && restored.as_ref().is_ok_and(|report| {
+                    matches!(
+                        report["state"].as_str(),
+                        Some("restored" | "restored_runtime_unverified")
+                    )
+                })
+            {
+                let mut previous: Working = read(&root.join("working.json"))?;
+                previous.health_error = None;
+                private_write(&root.join("working.json"), &previous)?;
+                return Ok(());
+            }
         }
         return Err(io::Error::other(format!(
             "automatic switch failed: {error}; inspect routing status and recover the recorded plan if required"

@@ -24,7 +24,8 @@ impl Client {
         }
         request["api_version"] = json!(1);
         let mut stream = UnixStream::connect(&self.socket).map_err(|_| {
-            invalid(
+            io::Error::new(
+                io::ErrorKind::NotConnected,
                 "native runtime unavailable; start wgates-native.service and check socket access",
             )
         })?;
@@ -51,7 +52,7 @@ impl Client {
                 return Err(invalid("native runtime peer must be root"));
             }
         }
-        write_message(&mut stream, &request)?;
+        write_message(&mut stream, &request).map_err(transport_error)?;
         let response = read_message_with_timeout(
             &mut stream,
             if matches!(request["command"].as_str(), Some("state" | "list")) {
@@ -59,7 +60,8 @@ impl Client {
             } else {
                 std::time::Duration::from_secs(30)
             },
-        )?;
+        )
+        .map_err(transport_error)?;
         if response["api_version"] != 1 {
             return Err(invalid("incompatible native runtime protocol"));
         }
@@ -70,6 +72,36 @@ impl Client {
             .get("data")
             .cloned()
             .ok_or_else(|| invalid("invalid native runtime response"))
+    }
+}
+
+fn transport_error(error: io::Error) -> io::Error {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::UnexpectedEof
+    ) {
+        io::Error::new(
+            io::ErrorKind::NotConnected,
+            "native runtime transport unavailable",
+        )
+    } else {
+        error
+    }
+}
+pub fn unavailable(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotConnected
+}
+fn unavailable_observation() -> Observation {
+    Observation {
+        authentication: "unavailable".into(),
+        reason: "native_runtime_unavailable".into(),
+        ..Default::default()
     }
 }
 
@@ -137,6 +169,25 @@ pub fn observe(
     client: &Client,
     prepared: &Generations,
 ) -> io::Result<BTreeMap<String, Observation>> {
+    observations(client, prepared, false)
+}
+pub fn health_observations(
+    client: &Client,
+    prepared: &Generations,
+) -> io::Result<BTreeMap<String, Observation>> {
+    match observations(client, prepared, true) {
+        Err(error) if unavailable(&error) => Ok(prepared
+            .keys()
+            .map(|id| (id.clone(), unavailable_observation()))
+            .collect()),
+        result => result,
+    }
+}
+fn observations(
+    client: &Client,
+    prepared: &Generations,
+    allow_missing: bool,
+) -> io::Result<BTreeMap<String, Observation>> {
     if prepared.is_empty() {
         return Ok(BTreeMap::new());
     }
@@ -146,12 +197,18 @@ pub fn observe(
         .ok_or_else(|| invalid("invalid native inventory"))?;
     let mut result = BTreeMap::new();
     for (id, generation) in prepared {
-        let value = values
+        let Some(value) = values
             .iter()
             .find(|value| value["prepared"]["generation"] == generation.generation)
-            .ok_or_else(|| {
-                invalid("native generation is not prepared; preview and apply before continuing")
-            })?;
+        else {
+            if allow_missing {
+                result.insert(id.clone(), unavailable_observation());
+                continue;
+            }
+            return Err(invalid(
+                "native generation is not prepared; preview and apply before continuing",
+            ));
+        };
         let actual: Prepared = serde_json::from_value(value["prepared"].clone())
             .map_err(|_| invalid("invalid native preparation response"))?;
         if crate::routing::digest(&actual)? != crate::routing::digest(generation)? {

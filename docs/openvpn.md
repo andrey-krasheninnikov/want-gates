@@ -174,14 +174,16 @@ On a disposable Linux systemd host with the real 3x-ui 3.8.5 installation:
 
 ```sh
 sudo python3 tests/openvpn_smoke.py target/release/wgates /path/to/x-ui
+sudo python3 tests/openvpn_smoke.py target/release/wgates /path/to/x-ui --helper-outage
 sudo python3 tests/native_safety_smoke.py target/release/wgates /path/to/xray
 ```
 
 The fixture creates its own certificates, VPN servers, namespaces, account and
 units. It uses public CLI commands and VLESS ingress traffic, then cleans its
 owned resources. It requires root and must not run on a live gateway. Native
-acceptance uses synthetic credentials and controllable servers. Corporate VPN
-providers and interactive identity-provider policies need separate live checks.
+acceptance uses synthetic credentials and controllable servers. The helper outage
+case separately checks VLESS monitoring, fallback and native recovery. Corporate
+VPN providers and interactive identity-provider policies need separate live checks.
 
 Runtime acceptance covers Linux aarch64, OpenVPN 2.6.19 and Xray 26.9.9.
 The stand exercises UDP over IPv4 and TCP over IPv6 as VPN transports, with

@@ -107,7 +107,56 @@ class AuthenticationServer:
         assert self.error is None, self.error
 
 
-def acceptance(context):
+def helper_outage(context, group, connection):
+    control, ns, prefix = (context[k] for k in ('control', 'ns', 'prefix'))
+    profile = context['outbound']('10.214.0.2',19002,context['ids']['b'])
+    reserve = control('connection','import','--group',group,'--name','Outage reserve','--protocol','vless','--file','-','--dns','udp://10.220.0.10:53',payload=profile)['data']['id']
+    pure_group = control('group','create','--name','Independent VLESS')['data']['id']
+    pure = control('connection','import','--group',pure_group,'--name','VLESS primary','--protocol','vless','--file','-','--dns','udp://10.220.0.10:53',payload=profile)['data']['id']
+    probes = control('group','show',group)['data']['probes']
+    policy = dict(target='http://health.corp.test:18080/health',required_capabilities=['tcp_ipv4','udp_ipv4','tcp_ipv6','udp_ipv6'],interval_seconds=1,timeout_seconds=1,failure_threshold=2,recovery_threshold=3)
+    control('group','update',group,'--fallbacks',reserve,'--healthcheck-file','-',payload=policy)
+    policy_path = context['work']/'outage-policy.json'
+    policy_path.write_text(json.dumps(policy))
+    control('group','update',pure_group,'--primary',pure,'--probe-file','-','--healthcheck-file',policy_path,payload=probes)
+    control('rule','create','--group',pure_group,'--destination','10.221.0.10')
+    plan = control('routing','preview')['data']['plan_id']
+    assert control('routing','apply',plan)['data']['state']=='applied'
+    def health():
+        report=control('routing','status')['data']['health']
+        assert not report['error'],report
+        return {g['group_id']:g for g in report['groups']}
+    before=health()[pure_group]['connections'][pure]['observed_at']
+    stand.checked('systemctl','stop',prefix+'-native.service')
+    deadline=time.monotonic()+30
+    while True:
+        current=health()
+        if current[group]['selected_connection']==reserve and current[pure_group]['connections'][pure]['observed_at']>before:
+            break
+        assert time.monotonic()<deadline,current
+        time.sleep(.1)
+    assert current[pure_group]['selected_connection']==pure,current
+    def traffic(address, peer):
+        result=ns('client','curl','--noproxy','','--socks5-hostname','127.0.0.1:10880','--max-time','4','-fsS',f'http://{address}:18080/helper-outage')
+        assert json.loads(result.stdout)['peer']==peer,result.stdout
+    traffic('10.220.0.10','10.212.0.1')
+    traffic('10.221.0.10','10.212.0.1')
+    traffic('1.1.1.1','10.210.0.1')
+    stand.checked('systemctl','start',prefix+'-native.service')
+    deadline=time.monotonic()+30
+    while True:
+        current=health()
+        if current[group]['selected_connection']==connection:
+            break
+        assert time.monotonic()<deadline,current
+        time.sleep(.1)
+    assert current[group]['connections'][connection]['successes']>=3,current
+    traffic('10.220.0.10','10.211.0.1')
+    traffic('10.221.0.10','10.212.0.1')
+    print('Helper outage preserves VLESS monitoring and fallback, then native recovery observes its threshold',flush=True)
+
+
+def acceptance(context, only_helper_outage=False):
     ns, spawn, control = (context[k] for k in ('ns', 'spawn', 'control'))
     work, installed, xray, prefix = (context[k] for k in ('work', 'installed', 'xray', 'prefix'))
     tls = work / 'tls'
@@ -183,6 +232,9 @@ def acceptance(context):
             reply = ns('client', 'python3', Path(stand.__file__), '--udp', str(port), 'native-capability.example.test')
             assert json.loads(reply.stdout)['answer'] == '198.18.1.1'
         print('OpenVPN imported-profile VLESS traffic, four capabilities and pushed DNS passed', flush=True)
+        if only_helper_outage:
+            helper_outage(context, group, connection)
+            return
 
         management = work/'server-management.sock'
         authentication = AuthenticationServer(management)
@@ -549,4 +601,5 @@ def acceptance(context):
 
 
 if __name__ == '__main__':
-    stand.main(sys.argv[1], sys.argv[2], native_acceptance=acceptance)
+    assert sys.argv[3:] in ([], ['--helper-outage']), 'unknown native stand option'
+    stand.main(sys.argv[1], sys.argv[2], native_acceptance=lambda context: acceptance(context, only_helper_outage=bool(sys.argv[3:])))
