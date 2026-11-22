@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise native OpenVPN only on the disposable local Linux systemd stand."""
 import json
+import os
 import base64
 import pwd
 from pathlib import Path
