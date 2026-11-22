@@ -1276,8 +1276,8 @@ impl Runtime {
         Ok(Instance::new(record, auth))
     }
     fn restart(&self, instance: &mut Instance, automatic_forti: bool) -> io::Result<()> {
-        self.client_version(instance.record.profile["protocol"].as_str().unwrap_or(""))?;
         instance.stop_for_restart();
+        self.client_version(instance.record.profile["protocol"].as_str().unwrap_or(""))?;
         if Self::forti_processes_remain(&instance.record)? {
             return Err(invalid("native Forti namespace still has active processes"));
         }

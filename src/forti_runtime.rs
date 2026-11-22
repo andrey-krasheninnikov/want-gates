@@ -479,7 +479,7 @@ impl Session {
             &self.directory.join("forti-ppp/options"),
             "noauth\nnoipv6\nnodefaultroute\nnoproxyarp\nnolog\n",
         )?;
-        crate::forti::check_gateway_identity(&self.profile)?;
+        crate::forti::validate_client_options(&self.profile)?;
         let host = option(&self.profile, "host").unwrap();
         let hosts = record
             .endpoints
@@ -680,13 +680,13 @@ impl Session {
             }
             while !self.output[index].is_empty() {
                 let text = &self.output[index];
-                let log_prefixes: &[&[u8]] = &[b"INFO:   ", b"WARN:   ", b"ERROR:  ", b"DEBUG:  "];
                 if index == 0
                     && self.gateway_connected
                     && matches!(auth.state.as_str(), "authenticating" | "browser_required")
-                    && !log_prefixes
-                        .iter()
-                        .any(|prefix| text.starts_with(prefix) || prefix.starts_with(text))
+                    && !crate::forti::LOG_LABELS.iter().any(|label| {
+                        let prefix = label.as_bytes();
+                        text.starts_with(prefix) || prefix.starts_with(text)
+                    })
                 {
                     let challenge = if text.starts_with(b"Two-factor authentication token: ") {
                         Some("Forti one-time response".to_owned())

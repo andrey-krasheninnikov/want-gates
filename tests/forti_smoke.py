@@ -154,23 +154,25 @@ with open(sys.argv[1], 'w', buffering=1) as events:
         set_mode(dict(mode='password'))
         control('connection','restart',connection)
         await_auth('authenticated')
-        plan=control('routing','preview')['data']['plan_id']
-        assert control('routing','apply',plan)['data']['capabilities'][group]['tcp_ipv4']=='verified'
         print('Stock Forti PPP down notification revokes admission and DNS',flush=True)
         (record,) = [p for p in state.glob('*.json') if json.loads(p.read_text())['prepared']['id']==connection]
         private_runtime=runtime/record.stem/'forti-runtime'
-        permissions=private_runtime.stat().st_mode & 0o777
-        try:
-            private_runtime.chmod(permissions | 0o020)
-            control('connection','restart',connection,success=False)
-            failed=control('connection','show',connection)['data']
-            assert failed['authentication']!='authenticated' and not failed['capabilities'],failed
-            assert not failed['native_runtime']['admitted'] and failed['native_runtime']['dns'] is None,failed
-        finally:
-            private_runtime.chmod(permissions)
-        control('connection','restart',connection)
-        current = await_auth('authenticated')
-        assert current['capabilities']==[], 'restart reused an earlier native admission'
+        for path in (native_client, private_runtime):
+            plan=control('routing','preview')['data']['plan_id']
+            assert control('routing','apply',plan)['data']['capabilities'][group]['tcp_ipv4']=='verified'
+            permissions=path.stat().st_mode & 0o777
+            try:
+                path.chmod(permissions | 0o020)
+                control('connection','restart',connection,success=False)
+                failed=control('connection','show',connection)['data']
+                assert failed['authentication']!='authenticated' and not failed['capabilities'],failed
+                assert not failed['native_runtime']['admitted'] and failed['native_runtime']['dns'] is None,failed
+            finally:
+                path.chmod(permissions)
+            control('connection','restart',connection)
+            current = await_auth('authenticated')
+            assert current['capabilities']==[], 'restart reused an earlier native admission'
+        print('Failed restart revokes Forti admission before and after client preflight',flush=True)
         set_mode(dict(mode='password', password='forti-replacement-marker'))
         control('connection','restart',connection)
         rejected=await_auth('failed')

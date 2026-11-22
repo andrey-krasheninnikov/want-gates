@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, io, path::Path};
 
 const ASSETS: &[&str] = &["ca-file", "user-cert", "user-key"];
+pub const LOG_LABELS: &[&str] = &["INFO:", "WARN:", "ERROR:", "DEBUG:"];
 
 pub fn parse(input: &str) -> io::Result<Value> {
     bundle(input, None).and_then(|s| crate::profile::strict_json(&s))
@@ -55,7 +56,7 @@ fn bundle_profile(input: &str, directory: Option<&Path>, importing: bool) -> io:
     };
     validate_and_normalize(&mut profile)?;
     if importing {
-        check_gateway_identity(&profile)?;
+        validate_client_options(&profile)?;
     }
     let mut value = serde_json::to_value(profile)?;
     value["protocol"] = json!("forti");
@@ -80,12 +81,19 @@ pub fn option<'a>(profile: &'a Profile, key: &str) -> Option<&'a str> {
         .map(|o| o[1].as_str())
 }
 
-pub fn check_gateway_identity(profile: &Profile) -> io::Result<()> {
+pub fn validate_client_options(profile: &Profile) -> io::Result<()> {
     if option(profile, "host").is_some_and(|host| host.parse::<std::net::Ipv4Addr>().is_ok())
         && option(profile, "trusted-cert").is_none()
     {
         return Err(invalid(
             "an IPv4 Forti gateway requires a verified trusted-cert fingerprint; use a DNS name for native CA and hostname validation",
+        ));
+    }
+    if option(profile, "otp-prompt")
+        .is_some_and(|prompt| LOG_LABELS.iter().any(|label| prompt.starts_with(label)))
+    {
+        return Err(invalid(
+            "Forti otp-prompt cannot begin with a native log label",
         ));
     }
     Ok(())
@@ -224,6 +232,22 @@ mod tests {
         let restored = decoded_profile(&saved).unwrap();
         assert_eq!(option(&restored, "host"), Some("xn--bro-hoa.example"));
         assert_eq!(option(&restored, "sni"), Some("xn--bro-hoa.example"));
+    }
+
+    #[test]
+    fn rejects_forti_otp_prompt_that_starts_with_a_log_label() {
+        let input = "host = vpn.example.test\notp-prompt = INFO: access code\n";
+        assert!(
+            parse(input)
+                .unwrap_err()
+                .to_string()
+                .contains("native log label")
+        );
+        let input = "host = vpn.example.test\notp-prompt = I\n";
+        assert_eq!(
+            parse(input).unwrap()["options"][1],
+            json!(["otp-prompt", "I"])
+        );
     }
 
     #[test]
