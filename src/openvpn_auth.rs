@@ -20,6 +20,7 @@ struct Reply {
     private_key_password: Option<String>,
     response: Option<String>,
 }
+#[derive(Clone)]
 struct Action {
     id: String,
     kind: &'static str,
@@ -27,6 +28,7 @@ struct Action {
     url: Option<String>,
     opaque: String,
 }
+#[derive(Clone)]
 pub struct Authentication {
     pub state: String,
     pub reason: String,

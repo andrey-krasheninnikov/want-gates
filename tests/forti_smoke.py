@@ -82,6 +82,8 @@ def acceptance(context, legacy=False):
                 assert time.monotonic()<deadline,value
                 time.sleep(.05)
         forti_binary.unlink()
+        control('connection','login',connection,'--file','-',payload=dict(challenge_id=action['challenge_id'],username='forti-incomplete-marker'),success=False)
+        control('connection','login',connection,'--file','-',payload=dict(challenge_id=action['challenge_id'],password='forti-password-marker'),success=False)
         credentials = dict(challenge_id=action['challenge_id'], username='forti-user', password='forti-password-marker')
         control('connection','login',connection,'--file','-','--remember',payload=credentials)
         current = await_auth('authenticated')
@@ -103,6 +105,17 @@ def acceptance(context, legacy=False):
             result=stand.run('ip','netns','exec',context['names']['client'],'curl','--noproxy','','--socks5-hostname','127.0.0.1:10880','--max-time','2','-fsS',f'http://[{address}]:18080/forti')
             assert result.returncode!=0,'unsupported Forti IPv6 escaped'
         print('Real openfortivpn/pppd authentication, private DNS and VLESS TCP/UDP over IPv4 passed; IPv6 blocked',flush=True)
+        (record,) = [p for p in state.glob('*.json') if json.loads(p.read_text())['prepared']['id']==connection]
+        private_runtime=runtime/record.stem/'forti-runtime'
+        permissions=private_runtime.stat().st_mode & 0o777
+        try:
+            private_runtime.chmod(permissions | 0o020)
+            control('connection','restart',connection,success=False)
+            failed=control('connection','show',connection)['data']
+            assert failed['authentication']!='authenticated' and not failed['capabilities'],failed
+            assert not failed['native_runtime']['admitted'] and failed['native_runtime']['dns'] is None,failed
+        finally:
+            private_runtime.chmod(permissions)
         control('connection','restart',connection)
         current = await_auth('authenticated')
         assert current['capabilities']==[], 'restart reused an earlier native admission'

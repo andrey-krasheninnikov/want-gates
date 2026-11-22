@@ -128,6 +128,17 @@ impl Instance {
             proxy_gate: None,
         }
     }
+    fn stop_for_restart(&mut self) {
+        self.auth.fail("native_restart_failed");
+        self.admitted_session = None;
+        self.dns = None;
+        self.proxy_gate = None;
+        stop(&mut self.proxy);
+        stop(&mut self.client);
+        self.management = None;
+        self.listener = None;
+        self.forti = None;
+    }
 }
 struct Runtime {
     root: PathBuf,
@@ -1212,8 +1223,13 @@ impl Runtime {
         }
         Ok(instance)
     }
-    fn restore(&self, mut record: Record, client_available: bool) -> io::Result<Instance> {
-        let reason = if self.cleanup_runtime_files(&record).is_err() {
+    fn restore(
+        &self,
+        mut record: Record,
+        network_clean: bool,
+        client_available: bool,
+    ) -> io::Result<Instance> {
+        let reason = if !network_clean || self.cleanup_runtime_files(&record).is_err() {
             "native_cleanup_required"
         } else if !client_available {
             "native_adapter_unavailable"
@@ -1224,8 +1240,9 @@ impl Runtime {
             {
                 Ok(instance) => return Ok(instance),
                 Err(_) => {
-                    self.cleanup_network(&mut record)?;
-                    if self.cleanup_runtime_files(&record).is_ok() {
+                    if self.cleanup_network(&mut record)?
+                        && self.cleanup_runtime_files(&record).is_ok()
+                    {
                         "native_restore_failed"
                     } else {
                         "native_cleanup_required"
@@ -1263,25 +1280,38 @@ impl Runtime {
         instance.proxy_gate = Some(gate);
         Ok(())
     }
-    fn cleanup_network(&self, record: &mut Record) -> io::Result<()> {
-        let ns_path = Path::new("/run/netns").join(&record.namespace);
-        if record.profile["protocol"] == "forti"
-            && record.namespace_identity.is_some()
-            && let Ok(meta) = fs::symlink_metadata(&ns_path)
-            && record.namespace_identity == Some((meta.dev(), meta.ino()))
+    fn forti_processes_remain(record: &Record) -> io::Result<bool> {
+        let Some(identity) = record
+            .namespace_identity
+            .filter(|_| record.profile["protocol"] == "forti")
+        else {
+            return Ok(false);
+        };
+        // A pppd descendant can outlive the helper and its namespace bind mount.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while fs::read_dir("/proc")?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .as_encoded_bytes()
+                    .iter()
+                    .all(u8::is_ascii_digit)
+            })
+            .any(|entry| {
+                fs::metadata(entry.path().join("ns/net"))
+                    .is_ok_and(|meta| (meta.dev(), meta.ino()) == identity)
+            })
         {
-            // openfortivpn can leave pppd in a separate process group while its PTY closes.
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !command("/usr/sbin/ip", &["netns", "pids", &record.namespace])?
-                .trim()
-                .is_empty()
-            {
-                if Instant::now() >= deadline {
-                    return Err(invalid("native Forti namespace still has active processes"));
-                }
-                std::thread::sleep(Duration::from_millis(20));
+            if Instant::now() >= deadline {
+                return Ok(true);
             }
+            std::thread::sleep(Duration::from_millis(20));
         }
+        Ok(false)
+    }
+    fn cleanup_network(&self, record: &mut Record) -> io::Result<bool> {
+        let ns_path = Path::new("/run/netns").join(&record.namespace);
         let table = format!("wgates_{}", record.prepared.generation);
         let tables: Value =
             serde_json::from_str(&command("/usr/sbin/nft", &["-j", "list", "tables"])?)?;
@@ -1296,6 +1326,13 @@ impl Runtime {
                     "owned native firewall changed or ownership is uncertain; retain resources for inspection",
                 ));
             }
+        }
+        if Self::forti_processes_remain(record)? {
+            // A disconnected namespace cannot keep an old bridge reachable.
+            Self::detach_bridge(record)?;
+            return Ok(false);
+        }
+        if present {
             nft(None, &format!("delete table inet {table}"))?;
         }
         record.firewall_digest = None;
@@ -1330,6 +1367,10 @@ impl Runtime {
         record.namespace_identity = None;
         record.namespace_file = None;
         self.save(record)?;
+        Self::detach_bridge(record)?;
+        Ok(true)
+    }
+    fn detach_bridge(record: &Record) -> io::Result<()> {
         let links: Value =
             serde_json::from_str(&command("/usr/sbin/ip", &["-d", "-j", "link", "show"])?)?;
         if let Some(link) = links
@@ -1388,7 +1429,9 @@ impl Runtime {
         Ok(())
     }
     fn cleanup(&self, record: &mut Record, forget: bool) -> io::Result<()> {
-        self.cleanup_network(record)?;
+        if !self.cleanup_network(record)? {
+            return Err(invalid("native Forti namespace still has active processes"));
+        }
         self.cleanup_runtime_files(record)?;
         if forget {
             if !self.instances.values().any(|i| {
@@ -1497,8 +1540,12 @@ impl Runtime {
                 i.dns = dns;
             } else {
                 driver.stopped();
+                i.dns = None;
+                if i.auth.state == "authenticated" {
+                    i.auth.fail("native_client_exited");
+                }
             }
-            if i.auth.state == "authenticated" {
+            if i.client.is_some() && i.auth.state == "authenticated" {
                 self.proxy(i, i.admitted_session.as_ref() == Some(&i.auth.session))?;
             } else {
                 i.admitted_session = None;
@@ -1667,9 +1714,7 @@ impl Runtime {
                     self.client_version(i.record.profile["protocol"].as_str().unwrap_or(""))?;
                     i.record.paused = false;
                     self.save(&i.record)?;
-                    stop(&mut i.proxy);
-                    stop(&mut i.client);
-                    i.listener = None;
+                    i.stop_for_restart();
                     if i.record.namespace_identity.is_none() {
                         self.create_network(&mut i.record)?;
                     }
@@ -1759,9 +1804,7 @@ impl Runtime {
                 self.client_version(i.record.profile["protocol"].as_str().unwrap_or(""))?;
                 i.record.paused = false;
                 self.save(&i.record)?;
-                stop(&mut i.proxy);
-                stop(&mut i.client);
-                i.management = None;
+                i.stop_for_restart();
                 if i.record.namespace_identity.is_none() {
                     self.create_network(&mut i.record)?;
                 }
@@ -2032,12 +2075,14 @@ pub fn run(mut args: impl Iterator<Item = OsString>, cleanup_only: bool) -> io::
         }
         return first_error.map_or(Ok(()), Err);
     }
-    for record in &mut retained {
-        runtime.cleanup_network(record)?;
+    let mut generations = Vec::with_capacity(retained.len());
+    for mut record in retained {
+        let network_clean = runtime.cleanup_network(&mut record)?;
+        generations.push((record, network_clean));
     }
     runtime.preflight(&[])?;
     let mut clients = BTreeMap::new();
-    for record in &retained {
+    for (record, _) in &generations {
         let protocol = record.profile["protocol"]
             .as_str()
             .ok_or_else(|| invalid("native protocol required"))?;
@@ -2045,9 +2090,9 @@ pub fn run(mut args: impl Iterator<Item = OsString>, cleanup_only: bool) -> io::
             .entry(protocol.to_owned())
             .or_insert_with(|| runtime.client_version(protocol).is_ok());
     }
-    for record in retained {
+    for (record, network_clean) in generations {
         let client_available = clients[record.profile["protocol"].as_str().unwrap()];
-        let instance = runtime.restore(record, client_available)?;
+        let instance = runtime.restore(record, network_clean, client_available)?;
         runtime
             .instances
             .insert(instance.record.prepared.generation.clone(), instance);

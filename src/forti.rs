@@ -95,10 +95,14 @@ fn validate_and_normalize(profile: &mut Profile) -> io::Result<()> {
             return Err(invalid("duplicate Forti option"));
         }
         let valid = match key {
-            "host" => {
-                value.parse::<std::net::Ipv4Addr>().is_ok()
-                    || crate::policy::domain_name(value).is_ok()
-            }
+            "host" if value.parse::<std::net::Ipv4Addr>().is_ok() => true,
+            "host" | "sni" => match crate::policy::domain_name(value) {
+                Ok(name) => {
+                    *stored_value = name;
+                    true
+                }
+                Err(_) => false,
+            },
             "port" => value
                 .parse::<u16>()
                 .is_ok_and(|v| v != 0 && v.to_string() == value),
@@ -106,7 +110,6 @@ fn validate_and_normalize(profile: &mut Profile) -> io::Result<()> {
             "trusted-cert" => {
                 *count <= 16 && value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
             }
-            "sni" => crate::policy::domain_name(value).is_ok(),
             "otp-prompt" if value.len() <= 255 => {
                 *stored_value = value.trim_matches(' ').to_owned();
                 true
@@ -187,6 +190,20 @@ mod tests {
         assert_eq!(option(&restored, "otp-prompt"), Some("Entrez"));
         let raw = parse("host = vpn.example.test\notp-delay = 08\notp-prompt = Entrez\n").unwrap();
         assert_eq!(parse(&saved.to_string()).unwrap(), raw);
+    }
+
+    #[test]
+    fn canonicalizes_forti_dns_host_and_sni() {
+        let saved = json!({
+            "protocol": "forti",
+            "options": [["host", "büro.example"], ["sni", "büro.example"]],
+            "inline": {}
+        });
+        let restored = decoded_profile(&saved).unwrap();
+        assert_eq!(option(&restored, "host"), Some("xn--bro-hoa.example"));
+        assert_eq!(option(&restored, "sni"), Some("xn--bro-hoa.example"));
+        let literal = parse("host = 192.0.2.1\n").unwrap();
+        assert_eq!(literal["options"][0][1], "192.0.2.1");
     }
 
     #[test]

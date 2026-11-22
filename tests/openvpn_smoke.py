@@ -531,13 +531,15 @@ def acceptance(context, only_helper_outage=False, mixed_adapters=False):
             control('connection','login',forti_id,'--file','-','--remember',payload=dict(challenge_id=forti_action['challenge_id'],username='forti-user',password='forti-password-marker'))
             (forti_auth,) = state.glob(forti_id+'-*.auth')
             forti_alias.unlink()
-            pid=stand.checked('systemctl','show','--property=MainPID','--value',unit.name).stdout.strip()
-            assert int(pid)>0
-            stand.checked('systemctl','kill','--kill-who=main','--signal=SIGKILL',unit.name)
-            deadline=time.monotonic()+25
-            while not (runtime/'control.sock').is_socket() or stand.checked('systemctl','show','--property=MainPID','--value',unit.name).stdout.strip() in ('0',pid):
-                assert time.monotonic()<deadline,'native helper did not restart after abrupt exit'
-                time.sleep(.1)
+            def restart_after_crash():
+                pid=stand.checked('systemctl','show','--property=MainPID','--value',unit.name).stdout.strip()
+                assert int(pid)>0
+                stand.checked('systemctl','kill','--kill-who=main','--signal=SIGKILL',unit.name)
+                deadline=time.monotonic()+25
+                while not (runtime/'control.sock').is_socket() or stand.checked('systemctl','show','--property=MainPID','--value',unit.name).stdout.strip() in ('0',pid):
+                    assert time.monotonic()<deadline,'native helper did not restart after abrupt exit'
+                    time.sleep(.1)
+            restart_after_crash()
             fault_state=await_connection(forti_id,lambda v:v.get('native_runtime',{}).get('reason')=='native_adapter_unavailable')
             assert not fault_state['native_runtime']['admitted']
             await_connection(connection,lambda v:v.get('native_runtime',{}).get('admitted') and 'tcp_ipv4' in v['capabilities'],45)
@@ -570,6 +572,36 @@ def acceptance(context, only_helper_outage=False, mixed_adapters=False):
             assert witness.read_text()=='owned fixture marker'
             witness.unlink()
             control('connection','forget-auth',forti_id)
+            control('connection','restart',forti_id)
+            await_connection(forti_id,lambda v:v['authentication']=='credentials_required')
+            prepared=json.loads(forti_record.read_text())
+            helper_pid=stand.checked('systemctl','show','--property=MainPID','--value',unit.name).stdout.strip()
+            namespace=Path(f'/proc/{helper_pid}/root/run/netns')/prepared['namespace']
+            identity=namespace.stat()
+            assert (identity.st_dev,identity.st_ino)==tuple(prepared['namespace_identity'])
+            # Match the helper's group and drop capabilities as its Forti descendants do.
+            holder=subprocess.Popen(['nsenter',f'--net={namespace}','setpriv','--regid',str(gid),
+                                     '--clear-groups','--bounding-set=-all','--inh-caps=-all',
+                                     '--ambient-caps=-all','/usr/bin/sleep','120'],stderr=subprocess.PIPE)
+            try:
+                deadline=time.monotonic()+5
+                proc=Path(f'/proc/{holder.pid}')
+                while (proc/'comm').read_text().strip()!='sleep':
+                    assert holder.poll() is None,holder.stderr.read().decode()
+                    assert time.monotonic()<deadline,'fixture process did not enter Forti namespace'
+                    time.sleep(.05)
+                observed=(proc/'ns/net').stat()
+                assert (observed.st_dev,observed.st_ino)==(identity.st_dev,identity.st_ino)
+                restart_after_crash()
+                retained=await_connection(forti_id,lambda v:v.get('native_runtime',{}).get('reason')=='native_cleanup_required')
+                assert retained['native_runtime']['resources_active'] and not retained['native_runtime']['admitted'],retained
+                links=json.loads(ns('gateway','ip','-j','link','show').stdout)
+                assert all(link['ifname']!=prepared['interface'] for link in links),links
+                await_connection(connection,lambda v:v.get('native_runtime',{}).get('admitted') and 'tcp_ipv4' in v['capabilities'],45)
+                traffic('10.220.0.10','10.211.0.1')
+            finally:
+                holder.terminate()
+                holder.wait(timeout=5)
             control('connection','restart',forti_id)
             await_connection(forti_id,lambda v:v['authentication']=='credentials_required')
             control('connection','delete',forti_id)

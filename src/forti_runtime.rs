@@ -259,11 +259,13 @@ impl Session {
         }
         let accepted = relay.thread.take().unwrap().join().unwrap_or(false);
         self.relay = None;
-        if accepted {
-            auth.submitted();
-            auth.expires_at = Some(now() + 300);
-        } else {
-            auth.expires_at = Some(now());
+        if auth.state == "browser_required" {
+            if accepted {
+                auth.submitted();
+                auth.expires_at = Some(now() + 300);
+            } else {
+                auth.expires_at = Some(now());
+            }
         }
         false
     }
@@ -396,45 +398,47 @@ impl Session {
                 "certificate login requires a packaged certificate/key pair and no account credentials",
             ));
         }
+        let mut staged = auth.clone();
         if method == "password" {
             if let Some(user) = reply.username {
-                auth.credentials.username = Some(user);
+                staged.credentials.username = Some(user);
             }
             if let Some(password) = reply.password {
-                auth.credentials.password = Some(password);
+                staged.credentials.password = Some(password);
             }
-            if auth
+            if staged
                 .credentials
                 .username
                 .as_ref()
                 .is_none_or(|s| s.is_empty())
-                || auth.credentials.password.is_none()
+                || staged.credentials.password.is_none()
             {
                 return Err(invalid("Forti username and password required"));
             }
         }
         if let Some(password) = reply.private_key_password {
-            auth.credentials.private_key_password = Some(password);
+            staged.credentials.private_key_password = Some(password);
         }
         if method == "certificate" {
-            if remember && auth.credentials.private_key_password.is_none() {
+            if remember && staged.credentials.private_key_password.is_none() {
                 return Err(invalid(
                     "certificate login has no base password to remember",
                 ));
             }
-            auth.credentials.username = None;
-            auth.credentials.password = None;
+            staged.credentials.username = None;
+            staged.credentials.password = None;
         }
 
-        if self.encrypted_key() && auth.credentials.private_key_password.is_none() {
+        if self.encrypted_key() && staged.credentials.private_key_password.is_none() {
             return Err(invalid(
                 "Forti encrypted client key requires private_key_password",
             ));
         }
-        self.launch(record, auth, child, method, reply.cookie.as_deref())?;
+        self.launch(record, &mut staged, child, method, reply.cookie.as_deref())?;
         if remember {
-            auth.remembered = true;
+            staged.remembered = true;
         }
+        *auth = staged;
         Ok(())
     }
     fn launch(
@@ -541,29 +545,7 @@ impl Session {
         if method == "saml" {
             args.push("--saml-login=8020");
         }
-        let mut process = namespace_child(
-            record,
-            &self.executable,
-            &args,
-            Stdio::piped(),
-            None,
-            Some((&self.directory, &config_file)),
-        )?;
-        self.stdin = process.stdin.take();
-        *child = Some(process);
-        self.output = [Vec::new(), Vec::new()];
-        self.ready = false;
-        self.dns = None;
-        auth.submitted();
-        auth.expires_at = Some(now() + 300);
-        if let Some(cookie) = cookie {
-            let result = self.stdin.as_mut().unwrap().write_all(cookie.as_bytes());
-            self.stdin = None;
-            result?;
-        }
-        if let Some(relay) = relay {
-            let expires_at = relay.expires_at;
-            self.relay = Some(relay);
+        if let Some(relay) = &relay {
             let mut url = url::Url::parse(&format!(
                 "https://{host}:{}/remote/saml/start",
                 option(&self.profile, "port").unwrap_or("443")
@@ -579,8 +561,34 @@ impl Session {
                 Some(url.to_string()),
                 String::new(),
             )?;
-            auth.expires_at = Some(expires_at);
+            auth.expires_at = Some(relay.expires_at);
         }
+        let process = namespace_child(
+            record,
+            &self.executable,
+            &args,
+            Stdio::piped(),
+            None,
+            Some((&self.directory, &config_file)),
+        )?;
+        let mut process = Some(process);
+        let mut stdin = process.as_mut().unwrap().stdin.take();
+        if let Some(cookie) = cookie
+            && let Err(error) = stdin.take().unwrap().write_all(cookie.as_bytes())
+        {
+            super::stop(&mut process);
+            return Err(error);
+        }
+        if relay.is_none() {
+            auth.submitted();
+            auth.expires_at = Some(now() + 300);
+        }
+        self.relay = relay;
+        self.stdin = stdin;
+        *child = process;
+        self.output = [Vec::new(), Vec::new()];
+        self.ready = false;
+        self.dns = None;
         Ok(())
     }
     pub fn poll(
@@ -635,7 +643,9 @@ impl Session {
                 auth.require("text", "Forti one-time response", None, String::new())?;
             }
             while !self.output[index].is_empty() {
-                if index == 0 && auth.state == "authenticating" {
+                if index == 0
+                    && matches!(auth.state.as_str(), "authenticating" | "browser_required")
+                {
                     let text = &self.output[index];
                     if text.starts_with(b"Please")
                         || option(&self.profile, "otp-prompt")
@@ -860,6 +870,40 @@ mod tests {
     fn saml_callback_keeps_the_native_identifier_with_extra_parameters() {
         let request = "GET /?id=fixture-id&realm=office HTTP/1.1\r\n\r\n";
         assert_eq!(Relay::callback_id(request).unwrap(), "fixture-id");
+    }
+
+    #[test]
+    fn saml_completion_preserves_an_existing_otp_challenge() {
+        let mut session = Session {
+            profile: Profile {
+                options: Vec::new(),
+                inline: Default::default(),
+            },
+            directory: PathBuf::new(),
+            executable: PathBuf::new(),
+            version: (1, 24),
+            stdin: None,
+            output: Default::default(),
+            dns: None,
+            ready: false,
+            relay: Some(Relay {
+                path: PathBuf::new(),
+                expires_at: now() + SAML_CALLBACK_SECONDS,
+                stopping: Arc::new(AtomicBool::new(false)),
+                thread: Some(thread::spawn(|| true)),
+            }),
+        };
+        let mut auth = Authentication::new(Default::default(), false).unwrap();
+        auth.require("text", "One-time code", None, String::new())
+            .unwrap();
+        let challenge = auth.action();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while session.relay.is_some() {
+            assert!(Instant::now() < deadline);
+            session.poll_callback(&mut auth);
+            thread::yield_now();
+        }
+        assert_eq!(auth.action(), challenge);
     }
 
     #[test]
