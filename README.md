@@ -4,14 +4,14 @@
 
 Network routing and tunnel management for an existing 3x-ui gateway.
 
-Want Gates routes traffic from VLESS clients through outgoing VLESS or isolated OpenVPN connections
+Want Gates routes traffic from VLESS clients through outgoing VLESS or isolated OpenVPN/Forti connections
 selected by destination domains, IP addresses, and CIDR ranges. Connections
 are organized into company groups with an explicit primary and ordered fallbacks.
 Optional target-resource checks switch data and DNS together within a group.
 
 ## Status
 
-The Rust binary manages groups, VLESS/OpenVPN profiles, domain/IP rules and connection
+The Rust binary manages groups, VLESS/OpenVPN/Forti profiles, domain/IP rules and connection
 DNS through a Unix
 socket. A preview and explicit apply configure 3x-ui 3.8.5 with Xray 26.9.9.
 TCP/UDP over IPv4/IPv6 are verified separately; unavailable combinations are
@@ -22,8 +22,8 @@ without changing primary. See [service operation](docs/service.md) and
 Both `vless://` and complete outbound JSON imports are supported. Import checks
 structure; apply checks the panel and actual traffic. The isolated local
 Linux/arm64 stand exercises two groups and the complete VLESS ingress path.
-OpenVPN uses an optional privileged helper for isolated native authentication and
-routing. See [OpenVPN operation](docs/openvpn.md). Bootstrap, the skill package
+OpenVPN and Forti use an optional privileged helper for isolated native authentication and
+routing. See [OpenVPN operation](docs/openvpn.md) and [Forti operation](docs/forti.md). Bootstrap, the skill package
 and panel UI remain planned. No binary release is published.
 
 ## Routing model
@@ -44,7 +44,8 @@ capabilities. Ambiguous rules of equal specificity are rejected.
 
 - Outgoing VLESS through Xray.
 - Isolated OpenVPN with certificate, password and supported native MFA/SSO authentication.
-- Planned: Forti through openfortivpn, WireGuard and NetBird.
+- Isolated Forti through openfortivpn with password, certificates, OTP/push, cookie SSO and native SAML.
+- Planned: WireGuard and NetBird.
 - Profile import and native authentication, including supported MFA/SSO flows.
 - TCP, HTTP and HTTPS target checks, ordered failover, and stable failback within a group.
 
@@ -53,8 +54,8 @@ consecutive failures mark a connection unavailable; five consecutive successes
 make a recovered connection eligible again. These settings are configurable per
 group.
 
-Simultaneous isolated NetBird accounts and UDP/IPv6 support for the Forti bridge
-still require runtime validation. Session continuity during path changes or
+Simultaneous isolated NetBird accounts still require runtime validation. Forti
+supports separately verified TCP/UDP over IPv4; IPv6 stays blocked. Session continuity during path changes or
 Xray restarts is not guaranteed.
 
 ## Planned operation and installation

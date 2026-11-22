@@ -142,6 +142,17 @@ pub fn validate(input: &Input, base: &Snapshot) -> io::Result<()> {
                 ));
             }
         }
+        if profile["protocol"] == "forti" {
+            let forti = crate::forti::decoded_profile(profile)?;
+            if let Some(host) = crate::forti::option(&forti, "host")
+                && let Ok(name) = domain_name(host)
+                && winner(&input.config, &name).is_some()
+            {
+                return Err(invalid(
+                    "Forti server name overlaps a protected domain; avoid a DNS bootstrap cycle",
+                ));
+            }
+        }
         if profile["protocol"] == "openvpn"
             && let Some(options) = profile["options"].as_array()
         {

@@ -3,8 +3,8 @@
 Want Gates manages domain and IP/CIDR routing beside MHSanaei/3x-ui 3.8.5 with Xray
 26.9.9. It controls the shared policy of enabled local VLESS inbounds. Rules
 select a group; its primary or an eligible ordered fallback supplies the outgoing
-VLESS or isolated native OpenVPN connection. Groups without a healthcheck retain
-explicit-primary routing. See [OpenVPN operation](openvpn.md) for native setup,
+VLESS or isolated native OpenVPN/Forti connection. Groups without a healthcheck retain
+explicit-primary routing. See [OpenVPN](openvpn.md) and [Forti](forti.md) for native setup,
 authentication, effective DNS and session verification.
 
 ## Configure and preview
@@ -223,10 +223,11 @@ routing still requires explicit apply, which rechecks its selected primaries.
 
 Connection list/show and routing status expose `verification` observations with
 an observation time and source. The per-combination states are `verified`,
-`unsupported` with reason `configured_limit`, `unverified`, `unavailable`, and
-`stale`. A failed resource probe means `unavailable`, not a proven protocol
-limitation or authentication failure. Profile, group, DNS, limits and probe
-changes invalidate the corresponding evidence. The existing `capabilities` list
+`unsupported`, `unverified`, `unavailable`, and `stale`. An `unsupported`
+observation reports `configured_limit` for an operator limit or `protocol_limit`
+for an adapter limit such as Forti IPv6. A failed resource probe reports
+`unavailable`. Authentication status is reported separately. Profile, group,
+DNS, limits and probe changes invalidate the corresponding evidence. The existing `capabilities` list
 continues to describe the last matching applied policy. An unselected connection
 can have successful verification while its applied capability list is empty.
 

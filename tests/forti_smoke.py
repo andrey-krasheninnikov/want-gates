@@ -1,0 +1,541 @@
+#!/usr/bin/env python3
+"""Exercise Forti through the public CLI on the disposable Linux stand."""
+import json
+import hashlib
+import ssl
+import os
+import select
+import signal
+import shutil
+import sys
+import time
+from pathlib import Path
+import routing_smoke as stand
+
+
+def acceptance(context, legacy=False):
+    control, prefix = context['control'], context['prefix']
+    runtime, state = Path('/run') / f'{prefix}-native', Path('/var/lib') / f'{prefix}-native'
+    unit = Path('/run/systemd/system') / f'{prefix}-native.service'
+    repo = Path(__file__).resolve().parent.parent
+    native_binary = '/usr/bin/openfortivpn' if legacy else '/opt/forti-1.24.1/bin/openfortivpn'
+    alias = Path('/usr/local/bin') / f'{prefix}-forti-client'
+    bootstrap = Path('/run') / f'{prefix}-forti-bootstrap-hosts'
+    resolver = Path('/run') / f'{prefix}-forti-resolv'
+    keys = Path('/run') / f'{prefix}-saml-ssh'
+    assert not any(p.exists() or p.is_symlink() for p in (alias, runtime, state, unit, bootstrap, resolver, keys))
+    frozen = []
+    sshd = forwarding = None
+    start_attempted = False
+    try:
+        alias.mkdir(mode=0o755)
+        forti_binary=alias/'client'
+        native_client=alias/'openfortivpn'
+        shutil.copyfile(native_binary,native_client)
+        native_client.chmod(0o755)
+        forti_binary.symlink_to(native_client)
+        bootstrap.write_text('127.0.0.1 localhost\n10.213.0.2 wrong-name.example.test\n')
+        bootstrap.chmod(0o644)
+        resolver.write_text('nameserver 127.0.0.1\nsearch corp.test\noptions ndots:15 attempts:1 timeout:1\n')
+        dns_events = context['work']/'forti-bootstrap-queries'
+        dns_peer = r"""
+import socket, struct, sys
+server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+server.bind(('127.0.0.1', 53))
+with open(sys.argv[1], 'w', buffering=1) as events:
+    while True:
+        query, peer = server.recvfrom(2048)
+        offset, labels = 12, []
+        while query[offset]:
+            size = query[offset]
+            labels.append(query[offset + 1:offset + 1 + size])
+            offset += size + 1
+        name = b'.'.join(labels)
+        events.write(name.decode() + '\n')
+        question = query[12:offset + 5]
+        answer = b''
+        if name == b'forti-a.example.test':
+            answer = struct.pack('!HHHIH4s', 0xc00c, 1, 1, 0, 4, socket.inet_aton('10.213.0.2'))
+        flags = 0x8180 if answer else 0x8183
+        server.sendto(query[:2] + struct.pack('!5H', flags, 1, bool(answer), 0, 0) + question + answer, peer)
+"""
+        resolver_process = context['spawn']('gateway', ['python3', '-c', dns_peer, dns_events], 'forti-bootstrap-dns')
+        deadline = time.monotonic()+5
+        while not dns_events.exists():
+            assert resolver_process.poll() is None and time.monotonic()<deadline
+            time.sleep(.05)
+        template = (repo/'packaging/systemd/wgates-native.service').read_text().replace('wgates', prefix)
+        template = template.replace('[Service]', '[Service]\nNetworkNamespacePath=/run/netns/'+context['names']['gateway']+'\nBindReadOnlyPaths='+str(bootstrap)+':/etc/hosts '+str(resolver)+':/etc/resolv.conf')
+        template = '\n'.join(line+f' --xray-bin {context["xray"]} --openfortivpn-bin {forti_binary}' if line.startswith(('ExecStart=', 'ExecStopPost=')) else line for line in template.splitlines())+'\n'
+        unit.write_text(template)
+        tls = context['work']/'tls'
+        stand.checked('openssl', 'req', '-new', '-newkey', 'rsa:2048', '-nodes', '-subj', '/CN=Forti stand', '-keyout', str(tls/'forti.key'), '-out', str(tls/'forti.csr'))
+        (tls/'forti.ext').write_text('subjectAltName=IP:10.213.0.2,IP:10.214.0.2,DNS:forti-a.example.test\nextendedKeyUsage=serverAuth\n')
+        stand.checked('openssl', 'x509', '-req', '-in', str(tls/'forti.csr'), '-CA', str(tls/'ca.crt'), '-CAkey', str(tls/'ca.key'), '-CAcreateserial', '-days', '1', '-extfile', str(tls/'forti.ext'), '-out', str(tls/'forti.crt'))
+        mode = context['work']/'forti-mode.json'
+        def set_mode(value):
+            temporary=mode.with_suffix('.next')
+            temporary.write_text(json.dumps(value));temporary.replace(mode)
+        set_mode(dict(mode='password'))
+        server = context['spawn']('a', ['python3', repo/'tests/forti_server.py', tls, '10.213.0.2', mode], 'forti-peer')
+        context['ns']('a', 'nft', '-f', '-', input='table inet forti_stand { chain nat { type nat hook postrouting priority srcnat; ip saddr 10.231.0.0/24 oifname "w4211a" masquerade; }; }\n')
+        context['ns']('resource', 'nft', '-f', '-', input='table inet forti_dns { chain dns { type nat hook prerouting priority dstnat; ip daddr 10.220.0.10 udp dport 53 dnat ip to 10.220.0.10:15353; ip daddr 10.220.0.10 tcp dport 53 dnat ip to 10.220.0.10:15353; }; }\n')
+        deadline = time.monotonic()+5
+        while not context['ns']('a','ss','-H','-lnt','sport = :10443').stdout.strip():
+            assert server.poll() is None and time.monotonic()<deadline
+            time.sleep(.05)
+        stand.checked('systemctl', 'daemon-reload')
+        start_attempted = True
+        stand.checked('systemctl', 'start', unit.name)
+        group = control('group', 'create', '--name', 'Forti company')['data']['id']
+        profile = dict(protocol='forti', options=[['host','forti-a.example.test'],['port','10443'],['otp-prompt','Input'],['min-tls','1.2']], inline={'ca-file':(tls/'ca.crt').read_text()})
+        if not legacy:
+            profile['options'].append(['sni','forti-a.example.test'])
+        connection = control('connection', 'import', '--group', group, '--name', 'Forti native', '--protocol', 'forti', '--file', '-', payload=profile)['data']['id']
+        control('group', 'update', group, '--primary', connection, '--probe-file', '-', payload=dict(tcp_ipv4=dict(url='http://10.220.0.10:18080/forti'),udp_ipv4=dict(server='10.220.0.10:15353',query_name='probe.example.test',query_type='A'),dns=dict(query_name='v4.corp.test',query_type='A')))
+        control('rule','create','--group',group,'--destination','corp.test')
+        ipv6_rule = control('rule','create','--group',group,'--destination','fd42:220::/64')['data']['id']
+        control('rule', 'create', '--group', group, '--destination', '10.220.0.0/24')
+        preview = control('routing', 'preview')['data']
+        assert preview['eligibility'][ipv6_rule]['tcp_ipv6']['reason']=='protocol_limit', preview
+        applied = control('routing', 'apply', preview['plan_id'])['data']
+        assert applied['state'] == 'blocked', applied
+        bootstrap_queries = dns_events.read_text().splitlines()
+        assert bootstrap_queries and set(bootstrap_queries)=={'forti-a.example.test'},bootstrap_queries
+        assert applied['capabilities'][group]['udp_ipv6']=='protocol_limit', applied
+        assert not list(runtime.glob('*/management.sock')), 'Forti must not bind an OpenVPN management socket'
+        action = control('connection', 'login', connection)['data']
+        assert action['method'] == 'password', action
+        assert set(action['methods']) >= {'password', 'cookie'}, action
+        assert ('saml' in action['methods']) != legacy,action
+        assert action['challenge_id'], action
+        print('Forti native preparation stays blocked pending explicit authentication', flush=True)
+        def await_auth(expected, seconds=15):
+            deadline = time.monotonic()+seconds
+            while True:
+                value = control('connection','show',connection)['data']
+                if value['authentication']==expected:return value
+                assert time.monotonic()<deadline,value
+                time.sleep(.05)
+        forti_binary.unlink()
+        control('connection','login',connection,'--file','-',payload=dict(challenge_id=action['challenge_id'],username='forti-incomplete-marker'),success=False)
+        control('connection','login',connection,'--file','-',payload=dict(challenge_id=action['challenge_id'],password='forti-password-marker'),success=False)
+        credentials = dict(challenge_id=action['challenge_id'], username='forti-user', password='forti-password-marker')
+        try:
+            native_client.chmod(0o775)
+            control('connection','login',connection,'--file','-','--remember',payload=credentials,success=False)
+        finally:
+            native_client.chmod(0o755)
+        control('connection','login',connection,'--file','-','--remember',payload=credentials)
+        current = await_auth('authenticated')
+        forti_binary.symlink_to(native_client)
+        print('Prepared Forti session retains its resolved native path after a launcher alias disappears',flush=True)
+        assert current['capabilities']==[],current
+        assert current['native_runtime']['dns']=='udp://10.220.0.10:53',current
+        control('connection','login',connection,'--file','-',payload=credentials,success=False)
+        plan = control('routing','preview')['data']['plan_id']
+        applied = control('routing','apply',plan)['data']
+        assert applied['state']=='partial',applied
+        assert applied['capabilities'][group]['tcp_ipv4']=='verified' and applied['capabilities'][group]['udp_ipv4']=='verified',applied
+        for address in ['10.220.0.10','v4.corp.test']:
+            result=context['ns']('client','curl','--noproxy','','--socks5-hostname','127.0.0.1:10880','--max-time','4','-fsS',f'http://{address}:18080/forti')
+            assert json.loads(result.stdout)['peer']=='10.211.0.1',result.stdout
+        reply=context['ns']('client','python3',Path(stand.__file__),'--udp','15354','forti-udp.example.test')
+        assert json.loads(reply.stdout)['answer']=='198.18.1.1'
+        for address in ['fd42:220::10']:
+            result=stand.run('ip','netns','exec',context['names']['client'],'curl','--noproxy','','--socks5-hostname','127.0.0.1:10880','--max-time','2','-fsS',f'http://[{address}]:18080/forti')
+            assert result.returncode!=0,'unsupported Forti IPv6 escaped'
+        print('Real openfortivpn/pppd authentication, private DNS and VLESS TCP/UDP over IPv4 passed; IPv6 blocked',flush=True)
+        set_mode(dict(mode='password', disconnect=True))
+        stand.run('ip','netns','exec',context['names']['client'],'curl','--noproxy','','--socks5-hostname','127.0.0.1:10880','--max-time','2','-fsS','http://10.220.0.10:18080/forti-disconnect')
+        disconnected=await_auth('unknown')
+        assert disconnected['native_runtime']['reason']=='native_tunnel_down',disconnected
+        assert not disconnected['native_runtime']['admitted'] and disconnected['native_runtime']['dns'] is None,disconnected
+        set_mode(dict(mode='password'))
+        control('connection','restart',connection)
+        await_auth('authenticated')
+        print('Stock Forti PPP down notification revokes admission and DNS',flush=True)
+        (record,) = [p for p in state.glob('*.json') if json.loads(p.read_text())['prepared']['id']==connection]
+        private_runtime=runtime/record.stem/'forti-runtime'
+        for path in (native_client, private_runtime):
+            plan=control('routing','preview')['data']['plan_id']
+            assert control('routing','apply',plan)['data']['capabilities'][group]['tcp_ipv4']=='verified'
+            permissions=path.stat().st_mode & 0o777
+            try:
+                path.chmod(permissions | 0o020)
+                control('connection','restart',connection,success=False)
+                failed=control('connection','show',connection)['data']
+                assert failed['authentication']!='authenticated' and not failed['capabilities'],failed
+                assert not failed['native_runtime']['admitted'] and failed['native_runtime']['dns'] is None,failed
+            finally:
+                path.chmod(permissions)
+            control('connection','restart',connection)
+            current = await_auth('authenticated')
+            assert current['capabilities']==[], 'restart reused an earlier native admission'
+        print('Failed restart revokes Forti admission before and after client preflight',flush=True)
+        set_mode(dict(mode='password', password='forti-replacement-marker'))
+        control('connection','restart',connection)
+        rejected=await_auth('failed')
+        assert rejected['native_runtime']['reason']=='authentication_rejected',rejected
+        replacement=control('connection','login',connection)['data']
+        assert replacement['method']=='password' and replacement['challenge_id'],replacement
+        control('connection','login',connection,'--file','-','--remember',payload=dict(challenge_id=replacement['challenge_id'],username='forti-user',password='forti-wrong-marker'))
+        await_auth('failed')
+        set_mode(dict(mode='password'))
+        control('connection','restart',connection)
+        await_auth('authenticated')
+        print('Rejected remembered credentials allow a fresh login and a failed replacement leaves the last working password saved',flush=True)
+        control('connection','forget-auth',connection)
+        max_password = 'p' * 256
+        set_mode(dict(mode='otp', password=max_password))
+        control('connection','restart',connection)
+        await_auth('credentials_required')
+        action = control('connection','login',connection)['data']
+        control('connection','login',connection,'--file','-','--remember',payload=dict(challenge_id=action['challenge_id'],username='forti-user',password=max_password))
+        pending=await_auth('challenge_required')
+        assert not pending['native_runtime']['remembered'],pending
+        challenge = control('connection','login',connection)['data']
+        assert challenge['method']=='text',challenge
+        answer = dict(challenge_id=challenge['challenge_id'],response='forti-otp-marker')
+        control('connection','login',connection,'--file','-','--remember',payload=answer,success=False)
+        control('connection','login',connection,'--file','-',payload=answer)
+        await_auth('authenticated')
+        control('connection','login',connection,'--file','-',payload=answer,success=False)
+        set_mode(dict(mode='otp401', password=max_password))
+        control('connection','restart',connection)
+        await_auth('challenge_required')
+        challenge=control('connection','login',connection)['data']
+        assert challenge['prompt']=='Input access code:',challenge
+        control('connection','login',connection,'--file','-',payload=dict(challenge_id=challenge['challenge_id'],response='forti-401-marker'))
+        await_auth('authenticated')
+        print('Native HTTP 401 form challenge completes through the same login interface',flush=True)
+        set_mode(dict(mode='push', password=max_password))
+        control('connection','restart',connection)
+        await_auth('authenticated')
+        control('connection','forget-auth',connection)
+        set_mode(dict(mode='cookie'))
+        control('connection','restart',connection)
+        await_auth('credentials_required')
+        action = control('connection','login',connection)['data']
+        cookie = dict(challenge_id=action['challenge_id'],method='cookie',cookie='forti-cookie-marker')
+        control('connection','login',connection,'--file','-','--remember',payload=cookie,success=False)
+        control('connection','login',connection,'--file','-',payload=cookie)
+        current=await_auth('authenticated')
+        assert current['capabilities']==[] and not current['native_runtime']['remembered'],current
+        public = json.dumps(control('routing','status'))+json.dumps(current)
+        for marker in ['forti-password-marker','forti-otp-marker','forti-cookie-marker']:
+            assert marker not in public
+            assert all(marker.encode() not in p.read_bytes() for p in state.glob('*.auth'))
+        print('Remember/forget, fresh-session admission, native OTP/push, replay rejection and cookie SSO passed',flush=True)
+        set_mode(dict(mode='password',deny=True))
+        control('connection','restart',connection)
+        await_auth('credentials_required')
+        action=control('connection','login',connection)['data']
+        control('connection','login',connection,'--file','-',payload=dict(challenge_id=action['challenge_id'],username='forti-user',password='forti-password-marker'))
+        rejected=await_auth('failed')
+        assert rejected['native_runtime']['reason']=='authentication_rejected',rejected
+        time.sleep(.2)
+        rejected=control('connection','show',connection)['data']
+        assert rejected['authentication']=='failed' and rejected['native_runtime']['reason']=='authentication_rejected',rejected
+        print('Rejected native credentials keep their terminal authentication reason after client exit',flush=True)
+        set_mode(dict(mode='saml'))
+        control('connection','restart',connection)
+        await_auth('credentials_required')
+        action = control('connection','login',connection)['data']
+        if legacy:
+            rejected=control('connection','login',connection,'--file','-',payload=dict(challenge_id=action['challenge_id'],method='saml'),success=False)
+            assert 'native SAML requires openfortivpn 1.23' in rejected.stderr
+            print('Legacy client rejects native SAML explicitly while retaining cookie SSO',flush=True)
+        else:
+            web = control('connection','login',connection,'--file','-',payload=dict(challenge_id=action['challenge_id'],method='saml'))['data']
+            assert web['authentication']=='browser_required' and web['method']=='web',web
+            forward = web['ssh_forward']
+            callback = Path(forward['remote_socket'])
+            assert forward['local_host']=='127.0.0.1' and forward['local_port']==8020,forward
+            assert callback.parent==runtime and callback.is_socket() and callback.stat().st_mode & 0o777==0o660
+            denied=stand.run('runuser','-u','nobody','--','python3','-c','import socket, sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1])',callback)
+            assert denied.returncode!=0 and 'PermissionError' in denied.stderr, denied.stderr
+            stand.checked('runuser','-u',prefix,'--','test','-w',callback)
+            keys.mkdir(mode=0o700)
+            for label in ['host','operator']:
+                stand.checked('ssh-keygen','-q','-t','ed25519','-N','','-C','Forti acceptance','-f',str(keys/label))
+            host_type, host_key = (keys/'host.pub').read_text().split()[:2]
+            (keys/'known_hosts').write_text(f'[127.0.0.1]:22222 {host_type} {host_key}\n')
+            configuration = keys/'sshd.conf'
+            configuration.write_text(f'Port 22222\nListenAddress 127.0.0.1\nHostKey {keys}/host\nPidFile {keys}/sshd.pid\nAuthorizedKeysFile {keys}/operator.pub\nPermitRootLogin prohibit-password\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM yes\nAllowTcpForwarding local\nAllowStreamLocalForwarding local\nGatewayPorts no\nLogLevel VERBOSE\n')
+            Path('/run/sshd').mkdir(mode=0o755,exist_ok=True)
+            sshd = context['spawn']('gateway',['/usr/sbin/sshd','-D','-e','-f',configuration],'saml-sshd')
+            deadline=time.monotonic()+5
+            while not context['ns']('gateway','ss','-H','-lnt','sport = :22222').stdout.strip():
+                assert sshd.poll() is None and time.monotonic()<deadline
+                time.sleep(.05)
+            forwarding = context['spawn']('gateway',['ssh','-F','/dev/null','-N','-o','BatchMode=yes','-o','ExitOnForwardFailure=yes','-o','IdentitiesOnly=yes','-o','StrictHostKeyChecking=yes','-o',f'UserKnownHostsFile={keys}/known_hosts','-i',keys/'operator','-p','22222','-L',f'127.0.0.1:8020:{callback}','root@127.0.0.1'],'saml-forward')
+            deadline=time.monotonic()+5
+            while not context['ns']('gateway','ss','-H','-lnt','sport = :8020').stdout.strip():
+                assert forwarding.poll() is None and time.monotonic()<deadline
+                time.sleep(.05)
+            rejected=stand.run('ip','netns','exec',context['names']['gateway'],'curl','--noproxy','*','--max-time','3','-fsS','http://127.0.0.1:8020/?id=invalid_test_id')
+            assert rejected.returncode!=0 and callback.is_socket()
+            set_mode(dict(mode='saml',saml_delay=4))
+            time.sleep(max(0, web['expires_at']-time.time()-2))
+            context['ns']('gateway','curl','--noproxy','*','--max-time','5','--max-redirs','3','--cacert',tls/'ca.crt','--resolve','forti-a.example.test:10443:10.213.0.2','-fsSL',web['url'])
+            accepted=control('connection','login',connection)['data']
+            assert accepted['authentication']=='authenticating' and not accepted['requires_input'],accepted
+            assert accepted['expires_at'] > web['expires_at'] and not callback.exists(), accepted
+            current=await_auth('authenticated')
+            settled=control('connection','login',connection)['data']
+            assert settled['authentication']=='authenticated' and not settled['requires_input'],settled
+            assert not any(k in settled for k in ('challenge_id','url','ssh_forward')),settled
+            assert not current['native_runtime']['remembered'] and current['capabilities']==[],current
+            assert 'forti-saml-marker' not in json.dumps(current)
+            replay=stand.run('ip','netns','exec',context['names']['gateway'],'curl','--noproxy','*','--max-time','2','-fsS','http://127.0.0.1:8020/?id=forti-saml-marker')
+            assert replay.returncode!=0,'SAML callback remained open after completion'
+            forwarding.terminate();forwarding.wait(timeout=3);forwarding=None
+            sshd.terminate();sshd.wait(timeout=3);sshd=None
+            print('Native SAML completes through an actual SSH loopback forward and closes its callback after use',flush=True)
+            control('connection','restart',connection)
+            await_auth('credentials_required')
+            action=control('connection','login',connection)['data']
+            pending_web=control('connection','login',connection,'--file','-',payload=dict(challenge_id=action['challenge_id'],method='saml'))['data']
+            started=time.monotonic()
+            while True:
+                pending=control('connection','show',connection)['data']
+                if pending['authentication']!='browser_required':break
+                assert time.monotonic()-started<60,pending
+                time.sleep(.1)
+            assert time.monotonic()-started>=45 and pending['authentication'] in ('expired','unknown','failed'),pending
+            assert not Path(pending_web['ssh_forward']['remote_socket']).exists(), 'expired SAML callback is still open'
+            control('connection','login',connection,'--file','-',payload=dict(challenge_id=pending_web['challenge_id'],method='saml'),success=False)
+            action=control('connection','login',connection)['data']
+            cancelled=control('connection','login',connection,'--file','-',payload=dict(challenge_id=action['challenge_id'],method='saml'))['data']
+            stopped=control('connection','logout',connection)['data']
+            assert stopped['authentication']=='stopped' and not stopped['resources_active'],stopped
+            assert not Path(cancelled['ssh_forward']['remote_socket']).exists(), 'cancelled SAML callback is still open'
+            print('Native SAML deadline and logout close callbacks and reject stale responses',flush=True)
+
+        stand.checked('openssl','req','-new','-newkey','rsa:2048','-nodes','-subj','/CN=Forti stand client','-keyout',str(tls/'client.key'),'-out',str(tls/'client.csr'))
+        (tls/'client.ext').write_text('extendedKeyUsage=clientAuth\n')
+        stand.checked('openssl','x509','-req','-in',str(tls/'client.csr'),'-CA',str(tls/'ca.crt'),'-CAkey',str(tls/'ca.key'),'-CAcreateserial','-days','1','-extfile',str(tls/'client.ext'),'-out',str(tls/'client.crt'))
+        client_profile=json.loads(json.dumps(profile))
+        client_profile['inline'].update({'user-cert':(tls/'client.crt').read_text(),'user-key':(tls/'client.key').read_text()})
+        set_mode(dict(mode='password_certificate'))
+        control('connection','update',connection,'--file','-',payload=client_profile)
+        plan=control('routing','preview')['data']['plan_id'];control('routing','apply',plan)
+        action=control('connection','login',connection)['data']
+        assert action.get('method')=='password' and action.get('challenge_id'), 'a client certificate must not suppress account authentication: '+json.dumps(action)
+        control('connection','login',connection,'--file','-',payload=dict(challenge_id=action['challenge_id'],username='forti-user',password='forti-password-marker'))
+        await_auth('authenticated')
+        print('Client certificate can accompany explicit native account authentication',flush=True)
+        wrong_name=json.loads(json.dumps(profile));wrong_name['options'][0][1]='wrong-name.example.test'
+        set_mode(dict(mode='password'))
+        control('connection','update',connection,'--file','-',payload=wrong_name)
+        plan=control('routing','preview')['data']['plan_id'];control('routing','apply',plan)
+        action=control('connection','login',connection)['data']
+        control('connection','login',connection,'--file','-',payload=dict(challenge_id=action['challenge_id'],username='forti-user',password='forti-password-marker'))
+        failed=await_auth('unknown')
+        assert failed['capabilities']==[] and failed['native_runtime']['reason']=='server_certificate_verification_failed',failed
+        bad_profile=json.loads(json.dumps(profile))
+        bad_profile['inline']['ca-file']=(repo/'tests/fixtures/health-ca.pem').read_text()
+        set_mode(dict(mode='password'))
+        control('connection','update',connection,'--file','-',payload=bad_profile)
+        plan=control('routing','preview')['data']['plan_id'];control('routing','apply',plan)
+        action=control('connection','login',connection)['data']
+        control('connection','login',connection,'--file','-',payload=dict(challenge_id=action['challenge_id'],username='forti-user',password='forti-password-marker'))
+        failed=await_auth('unknown')
+        assert failed['capabilities']==[] and failed['native_runtime']['reason']=='server_certificate_verification_failed',failed
+        pin=hashlib.sha256(ssl.PEM_cert_to_DER_cert((tls/'forti.crt').read_text())).hexdigest().upper()
+        bad_profile['options'].append(['trusted-cert',pin])
+        control('connection','update',connection,'--file','-',payload=bad_profile)
+        plan=control('routing','preview')['data']['plan_id'];control('routing','apply',plan)
+        action=control('connection','login',connection)['data']
+        control('connection','login',connection,'--file','-',payload=dict(challenge_id=action['challenge_id'],username='forti-user',password='forti-password-marker'))
+        await_auth('authenticated')
+        print('Invalid CA fails closed; an explicit native certificate pin permits only the chosen certificate',flush=True)
+        set_mode(dict(mode='certificate'))
+        control('connection','update',connection,'--file','-',payload=client_profile)
+        plan=control('routing','preview')['data']['plan_id'];control('routing','apply',plan)
+        action=control('connection','login',connection)['data']
+        control('connection','login',connection,'--file','-',payload=dict(challenge_id=action['challenge_id'],method='certificate'))
+        await_auth('authenticated')
+        stand.checked('openssl','pkey','-in',str(tls/'client.key'),'-aes-256-cbc','-passout','pass:forti-key-password-marker','-out',str(tls/'encrypted.key'))
+        client_profile['inline']['user-key']=(tls/'encrypted.key').read_text()
+        control('connection','update',connection,'--file','-',payload=client_profile)
+        plan=control('routing','preview')['data']['plan_id'];control('routing','apply',plan)
+        action=control('connection','login',connection)['data']
+        set_mode(dict(mode='cookie'))
+        control('connection','login',connection,'--file','-',payload=dict(challenge_id=action['challenge_id'],method='cookie',cookie='SVPNCOOKIE=forti-cookie-marker'),success=False)
+        control('connection','login',connection,'--file','-',payload=dict(challenge_id=action['challenge_id'],method='cookie',cookie='SVPNCOOKIE=forti-cookie-marker',private_key_password='forti-key-password-marker'))
+        current=await_auth('authenticated')
+        assert not current['native_runtime']['remembered'],current
+        control('connection','forget-auth',connection)
+        assert control('connection','show',connection)['data']['authentication']=='authenticated'
+        assert not list(runtime.glob('*/forti-runtime/forti.conf')), 'passphrase config survived login and forget-auth'
+        control('connection','restart',connection)
+        await_auth('credentials_required')
+        action=control('connection','login',connection)['data']
+        set_mode(dict(mode='certificate'))
+        key_input=dict(challenge_id=action['challenge_id'],method='certificate',private_key_password='forti-key-password-marker')
+        control('connection','login',connection,'--file','-','--remember',payload=key_input)
+        await_auth('authenticated')
+        control('connection','restart',connection)
+        current=await_auth('authenticated')
+        assert current['native_runtime']['remembered'] and current['capabilities']==[],current
+        assert 'forti-key-password-marker' not in json.dumps(current)
+        print('Native certificate-only login, encrypted key and explicit remembered key restart passed',flush=True)
+        mode_b=context['work']/'forti-mode-b.json';mode_b.write_text(json.dumps(dict(mode='password')))
+        context['spawn']('b',['python3',repo/'tests/forti_server.py',tls,'10.214.0.2',mode_b],'forti-peer-b')
+        context['ns']('b','nft','-f','-',input='table inet forti_stand { chain nat { type nat hook postrouting priority srcnat; ip saddr 10.231.0.0/24 oifname "w4212a" masquerade; }; }\n')
+        context['ns']('resource','nft','-f','-',input='add rule inet forti_dns dns ip daddr 10.221.0.10 udp dport 53 dnat ip to 10.221.0.10:15353\nadd rule inet forti_dns dns ip daddr 10.221.0.10 tcp dport 53 dnat ip to 10.221.0.10:15353\n')
+        group_b=control('group','create','--name','Independent Forti company')['data']['id']
+        profile_b=json.loads(json.dumps(profile));profile_b['options'][0][1]='10.214.0.2'
+        control('connection','import','--group',group_b,'--name','Forti B without pin','--protocol','forti','--file','-',payload=profile_b,success=False)
+        profile_b['options'].append(['trusted-cert',pin])
+        connection_b=control('connection','import','--group',group_b,'--name','Forti B','--protocol','forti','--file','-','--dns','udp://10.221.0.10:53',payload=profile_b)['data']['id']
+        probes_b=dict(tcp_ipv4=dict(url='http://10.221.0.10:18080/forti-b'),udp_ipv4=dict(server='10.221.0.10:15353',query_name='probe.example.test',query_type='A'),dns=dict(query_name='v4.dev.corp.test',query_type='A'))
+        control('group','update',group_b,'--primary',connection_b,'--probe-file','-',payload=probes_b)
+        control('rule','create','--group',group_b,'--destination','10.221.0.0/24')
+        control('rule','create','--group',group_b,'--destination','dev.corp.test')
+        reserve=control('connection','import','--group',group,'--name','Same-company VLESS reserve','--protocol','vless','--file','-','--dns','udp://10.220.0.10:53',payload=context['outbound']('10.214.0.2',19002,context['ids']['b']))['data']['id']
+        policy=dict(target='http://health.corp.test:18080/health',required_capabilities=['tcp_ipv4','udp_ipv4'],interval_seconds=1,timeout_seconds=1,failure_threshold=2,recovery_threshold=3)
+        control('group','update',group,'--fallbacks',reserve,'--healthcheck-file','-',payload=policy)
+        plan=control('routing','preview')['data']['plan_id'];control('routing','apply',plan)
+        action_b=control('connection','login',connection_b)['data']
+        control('connection','login',connection_b,'--file','-',payload=dict(challenge_id=action_b['challenge_id'],username='forti-user',password='forti-password-marker'))
+        deadline=time.monotonic()+15
+        while control('connection','show',connection_b)['data']['authentication']!='authenticated':
+            assert time.monotonic()<deadline
+            time.sleep(.05)
+        plan=control('routing','preview')['data']['plan_id'];control('routing','apply',plan)
+        def traffic(address,peer):
+            response=context['ns']('client','curl','--noproxy','','--socks5-hostname','127.0.0.1:10880','--max-time','4','-fsS',f'http://{address}:18080/forti-isolation')
+            assert json.loads(response.stdout)['peer']==peer,response.stdout
+        traffic('v4.corp.test','10.211.0.1');traffic('v4.dev.corp.test','10.212.0.1')
+        assert control('connection','show',connection_b)['data']['effective_dns']=='udp://10.221.0.10:53'
+        def health():
+            report=control('routing','status')['data']['health']
+            assert not report['error'],report
+            return next(g for g in report['groups'] if g['group_id']==group)
+        def selected(expected):
+            deadline=time.monotonic()+40
+            while True:
+                value=health()
+                if value['selected_connection']==expected:return value
+                assert time.monotonic()<deadline,value
+                time.sleep(.1)
+        selected(connection)
+        set_mode(dict(mode='certificate',disconnect=True,logout_delay=4))
+        stand.run('ip','netns','exec',context['names']['client'],'curl','--noproxy','','--socks5-hostname','127.0.0.1:10880','--max-time','1','-fsS','http://10.220.0.10:18080/forti-slow-logout')
+        deadline=time.monotonic()+2.5
+        while time.monotonic()<deadline:
+            other=control('connection','show',connection_b)['data']
+            assert other['native_runtime']['admitted'],other
+            time.sleep(.05)
+        failed=await_auth('unknown')
+        assert failed['native_runtime']['reason']=='native_tunnel_down',failed
+        selected(reserve)
+        traffic('v4.dev.corp.test','10.212.0.1')
+        set_mode(dict(mode='certificate'))
+        control('connection','restart',connection)
+        await_auth('authenticated')
+        selected(connection)
+        print('A slow Forti gateway logout leaves the other company admitted',flush=True)
+        set_mode(dict(mode='certificate',drop_data=True))
+        selected(reserve)
+        assert control('connection','show',connection)['data']['authentication']=='authenticated','the test must break resource access while keeping the native session up'
+        traffic('v4.corp.test','10.212.0.1');traffic('v4.dev.corp.test','10.212.0.1')
+        context['ns']('b','nft','-f','-',input='table inet forti_reserve_fault { chain input { type filter hook input priority -30; tcp dport 19002 reject; }; }\n')
+        selected(None)
+        blocked=stand.run('ip','netns','exec',context['names']['client'],'curl','--noproxy','','--socks5-hostname','127.0.0.1:10880','--max-time','2','-fsS','http://10.220.0.10:18080/forti-blocked-marker')
+        assert blocked.returncode!=0,'all-down Forti traffic escaped'
+        blocked=stand.run('ip','netns','exec',context['names']['client'],'python3',str(Path(stand.__file__)),'--udp','15360','forti-blocked-query.corp.test')
+        assert blocked.returncode!=0,'all-down Forti DNS escaped'
+        assert not any('forti-blocked' in json.loads(line).get('marker','') for line in context['events'].read_text().splitlines()),'protected data or DNS leaked'
+        traffic('v4.dev.corp.test','10.212.0.1');traffic('1.1.1.1','10.210.0.1')
+        context['ns']('b','nft','delete','table','inet','forti_reserve_fault')
+        set_mode(dict(mode='certificate'))
+        recovered=selected(connection)
+        assert recovered['connections'][connection]['successes']>=3,recovered
+        traffic('v4.corp.test','10.211.0.1');traffic('v4.dev.corp.test','10.212.0.1')
+        print('Concurrent overlapping Forti networks, explicit DNS override, real-resource failover/failback, all-down blocking and independent company/direct traffic passed',flush=True)
+        stand.checked('systemctl','restart',prefix+'.service')
+        deadline=time.monotonic()+15
+        while stand.run(str(context['installed']),'status','--socket',str(Path('/run')/prefix/'control.sock')).returncode:
+            assert time.monotonic()<deadline,'control service did not restart'
+            time.sleep(.05)
+        await_auth('authenticated')
+        deadline=time.monotonic()+40
+        while True:
+            recovered=health()
+            if recovered['selected_connection']==connection and recovered['connections'][connection]['eligible'] and recovered['connections'][connection]['successes']>=3:break
+            assert time.monotonic()<deadline,recovered
+            time.sleep(.1)
+        deadline=time.monotonic()+15
+        while control('connection','show',connection_b)['data']['authentication']!='credentials_required':
+            assert time.monotonic()<deadline
+            time.sleep(.05)
+        action_b=control('connection','login',connection_b)['data']
+        control('connection','login',connection_b,'--file','-',payload=dict(challenge_id=action_b['challenge_id'],username='forti-user',password='forti-password-marker'))
+        deadline=time.monotonic()+15
+        while control('connection','show',connection_b)['data']['authentication']!='authenticated':
+            assert time.monotonic()<deadline
+            time.sleep(.05)
+        observed=health()['connections'][connection]['observed_at']
+        while health()['connections'][connection]['observed_at']<=observed+1:
+            assert time.monotonic()<deadline
+            time.sleep(.1)
+        assert control('connection','show',connection_b)['data']['capabilities']==[],'another company healthcheck admitted an unverified restarted session'
+        plan=control('routing','preview')['data']['plan_id'];control('routing','apply',plan)
+        traffic('v4.corp.test','10.211.0.1');traffic('v4.dev.corp.test','10.212.0.1')
+        print('Packaged restart restores remembered keys; another group cannot admit a fresh session without its own verification',flush=True)
+        helper_pid = int(stand.checked('systemctl','show',unit.name,'--property=MainPID','--value').stdout)
+        children = [int(v) for v in Path(f'/proc/{helper_pid}/task/{helper_pid}/children').read_text().split()]
+        records=[json.loads(p.read_text()) for p in state.glob('*.json')]
+        owned=[r for r in records if r['prepared']['id']==connection and not r['paused']]
+        assert len(owned)==1
+        identity=tuple(owned[0]['namespace_identity'])
+        native = [pid for pid in children if Path(f'/proc/{pid}/comm').read_text().strip()=='openfortivpn' and (os.stat(f'/proc/{pid}/ns/net').st_dev,os.stat(f'/proc/{pid}/ns/net').st_ino)==identity]
+        assert len(native)==1,native
+        args = Path(f'/proc/{native[0]}/cmdline').read_bytes().split(b'\0')
+        assert {b'--no-dns',b'--no-routes',b'--pppd-no-peerdns',b'--min-tls'} <= set(args)
+        descendants = [int(v) for v in Path(f'/proc/{native[0]}/task/{native[0]}/children').read_text().split()]
+        ppp = [pid for pid in descendants if Path(f'/proc/{pid}/comm').read_text().strip()=='pppd']
+        assert len(ppp)==1,ppp
+        native_descriptor = os.pidfd_open(native[0]); frozen.append(native_descriptor)
+        signal.pidfd_send_signal(native_descriptor, signal.SIGSTOP)
+        descriptor = os.pidfd_open(ppp[0]); frozen.append(descriptor)
+        signal.pidfd_send_signal(descriptor, signal.SIGSTOP)
+        stopped = control('connection','logout',connection)['data']
+        assert stopped['authentication']=='stopped' and not stopped['resources_active'],stopped
+        assert select.select([descriptor],[],[],0)[0], 'logout returned before its PPP descendant exited'
+        print('Logout stops a PPP descendant even when its separate session ignores graceful termination',flush=True)
+
+    finally:
+        for process in [forwarding,sshd]:
+            if process is not None and process.poll() is None:
+                process.terminate();process.wait(timeout=3)
+        if keys.exists(): shutil.rmtree(keys)
+        for descriptor in frozen:
+            if not select.select([descriptor],[],[],0)[0]:
+                for action in (signal.SIGCONT,signal.SIGTERM):
+                    try: signal.pidfd_send_signal(descriptor,action)
+                    except ProcessLookupError: pass
+                if not select.select([descriptor],[],[],2)[0]: signal.pidfd_send_signal(descriptor,signal.SIGKILL)
+            os.close(descriptor)
+        if start_attempted:
+            stand.checked('systemctl', 'stop', unit.name)
+            result = stand.checked('systemctl','show',unit.name,'--property=Result','--value').stdout.strip()
+            if result != 'success':
+                print('Retained private runtime names:', sorted(str(p.relative_to(runtime)) for p in runtime.rglob('*')), flush=True)
+                raise AssertionError('native cleanup failed; resources retained for inspection')
+        if unit.exists(): unit.unlink()
+        bootstrap.unlink(missing_ok=True)
+        resolver.unlink(missing_ok=True)
+        if alias.exists(): shutil.rmtree(alias)
+        stand.checked('systemctl', 'daemon-reload')
+        for p in [runtime, state]:
+            if p.exists(): shutil.rmtree(p)
+
+
+if __name__ == '__main__':
+    assert sys.argv[3:] in ([],['--legacy-client']), 'unknown Forti stand option'
+    stand.main(sys.argv[1], sys.argv[2], native_acceptance=lambda context: acceptance(context,legacy=bool(sys.argv[3:])))

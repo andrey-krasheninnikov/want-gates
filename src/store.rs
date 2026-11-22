@@ -154,7 +154,7 @@ impl Store {
         }
         let mut names = std::collections::HashSet::new();
         for connection in &config.connections {
-            if !matches!(connection.protocol.as_str(), "vless" | "openvpn")
+            if !matches!(connection.protocol.as_str(), "vless" | "openvpn" | "forti")
                 || id_number(&connection.id, 'c').is_none_or(|n| n > connection.revision)
                 || connection.revision == 0
                 || connection.revision > config.revision
@@ -776,16 +776,16 @@ fn dns_setting(value: Option<&Value>) -> io::Result<Option<String>> {
 
 fn protocol(value: &Value) -> io::Result<()> {
     match text(value)? {
-        "vless" | "openvpn" => Ok(()),
-        "forti" | "wireguard" | "netbird" => Err(invalid(
-            "protocol adapter unavailable; only VLESS and OpenVPN profile import are implemented",
+        "vless" | "openvpn" | "forti" => Ok(()),
+        "wireguard" | "netbird" => Err(invalid(
+            "protocol adapter unavailable; only VLESS, OpenVPN and Forti profile import are implemented",
         )),
         _ => Err(invalid("unsupported protocol")),
     }
 }
 fn summary(c: &Connection) -> Value {
     json!({"id":c.id,"group_id":c.group_id,"name":c.name,"protocol":c.protocol,"revision":c.revision,
-        "dns":c.dns,"allowed_capabilities":c.allowed_capabilities,"verification":{"capabilities":crate::capability::observations(&c.allowed_capabilities,None,false),"observed_at":null},"validation":"structural","authentication":"not_attempted"})
+        "dns":c.dns,"allowed_capabilities":c.allowed_capabilities,"verification":{"capabilities":crate::capability::observations(c,None,false),"observed_at":null},"validation":"structural","authentication":"not_attempted"})
 }
 
 fn id_number(id: &str, prefix: char) -> Option<u64> {

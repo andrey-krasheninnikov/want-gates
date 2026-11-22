@@ -306,8 +306,10 @@ fn transport_at(
     let mut results = std::collections::BTreeMap::new();
     for capability in CAPABILITIES {
         client.check()?;
-        let reason = if !crate::capability::permits(&connection.allowed_capabilities, capability) {
-            "configured_limit".to_owned()
+        let reason = if let Some(reason) =
+            crate::capability::connection_limit(connection, capability)
+        {
+            reason.to_owned()
         } else if only_verified.is_some_and(|m| m.get(capability).is_none_or(|r| r != "verified")) {
             "not_rechecked".to_owned()
         } else {
@@ -434,7 +436,7 @@ pub fn check(
             (None, _, _) => "primary_missing".to_owned(),
             (_, None, _) => "dns_missing".to_owned(),
             (_, _, None) => "probe_missing".to_owned(),
-            (_, Some(server), Some(probe)) => {
+            (Some(connection), Some(server), Some(probe)) => {
                 if only_verified.is_some_and(|m| {
                     m.get(&group.id)
                         .and_then(|r| r.get("dns"))
@@ -443,11 +445,10 @@ pub fn check(
                     "not_rechecked".to_owned()
                 } else {
                     let resolver = crate::policy::Resolver::parse(server)?;
-                    if matrix[&group.id]
-                        .get(&resolver.capability())
-                        .is_some_and(|v| v == "configured_limit")
+                    if let Some(reason) =
+                        crate::capability::connection_limit(connection, &resolver.capability())
                     {
-                        "configured_limit".to_owned()
+                        reason.to_owned()
                     } else if matrix[&group.id]
                         .get(&resolver.capability())
                         .is_none_or(|v| v != "verified")
@@ -520,9 +521,10 @@ fn connection_at(
         (_, None) => "probe_missing".to_owned(),
         (Some(server), Some(probe)) => {
             let resolver = crate::policy::Resolver::parse(server)?;
-            if !crate::capability::permits(&connection.allowed_capabilities, &resolver.capability())
+            if let Some(reason) =
+                crate::capability::connection_limit(connection, &resolver.capability())
             {
-                "configured_limit".to_owned()
+                reason.to_owned()
             } else if results
                 .get(&resolver.capability())
                 .is_none_or(|v| v != "verified")
@@ -883,7 +885,7 @@ fn health_at(
             return Ok(results);
         };
         let resolver = crate::policy::Resolver::parse(server)?;
-        if !crate::capability::permits(&connection.allowed_capabilities, &resolver.capability()) {
+        if !crate::capability::permits_connection(connection, &resolver.capability()) {
             results.insert("health".into(), "dns_capability_missing".into());
             return Ok(results);
         }
@@ -905,7 +907,7 @@ fn health_at(
     let mut target_error = if literal.is_some()
         || !["tcp_ipv4", "tcp_ipv6"]
             .into_iter()
-            .any(|c| crate::capability::permits(&connection.allowed_capabilities, c))
+            .any(|c| crate::capability::permits_connection(connection, c))
     {
         "capability_missing".to_owned()
     } else {
@@ -914,7 +916,7 @@ fn health_at(
     let mut target_ok = false;
     for (kind, capability) in [("A", "tcp_ipv4"), ("AAAA", "tcp_ipv6")] {
         if Instant::now() >= deadline
-            || !crate::capability::permits(&connection.allowed_capabilities, capability)
+            || !crate::capability::permits_connection(connection, capability)
         {
             continue;
         }

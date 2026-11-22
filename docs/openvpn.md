@@ -8,10 +8,11 @@ and probes; its application path stays closed until resource checks pass.
 ## Prerequisites and manual installation
 
 Install the control service using [service operation](service.md). Native routing
-requires Linux with systemd, OpenVPN 2.6.x, Xray 26.9.9, iproute2, nftables,
-`getent`, `sysctl` and `/dev/net/tun`. Executables and their parent directories
-must be controlled by root and unwritable by other users. The default Xray path
-is `/usr/local/x-ui/bin/xray-linux-arm64` or `xray-linux-amd64`.
+requires Linux with systemd, Xray 26.9.9, iproute2, nftables, `getent` and
+`sysctl`. OpenVPN connections also require OpenVPN 2.6.x and `/dev/net/tun`.
+Executables and their parent directories must be controlled by root and unwritable
+by other users. The default Xray path is `/usr/local/x-ui/bin/xray-linux-arm64`
+or `xray-linux-amd64`.
 
 Check the gateway's forwarding policy before enabling native routing. IPv4
 forwarding must already be enabled. IPv6 VPN endpoints additionally require
@@ -182,8 +183,10 @@ The fixture creates its own certificates, VPN servers, namespaces, account and
 units. It uses public CLI commands and VLESS ingress traffic, then cleans its
 owned resources. It requires root and must not run on a live gateway. Native
 acceptance uses synthetic credentials and controllable servers. The helper outage
-case separately checks VLESS monitoring, fallback and native recovery. Corporate
-VPN providers and interactive identity-provider policies need separate live checks.
+case separately checks VLESS monitoring, fallback and native recovery. Run the
+first command with `--mixed-adapters` to test OpenVPN recovery during Forti
+failures. That scenario also requires OpenFortiVPN and PPP. Corporate VPN
+providers and interactive identity-provider policies need separate live checks.
 
 Runtime acceptance covers Linux aarch64, OpenVPN 2.6.19 and Xray 26.9.9.
 The stand exercises UDP over IPv4 and TCP over IPv6 as VPN transports, with

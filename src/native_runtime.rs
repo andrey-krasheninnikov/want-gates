@@ -1,3 +1,5 @@
+#[path = "forti_runtime.rs"]
+mod forti;
 use crate::native::{Observation, Prepared};
 use crate::openvpn_auth::{Authentication, Credentials};
 use crate::store::{private_read, private_write, random_id};
@@ -98,7 +100,8 @@ impl Record {
 struct Instance {
     record: Record,
     auth: Authentication,
-    openvpn: Option<Child>,
+    client: Option<Child>,
+    forti: Option<forti::Session>,
     proxy: Option<Child>,
     listener: Option<UnixListener>,
     management: Option<UnixStream>,
@@ -108,13 +111,44 @@ struct Instance {
     admitted_session: Option<String>,
     proxy_gate: Option<bool>,
 }
+impl Instance {
+    fn new(record: Record, auth: Authentication) -> Self {
+        Self {
+            record,
+            auth,
+            client: None,
+            forti: None,
+            proxy: None,
+            listener: None,
+            management: None,
+            buffer: Vec::new(),
+            environment: None,
+            dns: None,
+            admitted_session: None,
+            proxy_gate: None,
+        }
+    }
+    fn stop_for_restart(&mut self) {
+        self.auth.fail("native_restart_failed");
+        self.admitted_session = None;
+        self.dns = None;
+        self.proxy_gate = None;
+        stop(&mut self.proxy);
+        stop(&mut self.client);
+        self.management = None;
+        self.listener = None;
+        self.forti = None;
+    }
+}
 struct Runtime {
     root: PathBuf,
     directory: PathBuf,
     uid: u32,
     gid: u32,
     xray: PathBuf,
+    openfortivpn: PathBuf,
     instances: BTreeMap<String, Instance>,
+    reaping: Vec<Child>,
 }
 
 fn valid_generation(s: &str) -> bool {
@@ -261,12 +295,17 @@ fn nft(namespace: Option<&str>, script: &str) -> io::Result<()> {
         std::thread::sleep(Duration::from_millis(5));
     }
 }
-fn nft_digest(table: &str) -> io::Result<String> {
-    let mut value: Value = serde_json::from_str(&command(
-        "/usr/sbin/nft",
-        &["-j", "list", "table", "inet", table],
-    )?)
-    .map_err(|_| invalid("invalid native firewall readback"))?;
+fn nft_digest(namespace: Option<&str>, table: &str) -> io::Result<String> {
+    let args = ["-j", "list", "table", "inet", table];
+    let output = if let Some(namespace) = namespace {
+        let mut command_args = vec!["netns", "exec", namespace, "/usr/sbin/nft"];
+        command_args.extend_from_slice(&args);
+        command("/usr/sbin/ip", &command_args)?
+    } else {
+        command("/usr/sbin/nft", &args)?
+    };
+    let mut value: Value =
+        serde_json::from_str(&output).map_err(|_| invalid("invalid native firewall readback"))?;
     fn clean(v: &mut Value) {
         match v {
             Value::Object(o) => {
@@ -292,27 +331,42 @@ fn ns(record: &Record, args: &[&str]) -> io::Result<String> {
     all.extend_from_slice(args);
     command("/usr/sbin/ip", &all)
 }
+fn child_exited(child: &Child) -> io::Result<bool> {
+    let mut information = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    // SAFETY: waitid initializes this sized buffer and WNOWAIT preserves the owned PID until stop reaps it.
+    if unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id(),
+            information.as_mut_ptr(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful waitid initialized information; si_pid is valid for child status.
+    Ok(unsafe { information.assume_init().si_pid() } != 0)
+}
 fn stop(child: &mut Option<Child>) {
     if let Some(mut child) = child.take() {
-        if child.try_wait().ok().flatten().is_some() {
+        if child_exited(&child).is_err() {
+            let _ = child.wait();
             return;
         }
-        // SAFETY: the PID belongs to this owned child; it is reaped before return.
+        // SAFETY: namespace_child creates a separate process group. WNOWAIT keeps its leader PID owned until wait below.
         unsafe {
-            libc::kill(child.id() as i32, libc::SIGTERM);
+            libc::kill(-(child.id() as i32), libc::SIGTERM);
         }
         let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if child.try_wait().ok().flatten().is_some() {
-                break;
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                break;
-            }
+        while Instant::now() < deadline && child_exited(&child).is_ok_and(|exited| !exited) {
             std::thread::sleep(Duration::from_millis(10));
         }
+        // SAFETY: the unreaped group leader prevents PID reuse while remaining native descendants are stopped.
+        unsafe {
+            libc::kill(-(child.id() as i32), libc::SIGKILL);
+        }
+        let _ = child.wait();
     }
 }
 fn namespace_child(
@@ -321,8 +375,14 @@ fn namespace_child(
     args: &[&str],
     stdin: Stdio,
     uid: Option<(u32, u32)>,
+    forti: Option<(&Path, &File)>,
 ) -> io::Result<Child> {
     let namespace = File::open(Path::new("/run/netns").join(&record.namespace))?;
+    let config_fd = forti.map(|(_, config)| config.as_raw_fd());
+    let mounts = forti
+        .map(|(directory, _)| forti::mounts(directory))
+        .transpose()?
+        .unwrap_or_default();
     let mut cmd = Command::new(program);
     cmd.args(args)
         .env_clear()
@@ -335,6 +395,34 @@ fn namespace_child(
     // SAFETY: after fork this closure uses only async-signal-safe Linux syscalls, then execs the fixed executable.
     unsafe {
         cmd.pre_exec(move || {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if !mounts.is_empty() {
+                if libc::unshare(libc::CLONE_NEWNS) != 0
+                    || libc::mount(
+                        std::ptr::null(),
+                        c"/".as_ptr(),
+                        std::ptr::null(),
+                        libc::MS_REC | libc::MS_PRIVATE,
+                        std::ptr::null(),
+                    ) != 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                for (source, target) in &mounts {
+                    if libc::mount(
+                        source.as_ptr(),
+                        target.as_ptr(),
+                        std::ptr::null(),
+                        libc::MS_BIND,
+                        std::ptr::null(),
+                    ) != 0
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+            }
             if libc::setns(namespace.as_raw_fd(), libc::CLONE_NEWNET) != 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -371,6 +459,12 @@ fn namespace_child(
                         return Err(io::Error::last_os_error());
                     }
                 }
+            }
+            // Only the selected Forti child inherits its memory-backed config.
+            if let Some(fd) = config_fd
+                && libc::fcntl(fd, libc::F_SETFD, 0) != 0
+            {
+                return Err(io::Error::last_os_error());
             }
             // Changing UID clears PDEATHSIG, so arm it after credentials and check the parent again.
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 || libc::getppid() != parent
@@ -451,11 +545,14 @@ fn private_text(path: &Path, text: &str) -> io::Result<()> {
     file.sync_all()
 }
 fn profile(value: &Value) -> io::Result<crate::openvpn::Profile> {
+    if value["protocol"] == "forti" {
+        return crate::forti::decoded_profile(value);
+    }
     let mut value = crate::openvpn::parse(&value.to_string())?;
     value.as_object_mut().unwrap().remove("protocol");
     serde_json::from_value(value).map_err(|_| invalid("invalid native profile"))
 }
-fn endpoints(profile: &crate::openvpn::Profile) -> io::Result<Vec<Endpoint>> {
+fn endpoints(profile: &crate::openvpn::Profile, absolute_dns: bool) -> io::Result<Vec<Endpoint>> {
     let protocol = profile
         .options
         .iter()
@@ -484,7 +581,14 @@ fn endpoints(profile: &crate::openvpn::Profile) -> io::Result<Vec<Endpoint>> {
         let addresses = if let Ok(ip) = remote[1].parse::<IpAddr>() {
             vec![ip]
         } else {
-            command("/usr/bin/getent", &["ahosts", &remote[1]])
+            let host = remote[1].as_str();
+            let resolved = if absolute_dns {
+                command("/usr/bin/getent", &["-s", "files", "ahostsv4", host])
+                    .or_else(|_| command("/usr/bin/getent", &["ahostsv4", &format!("{host}.")]))
+            } else {
+                command("/usr/bin/getent", &["ahosts", host])
+            };
+            resolved
                 .map_err(|_| invalid("VPN endpoint bootstrap resolution failed or timed out"))?
                 .lines()
                 .filter_map(|line| line.split_whitespace().next()?.parse::<IpAddr>().ok())
@@ -524,7 +628,7 @@ fn endpoints(profile: &crate::openvpn::Profile) -> io::Result<Vec<Endpoint>> {
     }
     if result.is_empty() || result.len() > 32 {
         return Err(invalid(
-            "OpenVPN endpoints have no supported unicast addresses or exceed the endpoint limit",
+            "VPN endpoints have no supported unicast addresses or exceed the endpoint limit",
         ));
     }
     Ok(result)
@@ -542,20 +646,20 @@ impl Runtime {
             record.prepared.id, record.prepared.profile_digest
         ))
     }
-    fn preflight(&self) -> io::Result<Value> {
+    fn preflight(&self, protocols: &[String]) -> io::Result<Value> {
         for path in [
             "/usr/sbin/ip",
             "/usr/sbin/nft",
-            "/usr/sbin/openvpn",
             "/usr/bin/getent",
             "/usr/sbin/sysctl",
             "/usr/bin/true",
         ] {
             executable(Path::new(path))?;
         }
-        let version = command("/usr/sbin/openvpn", &["--version"])?;
-        if !version.starts_with("OpenVPN 2.6.") {
-            return Err(invalid("native runtime requires supported OpenVPN 2.6.x"));
+        let mut versions = serde_json::Map::new();
+        for protocol in protocols {
+            let (name, version) = self.client_version(protocol)?;
+            versions.insert(name.into(), json!(version));
         }
         if !command(
             self.xray
@@ -567,19 +671,49 @@ impl Runtime {
         {
             return Err(invalid("native runtime requires Xray 26.9.9"));
         }
-        if !Path::new("/dev/net/tun").exists() {
-            return Err(invalid(
-                "TUN unavailable; provide /dev/net/tun to the native runtime",
-            ));
-        }
         if fs::read_to_string("/proc/sys/net/ipv4/ip_forward")?.trim() != "1" {
             return Err(invalid(
                 "IPv4 forwarding disabled; enable net.ipv4.ip_forward manually after checking host routing",
             ));
         }
         Ok(
-            json!({"openvpn":version.lines().next(),"xray":"26.9.9","ipv4_forwarding":true,"ipv6_forwarding":fs::read_to_string("/proc/sys/net/ipv6/conf/all/forwarding").ok().is_some_and(|s|s.trim()=="1")}),
+            json!({"clients":versions,"xray":"26.9.9","ipv4_forwarding":true,"ipv6_forwarding":fs::read_to_string("/proc/sys/net/ipv6/conf/all/forwarding").ok().is_some_and(|s|s.trim()=="1")}),
         )
+    }
+    fn client_version(&self, protocol: &str) -> io::Result<(&'static str, String)> {
+        match protocol {
+            "openvpn" => {
+                executable(Path::new("/usr/sbin/openvpn"))?;
+                let version = command("/usr/sbin/openvpn", &["--version"])?;
+                if !version.starts_with("OpenVPN 2.6.") {
+                    return Err(invalid("native runtime requires supported OpenVPN 2.6.x"));
+                }
+                if !Path::new("/dev/net/tun").exists() {
+                    return Err(invalid(
+                        "TUN unavailable; provide /dev/net/tun to the native runtime",
+                    ));
+                }
+                Ok(("openvpn", version.lines().next().unwrap().into()))
+            }
+            "forti" => {
+                let openfortivpn = forti::checked_executable(&self.openfortivpn)?;
+                forti::checked_executable(Path::new("/usr/sbin/pppd"))?;
+                let version = command(
+                    openfortivpn
+                        .to_str()
+                        .ok_or_else(|| invalid("invalid Forti executable path"))?,
+                    &["--version"],
+                )?;
+                forti::version(&version)?;
+                if !Path::new("/dev/ppp").exists() {
+                    return Err(invalid(
+                        "PPP unavailable; provide kernel PPP and /dev/ppp to the native runtime",
+                    ));
+                }
+                Ok(("openfortivpn", version.trim().into()))
+            }
+            _ => Err(invalid("unsupported native preflight protocol")),
+        }
     }
     fn prepare(&mut self, id: &str, generation: &str, value: &Value) -> io::Result<Value> {
         if !valid_id(id) || !valid_generation(generation) {
@@ -597,8 +731,28 @@ impl Runtime {
             }
             return Ok(json!(instance.record.prepared));
         }
-        self.preflight()?;
-        let endpoints = endpoints(&profile)?;
+        let protocol = value["protocol"]
+            .as_str()
+            .ok_or_else(|| invalid("native protocol required"))?;
+        self.preflight(&[protocol.to_owned()])?;
+        let endpoints = if protocol == "forti" {
+            let host = crate::forti::option(&profile, "host").unwrap();
+            let port = crate::forti::option(&profile, "port").unwrap_or("443");
+            endpoints(
+                &crate::openvpn::Profile {
+                    options: vec![vec![
+                        "remote".into(),
+                        host.into(),
+                        port.into(),
+                        "tcp4-client".into(),
+                    ]],
+                    inline: BTreeMap::new(),
+                },
+                true,
+            )?
+        } else {
+            endpoints(&profile, false)?
+        };
         if endpoints.iter().any(|e| e.address.is_ipv6())
             && fs::read_to_string("/proc/sys/net/ipv6/conf/all/forwarding")?.trim() != "1"
         {
@@ -671,7 +825,7 @@ impl Runtime {
         self.save(&record)?;
         let result: io::Result<()> = (|| {
             self.create_network(&mut record)?;
-            let instance = self.start(record.clone())?;
+            let instance = self.start(record.clone(), true)?;
             self.instances.insert(generation.into(), instance);
             Ok(())
         })();
@@ -683,7 +837,8 @@ impl Runtime {
                 Instance {
                     record,
                     auth,
-                    openvpn: None,
+                    client: None,
+                    forti: None,
                     proxy: None,
                     listener: None,
                     management: None,
@@ -909,10 +1064,7 @@ impl Runtime {
                 )?;
             }
         }
-        self.firewall(record)?;
-        record.firewall_digest = Some(nft_digest(&format!("wgates_{generation}"))?);
-        self.save(record)?;
-        Ok(())
+        self.firewall(record)
     }
     fn firewall(&self, r: &mut Record) -> io::Result<()> {
         let mut forward = String::new();
@@ -945,22 +1097,24 @@ impl Runtime {
                 r.interface, e.address, e.protocol, e.port
             );
         }
-        nft(
-            None,
-            &format!(
-                "create table inet wgates_{}\ntable inet wgates_{} {{ comment \"{}\"; chain input {{ type filter hook input priority -10; iifname \"{}\" icmpv6 type {{nd-neighbor-solicit,nd-neighbor-advert}} accept; iifname \"{}\" ct state established,related accept; iifname \"{}\" drop; }}; chain forward {{ type filter hook forward priority -10; {forward} iifname \"{}\" drop; oifname \"{}\" drop; }}; chain nat {{ type nat hook postrouting priority srcnat; {nat} }}; }}",
-                r.prepared.generation,
-                r.prepared.generation,
-                r.prepared.generation,
-                r.interface,
-                r.interface,
-                r.interface,
-                r.interface,
-                r.interface
-            ),
-        )?;
-        r.firewall_digest = Some(nft_digest(&format!("wgates_{}", r.prepared.generation))?);
+        let table = format!("wgates_{}", r.prepared.generation);
+        let nonce = random_id()?;
+        let host_rules = format!(
+            "create table inet {table}\ntable inet {table} {{ comment \"{nonce}\"; chain input {{ type filter hook input priority -10; iifname \"{}\" icmpv6 type {{nd-neighbor-solicit,nd-neighbor-advert}} accept; iifname \"{}\" ct state established,related accept; iifname \"{}\" drop; }}; chain forward {{ type filter hook forward priority -10; {forward} iifname \"{}\" drop; oifname \"{}\" drop; }}; chain nat {{ type nat hook postrouting priority srcnat; {nat} }}; }}",
+            r.interface, r.interface, r.interface, r.interface, r.interface
+        );
+        // Record the kernel's canonical rules before installing any host rules.
+        nft(Some(&r.namespace), &host_rules)?;
+        let expected = nft_digest(Some(&r.namespace), &table)?;
+        nft(Some(&r.namespace), &format!("delete table inet {table}"))?;
+        r.firewall_digest = Some(expected.clone());
         self.save(r)?;
+        nft(None, &host_rules)?;
+        if nft_digest(None, &table)? != expected {
+            return Err(invalid(
+                "native firewall readback differs from the prepared rules",
+            ));
+        }
         nft(
             Some(&r.namespace),
             &format!(
@@ -969,16 +1123,9 @@ impl Runtime {
             ),
         )
     }
-    fn start(&self, record: Record) -> io::Result<Instance> {
+    fn start(&self, record: Record, automatic_forti: bool) -> io::Result<Instance> {
         let dir = self.directory.join(&record.prepared.generation);
         secure_directory(&dir, 0o700, 0o077)?;
-        let socket = dir.join("management.sock");
-        if socket.exists() {
-            fs::remove_file(&socket)?;
-        }
-        let listener = UnixListener::bind(&socket)?;
-        listener.set_nonblocking(true)?;
-        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
         let auth_path = self.auth_path(&record);
         let (credentials, remembered) = match private_read(&auth_path, 32768) {
             Ok(bytes) => (
@@ -989,20 +1136,38 @@ impl Runtime {
             Err(e) if e.kind() == io::ErrorKind::NotFound => (Credentials::default(), false),
             Err(e) => return Err(e),
         };
-        let auth = Authentication::new(credentials, remembered)?;
-        let mut instance = Instance {
-            record,
-            auth,
-            openvpn: None,
-            proxy: None,
-            listener: Some(listener),
-            management: None,
-            buffer: Vec::new(),
-            environment: None,
-            dns: None,
-            admitted_session: None,
-            proxy_gate: None,
+        let credentials = if !automatic_forti && record.profile["protocol"] == "forti" {
+            Credentials::default()
+        } else {
+            credentials
         };
+        let auth = Authentication::new(credentials, remembered)?;
+        let mut instance = Instance::new(record, auth);
+        if instance.record.profile["protocol"] == "forti" {
+            let mut driver = forti::Session::new(
+                &instance.record,
+                &dir,
+                &self.openfortivpn,
+                &mut instance.auth,
+            )?;
+            if automatic_forti {
+                driver.automatic(&instance.record, &mut instance.auth, &mut instance.client)?;
+            }
+            instance.forti = Some(driver);
+            if instance.record.paused {
+                instance.auth.state = "stopped".into();
+                instance.auth.reason = "operator_stopped".into();
+            }
+            return Ok(instance);
+        }
+        let socket = dir.join("management.sock");
+        if socket.exists() {
+            fs::remove_file(&socket)?;
+        }
+        let listener = UnixListener::bind(&socket)?;
+        listener.set_nonblocking(true)?;
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+        instance.listener = Some(listener);
         if !instance.record.paused {
             let profile = profile(&instance.record.profile)?;
             let mut text = String::new();
@@ -1066,11 +1231,12 @@ impl Runtime {
                 fs::remove_file(&path)?;
             }
             private_text(&path, &text)?;
-            instance.openvpn = Some(namespace_child(
+            instance.client = Some(namespace_child(
                 &instance.record,
                 Path::new("/usr/sbin/openvpn"),
                 &["--config", path.to_str().unwrap()],
                 Stdio::null(),
+                None,
                 None,
             )?);
         } else {
@@ -1078,6 +1244,54 @@ impl Runtime {
             instance.auth.reason = "operator_stopped".into();
         }
         Ok(instance)
+    }
+    fn restore(
+        &self,
+        mut record: Record,
+        network_clean: bool,
+        client_available: bool,
+    ) -> io::Result<Instance> {
+        let reason = if !network_clean || self.cleanup_runtime_files(&record).is_err() {
+            "native_cleanup_required"
+        } else if !client_available {
+            "native_adapter_unavailable"
+        } else {
+            match self
+                .create_network(&mut record)
+                .and_then(|()| self.start(record.clone(), true))
+            {
+                Ok(instance) => return Ok(instance),
+                Err(_) => {
+                    if self.cleanup_network(&mut record)?.is_none()
+                        && self.cleanup_runtime_files(&record).is_ok()
+                    {
+                        "native_restore_failed"
+                    } else {
+                        "native_cleanup_required"
+                    }
+                }
+            }
+        };
+        let mut auth = Authentication::new(Credentials::default(), false)?;
+        auth.fail(reason);
+        Ok(Instance::new(record, auth))
+    }
+    fn restart(&self, instance: &mut Instance, automatic_forti: bool) -> io::Result<()> {
+        instance.stop_for_restart();
+        self.client_version(instance.record.profile["protocol"].as_str().unwrap_or(""))?;
+        if Self::forti_processes_remain(&instance.record)? {
+            return Err(invalid("native Forti namespace still has active processes"));
+        }
+        instance.record.paused = false;
+        self.save(&instance.record)?;
+        if instance.record.namespace_identity.is_none()
+            && let Err(error) = self.create_network(&mut instance.record)
+        {
+            instance.auth.fail("native_cleanup_required");
+            return Err(error);
+        }
+        *instance = self.start(instance.record.clone(), automatic_forti)?;
+        Ok(())
     }
     fn proxy(&self, instance: &mut Instance, gate: bool) -> io::Result<()> {
         if instance.proxy_gate == Some(gate)
@@ -1100,90 +1314,157 @@ impl Runtime {
             &["run", "-config", "stdin:"],
             Stdio::from(File::open(&path)?),
             Some((self.uid, self.gid)),
+            None,
         )?);
         instance.proxy_gate = Some(gate);
         Ok(())
     }
-    fn cleanup(&self, record: &mut Record, forget: bool) -> io::Result<()> {
+    fn forti_processes_remain(record: &Record) -> io::Result<bool> {
+        let Some(identity) = record
+            .namespace_identity
+            .filter(|_| record.profile["protocol"] == "forti")
+        else {
+            return Ok(false);
+        };
+        // A pppd descendant can outlive the helper and its namespace bind mount.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while fs::read_dir("/proc")?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .as_encoded_bytes()
+                    .iter()
+                    .all(u8::is_ascii_digit)
+            })
+            .any(|entry| {
+                fs::metadata(entry.path().join("ns/net"))
+                    .is_ok_and(|meta| (meta.dev(), meta.ino()) == identity)
+            })
+        {
+            if Instant::now() >= deadline {
+                return Ok(true);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Ok(false)
+    }
+    fn cleanup_network(&self, record: &mut Record) -> io::Result<Option<&'static str>> {
+        let ns_path = Path::new("/run/netns").join(&record.namespace);
         let table = format!("wgates_{}", record.prepared.generation);
         let tables: Value =
             serde_json::from_str(&command("/usr/sbin/nft", &["-j", "list", "tables"])?)?;
-        let present = tables["nftables"].as_array().is_some_and(|a| {
-            a.iter()
-                .any(|v| v["table"]["family"] == "inet" && v["table"]["name"] == table)
-        });
+        let present = tables["nftables"]
+            .as_array()
+            .ok_or_else(|| invalid("invalid native firewall table list"))?
+            .iter()
+            .any(|v| v["table"]["family"] == "inet" && v["table"]["name"] == table);
+        // Detach the verified bridge before leaving any retained namespace or firewall in place.
+        if let Some(reason) = Self::detach_bridge(record)? {
+            return Ok(Some(reason));
+        }
         if present {
-            let actual = nft_digest(&table)?;
+            let Ok(actual) = nft_digest(None, &table) else {
+                return Ok(Some(
+                    "native firewall could not be inspected; retain it for inspection",
+                ));
+            };
             if record.firewall_digest.as_ref() != Some(&actual) {
-                return Err(invalid(
-                    "owned native firewall changed or ownership is uncertain; retain resources for inspection",
+                return Ok(Some(
+                    "native firewall ownership changed; retain it for inspection",
                 ));
             }
-            nft(None, &format!("delete table inet {table}"))?;
+        }
+        if Self::forti_processes_remain(record)? {
+            return Ok(Some("native Forti namespace still has active processes"));
+        }
+        if present && nft(None, &format!("delete table inet {table}")).is_err() {
+            return Ok(Some("native firewall removal could not be confirmed"));
         }
         record.firewall_digest = None;
         self.save(record)?;
-        let ns_path = Path::new("/run/netns").join(&record.namespace);
-        if ns_path.exists() {
-            let meta = fs::symlink_metadata(&ns_path)?;
+        let ns_meta = match fs::symlink_metadata(&ns_path) {
+            Ok(meta) => Some(meta),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(_) => return Ok(Some("native namespace could not be inspected")),
+        };
+        if let Some(meta) = ns_meta {
             let identity = (meta.dev(), meta.ino());
             if record.namespace_identity == Some(identity) {
                 let path = CString::new(ns_path.as_os_str().as_encoded_bytes())
                     .map_err(|_| invalid("invalid namespace path"))?;
                 // SAFETY: fresh metadata confirms this exact owned namespace mount before detaching it.
                 if unsafe { libc::umount2(path.as_ptr(), libc::MNT_DETACH) } != 0 {
-                    return Err(io::Error::last_os_error());
+                    return Ok(Some("native namespace mount could not be detached"));
                 }
             } else if record.namespace_file != Some(identity) {
-                return Err(invalid(
+                return Ok(Some(
                     "native namespace ownership is uncertain; inspect retained resources",
                 ));
             }
-            let meta = fs::symlink_metadata(&ns_path)?;
+            let Ok(meta) = fs::symlink_metadata(&ns_path) else {
+                return Ok(Some("native namespace file could not be inspected"));
+            };
             if record.namespace_file != Some((meta.dev(), meta.ino()))
                 || !meta.is_file()
                 || meta.uid() != 0
                 || meta.nlink() != 1
             {
-                return Err(invalid(
+                return Ok(Some(
                     "native namespace file changed; retain it for inspection",
                 ));
             }
-            fs::remove_file(&ns_path)?;
+            if fs::remove_file(&ns_path).is_err() {
+                return Ok(Some("native namespace file could not be removed"));
+            }
         }
         record.namespace_identity = None;
         record.namespace_file = None;
         self.save(record)?;
+        Ok(None)
+    }
+    fn detach_bridge(record: &Record) -> io::Result<Option<&'static str>> {
         let links: Value =
             serde_json::from_str(&command("/usr/sbin/ip", &["-d", "-j", "link", "show"])?)?;
         if let Some(link) = links
             .as_array()
-            .unwrap()
+            .ok_or_else(|| invalid("invalid native link list"))?
             .iter()
             .find(|v| v["ifname"] == record.interface)
         {
             if link["ifalias"] != record.prepared.generation {
-                return Err(invalid(
+                return Ok(Some(
                     "native link ownership changed; retain it for inspection",
                 ));
             }
-            let deletion = command("/usr/sbin/ip", &["link", "delete", &record.interface]);
+            let _ = command("/usr/sbin/ip", &["link", "delete", &record.interface]);
             let remaining: Value =
                 serde_json::from_str(&command("/usr/sbin/ip", &["-j", "link", "show"])?)?;
             if remaining
                 .as_array()
-                .is_none_or(|links| links.iter().any(|link| link["ifname"] == record.interface))
+                .ok_or_else(|| invalid("invalid native link list"))?
+                .iter()
+                .any(|link| link["ifname"] == record.interface)
             {
-                return Err(deletion
-                    .err()
-                    .unwrap_or_else(|| invalid("native link removal could not be confirmed")));
+                return Ok(Some("native link removal could not be confirmed"));
             }
         }
+        Ok(None)
+    }
+    fn cleanup_runtime_files(&self, record: &Record) -> io::Result<()> {
         let dir = self.directory.join(&record.prepared.generation);
         if dir.exists() {
             secure_directory(&dir, 0o700, 0o077)?;
             for file in fs::read_dir(&dir)? {
                 let path = file?.path();
+                if path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("forti-"))
+                {
+                    forti::cleanup(&path)?;
+                    continue;
+                }
                 if !matches!(
                     path.file_name().and_then(|n| n.to_str()),
                     Some("management.sock" | "openvpn.conf" | "proxy.json")
@@ -1198,7 +1479,13 @@ impl Runtime {
             }
             fs::remove_dir(dir)?;
         }
-        record.namespace_identity = None;
+        Ok(())
+    }
+    fn cleanup(&self, record: &mut Record, forget: bool) -> io::Result<()> {
+        if let Some(reason) = self.cleanup_network(record)? {
+            return Err(invalid(reason));
+        }
+        self.cleanup_runtime_files(record)?;
         if forget {
             if !self.instances.values().any(|i| {
                 i.record.prepared.id == record.prepared.id
@@ -1225,13 +1512,26 @@ impl Runtime {
             dns: instance.dns.clone(),
             admitted: instance.admitted_session.as_ref() == Some(&instance.auth.session),
             resources_active: instance.record.namespace_identity.is_some()
-                || instance.openvpn.is_some()
+                || instance.client.is_some()
                 || instance.proxy.is_some(),
             expires_at: instance.auth.expires_at,
             remembered: instance.auth.remembered,
         }
     }
+    fn stop_in_poll(&mut self, process: &mut Option<Child>, forti: bool) {
+        if !forti {
+            stop(process);
+        } else if let Some(child) = process.take()
+            && child_exited(&child).is_ok()
+        {
+            // SAFETY: waitid with WNOWAIT still holds the owned group leader's PID.
+            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+            self.reaping.push(child);
+        }
+    }
     fn poll(&mut self) {
+        self.reaping
+            .retain_mut(|child| matches!(child.try_wait(), Ok(None)));
         let keys: Vec<_> = self.instances.keys().cloned().collect();
         for key in keys {
             let mut instance = self.instances.remove(&key).unwrap();
@@ -1241,26 +1541,40 @@ impl Runtime {
                 instance.auth.reason = error.to_string();
                 instance.dns = None;
                 instance.admitted_session = None;
-                stop(&mut instance.proxy);
+                let forti = instance.forti.is_some();
+                self.stop_in_poll(&mut instance.proxy, forti);
                 instance.proxy_gate = None;
-                stop(&mut instance.openvpn);
+                self.stop_in_poll(&mut instance.client, forti);
+                if let Some(driver) = instance.forti.as_mut() {
+                    driver.stopped();
+                }
                 instance.management = None;
             }
             self.instances.insert(key, instance);
         }
     }
-    fn poll_instance(&self, i: &mut Instance) -> io::Result<()> {
-        if let Some(reason) = child_diagnostic(&mut i.openvpn)?.or(child_diagnostic(&mut i.proxy)?)
+    fn poll_instance(&mut self, i: &mut Instance) -> io::Result<()> {
+        let forti = i.forti.is_some();
+        if let Some(reason) = (if !forti {
+            child_diagnostic(&mut i.client)?
+        } else {
+            None
+        })
+        .or(child_diagnostic(&mut i.proxy)?)
         {
             i.auth.reason = reason.into();
         }
 
-        if i.auth.expire() {
+        let awaiting_callback = i
+            .forti
+            .as_mut()
+            .is_some_and(|driver| driver.poll_callback(&mut i.auth));
+        if !awaiting_callback && i.auth.expire() {
             i.dns = None;
             i.admitted_session = None;
-            stop(&mut i.proxy);
+            self.stop_in_poll(&mut i.proxy, forti);
             i.proxy_gate = None;
-            stop(&mut i.openvpn);
+            self.stop_in_poll(&mut i.client, forti);
             i.management = None;
         }
         if let Some(child) = i.proxy.as_mut()
@@ -1268,19 +1582,54 @@ impl Runtime {
         {
             return Err(invalid("native proxy exited"));
         }
-        if let Some(child) = i.openvpn.as_mut()
-            && child.try_wait()?.is_some()
+        if let Some(child) = i.client.as_mut()
+            && child_exited(child)?
         {
-            i.openvpn = None;
-            i.auth.fail("native_client_exited");
+            if let Some(driver) = i.forti.as_mut() {
+                driver.poll(&i.record, &mut i.auth, child)?;
+            }
+            stop(&mut i.client);
+            if !matches!(i.auth.state.as_str(), "failed" | "expired") {
+                i.auth.fail("native_client_exited");
+            }
             i.dns = None;
             i.admitted_session = None;
-            stop(&mut i.proxy);
+            self.stop_in_poll(&mut i.proxy, forti);
             i.proxy_gate = None;
             i.management = None;
         }
+        if let Some(driver) = i.forti.as_mut() {
+            if let Some(child) = i.client.as_mut() {
+                let dns = driver.poll(&i.record, &mut i.auth, child)?;
+                if i.dns.is_some() && i.dns != dns {
+                    i.auth.session = random_id()?;
+                    i.admitted_session = None;
+                }
+                i.dns = dns;
+                if i.auth.state == "authenticated" && driver.remember_pending {
+                    private_write(&self.auth_path(&i.record), &i.auth.credentials)
+                        .map_err(|_| invalid("Forti credentials could not be saved"))?;
+                    driver.remember_pending = false;
+                    i.auth.remembered = true;
+                }
+            } else {
+                driver.stopped();
+                i.dns = None;
+                if i.auth.state == "authenticated" {
+                    i.auth.fail("native_client_exited");
+                }
+            }
+            if i.client.is_some() && i.auth.state == "authenticated" {
+                self.proxy(i, i.admitted_session.as_ref() == Some(&i.auth.session))?;
+            } else {
+                i.admitted_session = None;
+                self.stop_in_poll(&mut i.proxy, true);
+                i.proxy_gate = None;
+            }
+            return Ok(());
+        }
         if i.management.is_none()
-            && i.openvpn.is_some()
+            && i.client.is_some()
             && let Some(listener) = &i.listener
         {
             match listener.accept() {
@@ -1368,7 +1717,8 @@ impl Runtime {
             .as_str()
             .ok_or_else(|| invalid("native command required"))?;
         let fields: &[&str] = match command {
-            "preflight" | "list" => &[],
+            "preflight" => &["protocols"],
+            "list" => &[],
             "prepare" => &["id", "generation", "profile"],
             "state" | "logout" | "restart" | "forget-auth" | "release" => &["generation"],
             "login" => &["generation", "credentials", "remember"],
@@ -1385,7 +1735,18 @@ impl Runtime {
             return Err(invalid("native remember boolean required"));
         }
         if command == "preflight" {
-            return self.preflight();
+            let protocols: Vec<String> = request
+                .get("protocols")
+                .map(|v| {
+                    serde_json::from_value(v.clone())
+                        .map_err(|_| invalid("invalid native preflight protocols"))
+                })
+                .transpose()?
+                .unwrap_or_default();
+            if protocols.len() > 2 {
+                return Err(invalid("native preflight protocol limit exceeded"));
+            }
+            return self.preflight(&protocols);
         }
         if command == "list" {
             return Ok(json!(
@@ -1417,37 +1778,50 @@ impl Runtime {
                 Ok(json!({"prepared":i.record.prepared,"observation":Self::observation(&i)}))
             }
             "login" => {
-                if i.record.paused || i.openvpn.is_none() {
-                    i.record.paused = false;
-                    self.save(&i.record)?;
-                    stop(&mut i.proxy);
-                    stop(&mut i.openvpn);
-                    i.listener = None;
-                    if i.record.namespace_identity.is_none() {
-                        self.create_network(&mut i.record)?;
-                    }
-                    i = self.start(i.record.clone())?;
+                if i.auth.reason == "native_cleanup_required" {
+                    self.cleanup(&mut i.record, false)?;
+                }
+                let forti_auth_ended =
+                    i.forti.is_some() && matches!(i.auth.state.as_str(), "failed" | "expired");
+                if i.record.paused
+                    || forti_auth_ended
+                    || i.client.is_none()
+                        && (i.forti.is_none() || i.auth.action().get("challenge_id").is_none())
+                {
+                    self.restart(&mut i, false)?;
                 }
                 if let Some(credentials) = request.get("credentials") {
                     let remember = request["remember"].as_bool().unwrap_or(false);
-                    let was_remembered = i.auth.remembered;
-                    let commands = i.auth.submit(credentials, remember)?;
-                    let stream = i.management.as_mut().ok_or_else(|| {
-                        invalid("native authentication not ready; inspect login state")
-                    })?;
-                    for command in commands {
-                        stream.write_all(command.as_bytes())?;
-                        stream.write_all(b"\n")?;
-                    }
-                    if remember
-                        && let Err(error) =
-                            private_write(&self.auth_path(&i.record), &i.auth.credentials)
-                    {
-                        i.auth.remembered = was_remembered;
-                        return Err(error);
+                    if let Some(driver) = i.forti.as_mut() {
+                        driver.submit(
+                            &i.record,
+                            &mut i.auth,
+                            &mut i.client,
+                            credentials,
+                            remember,
+                        )?;
+                    } else {
+                        let was_remembered = i.auth.remembered;
+                        let commands = i.auth.submit(credentials, remember)?;
+                        let stream = i.management.as_mut().ok_or_else(|| {
+                            invalid("native authentication not ready; inspect login state")
+                        })?;
+                        for command in commands {
+                            stream.write_all(command.as_bytes())?;
+                            stream.write_all(b"\n")?;
+                        }
+                        if remember
+                            && let Err(error) =
+                                private_write(&self.auth_path(&i.record), &i.auth.credentials)
+                        {
+                            i.auth.remembered = was_remembered;
+                            return Err(error);
+                        }
                     }
                 }
-                Ok(i.auth.action())
+                Ok(i.forti
+                    .as_ref()
+                    .map_or_else(|| i.auth.action(), |driver| driver.action(&i.auth)))
             }
             "admit" => {
                 let admitted = request["admitted"]
@@ -1475,7 +1849,7 @@ impl Runtime {
                 i.record.paused = true;
                 self.save(&i.record)?;
                 stop(&mut i.proxy);
-                stop(&mut i.openvpn);
+                stop(&mut i.client);
                 i.management = None;
                 let remembered = i.auth.remembered;
                 i.auth.forget();
@@ -1486,19 +1860,18 @@ impl Runtime {
                 i.admitted_session = None;
                 i.proxy_gate = None;
                 i.listener = None;
-                self.cleanup(&mut i.record, false)?;
+                i.forti = None;
+                if let Err(error) = self.cleanup(&mut i.record, false) {
+                    i.auth.fail("native_cleanup_required");
+                    return Err(error);
+                }
                 Ok(json!(Self::observation(&i)))
             }
             "restart" => {
-                i.record.paused = false;
-                self.save(&i.record)?;
-                stop(&mut i.proxy);
-                stop(&mut i.openvpn);
-                i.management = None;
-                if i.record.namespace_identity.is_none() {
-                    self.create_network(&mut i.record)?;
+                if i.auth.reason == "native_cleanup_required" {
+                    self.cleanup(&mut i.record, false)?;
                 }
-                i = self.start(i.record.clone())?;
+                self.restart(&mut i, true)?;
                 Ok(json!(Self::observation(&i)))
             }
             "forget-auth" => {
@@ -1520,6 +1893,9 @@ impl Runtime {
                 }
                 File::open(&self.root)?.sync_all()?;
                 i.auth.forget();
+                if let Some(driver) = &mut i.forti {
+                    driver.remember_pending = false;
+                }
                 if let Some(stream) = i.management.as_mut() {
                     stream.write_all(b"forget-passwords\n")?;
                 }
@@ -1529,6 +1905,9 @@ impl Runtime {
                     .filter(|other| other.record.prepared.id == i.record.prepared.id)
                 {
                     other.auth.forget();
+                    if let Some(driver) = &mut other.forti {
+                        driver.remember_pending = false;
+                    }
                     if let Some(stream) = other.management.as_mut() {
                         stream.write_all(b"forget-passwords\n")?;
                     }
@@ -1540,8 +1919,9 @@ impl Runtime {
                 i.proxy_gate = None;
                 i.auth.fail("native_cleanup_required");
                 stop(&mut i.proxy);
-                stop(&mut i.openvpn);
+                stop(&mut i.client);
                 i.management = None;
+                i.forti = None;
                 self.cleanup(&mut i.record, true)?;
                 Ok(json!({"released":true}))
             }
@@ -1615,6 +1995,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>, cleanup_only: bool) -> io::
     let mut socket = PathBuf::from(crate::native::DEFAULT_SOCKET);
     let mut root = PathBuf::from("/var/lib/wgates-native");
     let mut xray = None;
+    let mut openfortivpn = PathBuf::from("/usr/bin/openfortivpn");
     let mut user = "wgates".to_owned();
     while let Some(arg) = args.next() {
         let value = args
@@ -1624,6 +2005,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>, cleanup_only: bool) -> io::
             Some("--socket") => socket = value.into(),
             Some("--state-dir") => root = value.into(),
             Some("--xray-bin") => xray = Some(PathBuf::from(value)),
+            Some("--openfortivpn-bin") => openfortivpn = PathBuf::from(value),
             Some("--service-user") => {
                 user = value
                     .into_string()
@@ -1729,7 +2111,9 @@ pub fn run(mut args: impl Iterator<Item = OsString>, cleanup_only: bool) -> io::
         uid,
         gid,
         xray,
+        openfortivpn,
         instances: BTreeMap::new(),
+        reaping: Vec::new(),
     };
     let mut retained = Vec::new();
     for entry in fs::read_dir(&runtime.root)? {
@@ -1752,16 +2136,33 @@ pub fn run(mut args: impl Iterator<Item = OsString>, cleanup_only: bool) -> io::
             retained.push(record);
         }
     }
-    for record in &mut retained {
-        runtime.cleanup(record, false)?;
-    }
     if cleanup_only {
-        return Ok(());
+        let mut first_error = None;
+        for record in &mut retained {
+            if let Err(error) = runtime.cleanup(record, false) {
+                first_error.get_or_insert(error);
+            }
+        }
+        return first_error.map_or(Ok(()), Err);
     }
-    runtime.preflight()?;
+    let mut generations = Vec::with_capacity(retained.len());
     for mut record in retained {
-        runtime.create_network(&mut record)?;
-        let instance = runtime.start(record)?;
+        let network_clean = runtime.cleanup_network(&mut record)?.is_none();
+        generations.push((record, network_clean));
+    }
+    runtime.preflight(&[])?;
+    let mut clients = BTreeMap::new();
+    for (record, _) in &generations {
+        let protocol = record.profile["protocol"]
+            .as_str()
+            .ok_or_else(|| invalid("native protocol required"))?;
+        clients
+            .entry(protocol.to_owned())
+            .or_insert_with(|| runtime.client_version(protocol).is_ok());
+    }
+    for (record, network_clean) in generations {
+        let client_available = clients[record.profile["protocol"].as_str().unwrap()];
+        let instance = runtime.restore(record, network_clean, client_available)?;
         runtime
             .instances
             .insert(instance.record.prepared.generation.clone(), instance);
@@ -1822,13 +2223,17 @@ pub fn run(mut args: impl Iterator<Item = OsString>, cleanup_only: bool) -> io::
             Err(e) => return Err(e),
         }
     }
+    for mut child in runtime.reaping.drain(..) {
+        let _ = child.wait();
+    }
     let keys: Vec<_> = runtime.instances.keys().cloned().collect();
     let mut failed = false;
     for key in keys {
         let mut i = runtime.instances.remove(&key).unwrap();
         stop(&mut i.proxy);
-        stop(&mut i.openvpn);
+        stop(&mut i.client);
         i.management = None;
+        i.forti = None;
         if let Err(error) = runtime.cleanup(&mut i.record, false) {
             eprintln!("wgates: native cleanup: {error}");
             failed = true;

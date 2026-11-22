@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise native OpenVPN only on the disposable local Linux systemd stand."""
 import json
+import os
 import base64
 import pwd
 from pathlib import Path
@@ -156,7 +157,7 @@ def helper_outage(context, group, connection):
     print('Helper outage preserves VLESS monitoring and fallback, then native recovery observes its threshold',flush=True)
 
 
-def acceptance(context, only_helper_outage=False):
+def acceptance(context, only_helper_outage=False, mixed_adapters=False):
     ns, spawn, control = (context[k] for k in ('ns', 'spawn', 'control'))
     work, installed, xray, prefix = (context[k] for k in ('work', 'installed', 'xray', 'prefix'))
     tls = work / 'tls'
@@ -172,6 +173,8 @@ def acceptance(context, only_helper_outage=False):
     authentication = None
     helper_enabled = False
     unit = Path('/run/systemd/system') / f'{prefix}-native.service'
+    forti_alias = Path('/run') / f'{prefix}-forti-client'
+    forti_alias_created = False
     assert not unit.exists()
     class HelperUnit:
         def poll(self):
@@ -191,7 +194,14 @@ def acceptance(context, only_helper_outage=False):
         ns('resource', 'nft', '-f', '-', input='table inet native_dns { chain input { type nat hook prerouting priority dstnat; ip daddr 10.220.0.10 udp dport 53 dnat ip to 10.220.0.10:15353; ip daddr 10.220.0.10 tcp dport 53 dnat ip to 10.220.0.10:15353; }; }\n')
         template = (Path(__file__).resolve().parent.parent/'packaging/systemd/wgates-native.service').read_text().replace('wgates',prefix)
         template = template.replace('[Service]', '[Service]\nNetworkNamespacePath=/run/netns/'+context['names']['gateway'])
-        template = '\n'.join(line+f' --xray-bin {xray}' if line.startswith(('ExecStart=','ExecStopPost=')) else line for line in template.splitlines())+'\n'
+        options = f' --xray-bin {xray}'
+        if mixed_adapters:
+            assert Path('/usr/bin/openfortivpn').is_file(), 'mixed-adapter checks require openfortivpn'
+            assert not forti_alias.exists() and not forti_alias.is_symlink()
+            forti_alias.symlink_to('/usr/bin/openfortivpn')
+            forti_alias_created = True
+            options += f' --openfortivpn-bin {forti_alias}'
+        template = '\n'.join(line+options if line.startswith(('ExecStart=','ExecStopPost=')) else line for line in template.splitlines())+'\n'
         unit.write_text(template)
         stand.checked('systemd-analyze','verify',str(unit))
         stand.checked('systemctl','daemon-reload')
@@ -515,6 +525,124 @@ def acceptance(context, only_helper_outage=False):
         traffic('10.220.0.10','10.211.0.1')
         traffic('10.221.0.10','10.212.0.1')
         print('Packaged helper/control restart preserves private preparation and re-verifies new native sessions',flush=True)
+        if mixed_adapters:
+            forti_group=control('group','create','--name','Forti standby')['data']['id']
+            forti_id=control('connection','import','--group',forti_group,'--name','Forti standby','--protocol','forti','--file','-',payload=dict(protocol='forti',options=[['host','10.213.0.2'],['port','10443'],['trusted-cert','ab'*32]],inline={}))['data']['id']
+            assert apply()['state']=='applied'
+            (forti_record,) = [p for p in state.glob('*.json') if json.loads(p.read_text())['prepared']['id']==forti_id]
+            digest=json.loads(forti_record.read_text())['prepared']['profile_digest']
+            forti_auth=state/f'{forti_id}-{digest}.auth'
+            forti_alias.unlink()
+            def restart_after_crash():
+                pid=stand.checked('systemctl','show','--property=MainPID','--value',unit.name).stdout.strip()
+                assert int(pid)>0
+                stand.checked('systemctl','kill','--kill-who=main','--signal=SIGKILL',unit.name)
+                deadline=time.monotonic()+25
+                while not (runtime/'control.sock').is_socket() or stand.checked('systemctl','show','--property=MainPID','--value',unit.name).stdout.strip() in ('0',pid):
+                    assert time.monotonic()<deadline,'native helper did not restart after abrupt exit'
+                    time.sleep(.1)
+            restart_after_crash()
+            fault_state=await_connection(forti_id,lambda v:v.get('native_runtime',{}).get('reason')=='native_adapter_unavailable')
+            assert not fault_state['native_runtime']['admitted']
+            await_connection(connection,lambda v:v.get('native_runtime',{}).get('admitted') and 'tcp_ipv4' in v['capabilities'],45)
+            await_health(connection)
+            traffic('10.220.0.10','10.211.0.1')
+            assert apply()['state']=='applied'
+            forti_alias.symlink_to('/usr/bin/openfortivpn')
+            forti_auth.touch(mode=0o600,exist_ok=False)
+            forti_auth.write_text('{')
+            stand.checked('systemctl','restart',unit.name)
+            failed=await_connection(forti_id,lambda v:v.get('native_runtime',{}).get('reason')=='native_restore_failed')
+            assert not failed['native_runtime']['resources_active'] and not failed['capabilities'],failed
+            await_connection(connection,lambda v:v.get('native_runtime',{}).get('admitted') and 'tcp_ipv4' in v['capabilities'],45)
+            await_health(connection)
+            traffic('10.220.0.10','10.211.0.1')
+            stand.checked('systemctl','stop',unit.name)
+            runtime.mkdir(mode=0o750,exist_ok=True)
+            os.chown(runtime,0,gid)
+            runtime.chmod(0o750)
+            witness=runtime/forti_record.stem/'forti-runtime'/'inspection-marker'
+            (runtime/forti_record.stem).mkdir(mode=0o700)
+            witness.parent.mkdir(mode=0o700)
+            witness.write_text('owned fixture marker')
+            stand.checked('systemctl','start',unit.name)
+            retained=await_connection(forti_id,lambda v:v.get('native_runtime',{}).get('reason')=='native_cleanup_required')
+            assert not retained['native_runtime']['resources_active'] and witness.is_file(),retained
+            await_connection(connection,lambda v:v.get('native_runtime',{}).get('admitted') and 'tcp_ipv4' in v['capabilities'],45)
+            traffic('10.220.0.10','10.211.0.1')
+            control('connection','restart',forti_id,success=False)
+            assert witness.read_text()=='owned fixture marker'
+            witness.unlink()
+            control('connection','forget-auth',forti_id)
+            control('connection','restart',forti_id)
+            await_connection(forti_id,lambda v:v['authentication']=='credentials_required')
+            prepared=json.loads(forti_record.read_text())
+            helper_pid=stand.checked('systemctl','show','--property=MainPID','--value',unit.name).stdout.strip()
+            namespace=Path(f'/proc/{helper_pid}/root/run/netns')/prepared['namespace']
+            identity=namespace.stat()
+            assert (identity.st_dev,identity.st_ino)==tuple(prepared['namespace_identity'])
+            # Match the helper's group and drop capabilities as its Forti descendants do.
+            holder=subprocess.Popen(['nsenter',f'--net={namespace}','setpriv','--regid',str(gid),
+                                     '--clear-groups','--bounding-set=-all','--inh-caps=-all',
+                                     '--ambient-caps=-all','/usr/bin/sleep','120'],stderr=subprocess.PIPE)
+            try:
+                deadline=time.monotonic()+5
+                proc=Path(f'/proc/{holder.pid}')
+                while (proc/'comm').read_text().strip()!='sleep':
+                    assert holder.poll() is None,holder.stderr.read().decode()
+                    assert time.monotonic()<deadline,'fixture process did not enter Forti namespace'
+                    time.sleep(.05)
+                observed=(proc/'ns/net').stat()
+                assert (observed.st_dev,observed.st_ino)==(identity.st_dev,identity.st_ino)
+                control('connection','restart',forti_id,success=False)
+                blocked=control('connection','show',forti_id)['data']
+                assert not blocked['native_runtime']['admitted'] and not blocked['capabilities'],blocked
+                control('connection','login',forti_id,success=False)
+                assert (namespace.stat().st_dev,namespace.stat().st_ino)==(identity.st_dev,identity.st_ino)
+                restart_after_crash()
+                retained=await_connection(forti_id,lambda v:v.get('native_runtime',{}).get('reason')=='native_cleanup_required')
+                assert retained['native_runtime']['resources_active'] and not retained['native_runtime']['admitted'],retained
+                links=json.loads(ns('gateway','ip','-j','link','show').stdout)
+                assert all(link['ifname']!=prepared['interface'] for link in links),links
+                await_connection(connection,lambda v:v.get('native_runtime',{}).get('admitted') and 'tcp_ipv4' in v['capabilities'],45)
+                traffic('10.220.0.10','10.211.0.1')
+            finally:
+                holder.terminate()
+                holder.wait(timeout=5)
+            control('connection','restart',forti_id)
+            await_connection(forti_id,lambda v:v['authentication']=='credentials_required')
+            control('connection','logout',forti_id)
+            ns('gateway','ip','link','add',prepared['interface'],'type','veth','peer','name','wgn9-fixture')
+            try:
+                control('connection','restart',forti_id,success=False)
+                await_connection(forti_id,lambda v:v.get('native_runtime',{}).get('reason')=='native_cleanup_required')
+                control('connection','restart',forti_id,success=False)
+                ns('gateway','ip','link','show',prepared['interface'])
+            finally:
+                ns('gateway','ip','link','delete',prepared['interface'])
+            control('connection','restart',forti_id)
+            await_connection(forti_id,lambda v:v['authentication']=='credentials_required')
+            table='wgates_'+forti_record.stem
+            ns('gateway','nft','-f','-',input=f'add chain inet {table} retained_stand\n'+
+               f'add rule inet {table} retained_stand counter\n'*8000)
+            original=ns('gateway','nft','-j','list','table','inet',table).stdout
+            assert len(original.encode())>1024*1024
+            try:
+                restart_after_crash()
+                retained=await_connection(forti_id,lambda v:v.get('native_runtime',{}).get('reason')=='native_cleanup_required')
+                assert not retained['native_runtime']['admitted'],retained
+                assert ns('gateway','nft','-j','list','table','inet',table).stdout==original
+                await_connection(connection,lambda v:v.get('native_runtime',{}).get('admitted') and 'tcp_ipv4' in v['capabilities'],45)
+                traffic('10.220.0.10','10.211.0.1')
+            finally:
+                ns('gateway','nft','-f','-',input=f'flush chain inet {table} retained_stand\n'
+                   f'delete chain inet {table} retained_stand\n')
+            control('connection','restart',forti_id)
+            await_connection(forti_id,lambda v:v['authentication']=='credentials_required')
+            print('Forti firewall drift is preserved while OpenVPN remains usable after helper restart',flush=True)
+            control('connection','delete',forti_id)
+            assert apply()['state']=='applied'
+            print('Packaged helper recovers after abrupt exit and isolates a missing Forti adapter',flush=True)
         fault=control('connection','import','--group',group,'--name','Native preparation collision','--protocol','openvpn','--file','-',payload=profile)['data']['id']
         plan=control('routing','preview')['data']['plan_id']
         # The private plan is used only to inject a deterministic ownership collision.
@@ -562,8 +690,14 @@ def acceptance(context, only_helper_outage=False):
         mode=executable.stat().st_mode & 0o7777
         try:
             executable.chmod(mode | 0o020)
-            result=stand.run('systemctl','start',unit.name,timeout=30)
-            assert result.returncode!=0,'helper restart executed an unsafe native dependency'
+            stand.checked('systemctl','start',prefix+'.service')
+            stand.checked('systemctl','is-active','--quiet',unit.name)
+            deadline=time.monotonic()+15
+            while stand.run(installed,'status','--socket',Path('/run')/prefix/'control.sock').returncode:
+                assert time.monotonic()<deadline,'control service did not become ready'
+                time.sleep(.05)
+            unavailable=await_connection(connection,lambda v:v.get('native_runtime',{}).get('reason')=='native_adapter_unavailable')
+            assert not unavailable['native_runtime']['resources_active'] and not unavailable['capabilities'],unavailable
         finally:
             executable.chmod(mode)
         stand.checked('systemctl','stop',prefix+'.service')
@@ -593,6 +727,9 @@ def acceptance(context, only_helper_outage=False):
         print('Native helper namespace, veth and nftables cleanup confirmed',flush=True)
         if helper_enabled: stand.checked('systemctl','disable','--runtime',unit.name)
         if unit.exists(): unit.unlink(); stand.checked('systemctl','daemon-reload')
+        if (forti_alias_created and forti_alias.is_symlink()
+                and forti_alias.readlink() == Path('/usr/bin/openfortivpn')):
+            forti_alias.unlink()
         # These paths were absent before this fixture and belong only to its helper.
         for path in (runtime, state):
             if path.exists():
@@ -601,5 +738,7 @@ def acceptance(context, only_helper_outage=False):
 
 
 if __name__ == '__main__':
-    assert sys.argv[3:] in ([], ['--helper-outage']), 'unknown native stand option'
-    stand.main(sys.argv[1], sys.argv[2], native_acceptance=lambda context: acceptance(context, only_helper_outage=bool(sys.argv[3:])))
+    option = sys.argv[3:]
+    assert option in ([], ['--helper-outage'], ['--mixed-adapters']), 'unknown native stand option'
+    stand.main(sys.argv[1], sys.argv[2], native_acceptance=lambda context: acceptance(
+        context, only_helper_outage=option==['--helper-outage'], mixed_adapters=option==['--mixed-adapters']))

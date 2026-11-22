@@ -101,7 +101,7 @@ fn package(mut profile: Profile, directory: Option<&std::path::Path>) -> io::Res
     Ok(profile)
 }
 
-fn asset(directory: &std::path::Path, name: &str) -> io::Result<Vec<u8>> {
+pub(crate) fn asset(directory: &std::path::Path, name: &str) -> io::Result<Vec<u8>> {
     use std::ffi::CString;
     use std::fs::{File, OpenOptions};
     use std::io::Read;

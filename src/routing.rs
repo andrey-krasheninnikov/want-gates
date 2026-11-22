@@ -136,12 +136,12 @@ fn connection_verification(
 ) -> Value {
     let stale = record.is_some_and(|r| {
         connection_binding(config, connection).is_ok_and(|b| b != r.binding)
-            || connection.protocol == "openvpn"
+            || crate::native::is_native(&connection.protocol)
                 && (native_context.is_none() || r.native_context.as_deref() != native_context)
     });
     let results = record.map(|r| &r.results);
     json!({"observed_at":record.map(|r|r.observed_at),"source":record.map(|r|&r.source),"stale":stale,
-        "capabilities":crate::capability::observations(&connection.allowed_capabilities, results, stale),
+        "capabilities":crate::capability::observations(connection, results, stale),
         "dns":crate::capability::observation(if stale{"inputs_changed"}else{results.and_then(|r|r.get("dns")).map(String::as_str).unwrap_or("not_checked")})})
 }
 fn connection_reports(
@@ -393,16 +393,14 @@ fn initial_matrix(config: &Config) -> Matrix {
                         c.to_string(),
                         match crate::domain::connection(config, g) {
                             None => "primary_missing",
-                            Some(connection)
-                                if !crate::capability::permits(
-                                    &connection.allowed_capabilities,
-                                    c,
-                                ) =>
-                            {
-                                "configured_limit"
-                            }
-                            Some(_) if !probe_configured(g, c) => "probe_missing",
-                            Some(_) => "candidate",
+                            Some(connection) => crate::capability::connection_limit(connection, c)
+                                .unwrap_or_else(|| {
+                                    if probe_configured(g, c) {
+                                        "candidate"
+                                    } else {
+                                        "probe_missing"
+                                    }
+                                }),
                         }
                         .to_owned(),
                     )
@@ -425,19 +423,13 @@ fn initial_matrix(config: &Config) -> Matrix {
                     .and_then(|c| c.dns.as_ref())
                     .and_then(|d| crate::policy::Resolver::parse(d).ok())
                 {
-                    if result
+                    result
                         .get(&resolver.capability())
-                        .is_some_and(|r| r == "configured_limit")
-                    {
-                        "configured_limit"
-                    } else if result
-                        .get(&resolver.capability())
-                        .is_none_or(|r| r != "candidate")
-                    {
-                        "dns_transport_unverified"
-                    } else {
-                        "candidate"
-                    }
+                        .map(String::as_str)
+                        .filter(|reason| {
+                            matches!(*reason, "configured_limit" | "protocol_limit" | "candidate")
+                        })
+                        .unwrap_or("dns_transport_unverified")
                 } else {
                     "dns_missing"
                 };
@@ -445,7 +437,9 @@ fn initial_matrix(config: &Config) -> Matrix {
             }
             if g.healthcheck.is_some() {
                 for reason in result.values_mut() {
-                    *reason = "healthcheck_pending".into();
+                    if !matches!(reason.as_str(), "configured_limit" | "protocol_limit") {
+                        *reason = "healthcheck_pending".into();
+                    }
                 }
             }
             (g.id.clone(), result)
@@ -506,7 +500,7 @@ pub(crate) fn outbound(input: &Input, id: &str, diagnostic: bool) -> Value {
         .config
         .connections
         .iter()
-        .any(|c| c.id == id && c.protocol == "openvpn")
+        .any(|c| c.id == id && crate::native::is_native(&c.protocol))
     {
         input
             .native
@@ -549,7 +543,7 @@ fn render(
             .config
             .connections
             .iter()
-            .find(|c| c.id == *id && c.protocol == "openvpn")
+            .find(|c| c.id == *id && crate::native::is_native(&c.protocol))
         {
             let mut diagnostic = outbound(input, id, true);
             diagnostic["tag"] = json!(crate::native::diagnostic_tag(connection));
@@ -594,8 +588,8 @@ fn render(
         };
         for protocol in ["tcp", "udp"] {
             for (family, network) in [(4, "0.0.0.0/0"), (6, "::/0")] {
-                let permitted = crate::capability::permits(
-                    &connection.allowed_capabilities,
+                let permitted = crate::capability::permits_connection(
+                    connection,
                     &format!("{protocol}_ipv{family}"),
                 );
                 rules.push(json!({"type":"field","ruleTag":format!("wgates-check-{}-{protocol}-ipv{family}",connection.id),"inboundTag":[PROBE_TAG],"user":[user],"network":protocol,"ip":[network],"outboundTag":if permitted{crate::native::diagnostic_tag(connection)}else{"wgates-block".into()}}));
@@ -758,9 +752,9 @@ impl Service {
                 .iter()
                 .find(|c| request["id"] == c.id)
                 .ok_or_else(|| invalid("connection not found"))?;
-            if connection.protocol != "openvpn" {
+            if !crate::native::is_native(&connection.protocol) {
                 return Err(invalid(
-                    "native authentication is available only for OpenVPN",
+                    "native authentication is available only for OpenVPN and Forti",
                 ));
             }
             if working.as_ref().is_none_or(|w| {
@@ -1007,19 +1001,12 @@ fn execute(
         )?;
         let previous: Option<Working> = optional(&root.join("working.json"))?;
         let mut native_intents = BTreeMap::new();
-        if input
-            .config
-            .connections
-            .iter()
-            .any(|c| c.protocol == "openvpn")
-        {
-            native.call(json!({"command":"preflight"}))?;
-        }
+        let mut protocols = BTreeSet::new();
         for connection in input
             .config
             .connections
             .iter()
-            .filter(|c| c.protocol == "openvpn")
+            .filter(|c| crate::native::is_native(&c.protocol))
         {
             let generation = previous
                 .as_ref()
@@ -1032,9 +1019,18 @@ fn execute(
                         })
                         .and_then(|_| w.native.get(&connection.id))
                 })
-                .map(|p| p.generation.clone())
-                .unwrap_or(random_id()?);
+                .map(|p| p.generation.clone());
+            let generation = match generation {
+                Some(generation) => generation,
+                None => {
+                    protocols.insert(&connection.protocol);
+                    random_id()?
+                }
+            };
             native_intents.insert(connection.id.clone(), generation);
+        }
+        if !native_intents.is_empty() {
+            native.call(json!({"command":"preflight","protocols":protocols}))?;
         }
         let plan = Plan {
             id: random_id()?,
@@ -1132,7 +1128,7 @@ fn execute(
             .config
             .connections
             .iter()
-            .filter(|c| c.protocol == "openvpn")
+            .filter(|c| crate::native::is_native(&c.protocol))
         {
             let generation = journal
                 .plan
@@ -1199,7 +1195,7 @@ fn execute(
                 .iter()
                 .find(|g| g.id == rule.group_id)
                 .and_then(|g| crate::domain::connection(&effective_input.config, g))
-                .is_none_or(|c| c.protocol != "openvpn")
+                .is_none_or(|c| !crate::native::is_native(&c.protocol))
         });
         let mut matrix = crate::probe::check(&client, &legacy, &journal.plan.proxy, None)?;
         for group in effective_input.config.groups.iter().filter(|g| {
@@ -1211,7 +1207,7 @@ fn execute(
                     .any(|r| r.group_id == g.id)
         }) {
             if let Some(connection) = crate::domain::connection(&effective_input.config, group)
-                && connection.protocol == "openvpn"
+                && crate::native::is_native(&connection.protocol)
             {
                 let mut results = if let Some(reason) =
                     crate::native::readiness(connection, &native_observations)
@@ -1270,7 +1266,7 @@ fn execute(
                 verifications.insert(connection.id.clone(), admitted.clone());
                 let mut record = crate::health::Observation {
                     admitted: admitted.clone(),
-                    was_down: connection.protocol == "openvpn"
+                    was_down: crate::native::is_native(&connection.protocol)
                         && journal.previous.as_ref().is_some_and(|previous| {
                             previous.native.contains_key(&connection.id)
                                 && previous
@@ -1294,7 +1290,7 @@ fn execute(
                     && connection_binding(&previous.config, old_connection)?
                         == connection_binding(&effective_input.config, connection)?
                     && digest(&old_group.healthcheck)? == digest(&group.healthcheck)?
-                    && (connection.protocol != "openvpn"
+                    && (!crate::native::is_native(&connection.protocol)
                         || previous
                             .native_observations
                             .get(&connection.id)
@@ -1942,7 +1938,10 @@ impl Service {
                 }
             }
             if let Some(object) = value.as_object_mut()
-                && object.get("protocol").is_some_and(|v| v == "openvpn")
+                && object
+                    .get("protocol")
+                    .and_then(Value::as_str)
+                    .is_some_and(crate::native::is_native)
             {
                 let id = object
                     .get("id")

@@ -32,15 +32,30 @@ pub fn parse(value: &str) -> io::Result<Vec<String>> {
 pub fn permits(values: &[String], capability: &str) -> bool {
     values.iter().any(|s| s == capability)
 }
+pub fn permits_connection(connection: &crate::store::Connection, capability: &str) -> bool {
+    connection_limit(connection, capability).is_none()
+}
+pub fn connection_limit(
+    connection: &crate::store::Connection,
+    capability: &str,
+) -> Option<&'static str> {
+    if connection.protocol == "forti" && capability.ends_with("_ipv6") {
+        Some("protocol_limit")
+    } else if !permits(&connection.allowed_capabilities, capability) {
+        Some("configured_limit")
+    } else {
+        None
+    }
+}
 pub fn observations(
-    allowed: &[String],
+    connection: &crate::store::Connection,
     results: Option<&BTreeMap<String, String>>,
     stale: bool,
 ) -> Value {
     let mut output = serde_json::Map::new();
     for capability in ALL {
-        let reason = if !permits(allowed, capability) {
-            "configured_limit"
+        let reason = if let Some(reason) = connection_limit(connection, capability) {
+            reason
         } else if stale {
             "inputs_changed"
         } else {
@@ -56,7 +71,7 @@ pub fn observations(
 
 pub fn observation(reason: &str) -> Value {
     let state = match reason {
-        "configured_limit" => "unsupported",
+        "configured_limit" | "protocol_limit" => "unsupported",
         "inputs_changed" => "stale",
         "verified" => "verified",
         "probe_missing" | "not_checked" | "not_rechecked" | "primary_missing" => "unverified",
