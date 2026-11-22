@@ -19,7 +19,7 @@ def acceptance(context, legacy=False):
     unit = Path('/run/systemd/system') / f'{prefix}-native.service'
     repo = Path(__file__).resolve().parent.parent
     native_binary = '/usr/bin/openfortivpn' if legacy else '/opt/forti-1.24.1/bin/openfortivpn'
-    alias = Path('/run') / f'{prefix}-forti-client'
+    alias = Path('/usr/local/bin') / f'{prefix}-forti-client'
     bootstrap = Path('/run') / f'{prefix}-forti-bootstrap-hosts'
     resolver = Path('/run') / f'{prefix}-forti-resolv'
     keys = Path('/run') / f'{prefix}-saml-ssh'
@@ -30,7 +30,10 @@ def acceptance(context, legacy=False):
     try:
         alias.mkdir(mode=0o755)
         forti_binary=alias/'client'
-        forti_binary.symlink_to(native_binary)
+        native_client=alias/'openfortivpn'
+        shutil.copyfile(native_binary,native_client)
+        native_client.chmod(0o755)
+        forti_binary.symlink_to(native_client)
         bootstrap.write_text('127.0.0.1 localhost\n10.213.0.2 wrong-name.example.test\n')
         bootstrap.chmod(0o644)
         resolver.write_text('nameserver 127.0.0.1\nsearch corp.test\noptions ndots:15 attempts:1 timeout:1\n')
@@ -85,7 +88,9 @@ with open(sys.argv[1], 'w', buffering=1) as events:
         start_attempted = True
         stand.checked('systemctl', 'start', unit.name)
         group = control('group', 'create', '--name', 'Forti company')['data']['id']
-        profile = dict(protocol='forti', options=[['host','forti-a.example.test'],['port','10443'],['otp-prompt','I']], inline={'ca-file':(tls/'ca.crt').read_text()})
+        profile = dict(protocol='forti', options=[['host','forti-a.example.test'],['port','10443'],['otp-prompt','I'],['min-tls','1.2']], inline={'ca-file':(tls/'ca.crt').read_text()})
+        if not legacy:
+            profile['options'].append(['sni','forti-a.example.test'])
         connection = control('connection', 'import', '--group', group, '--name', 'Forti native', '--protocol', 'forti', '--file', '-', payload=profile)['data']['id']
         control('group', 'update', group, '--primary', connection, '--probe-file', '-', payload=dict(tcp_ipv4=dict(url='http://10.220.0.10:18080/forti'),udp_ipv4=dict(server='10.220.0.10:15353',query_name='probe.example.test',query_type='A'),dns=dict(query_name='v4.corp.test',query_type='A')))
         control('rule','create','--group',group,'--destination','corp.test')
@@ -116,9 +121,14 @@ with open(sys.argv[1], 'w', buffering=1) as events:
         control('connection','login',connection,'--file','-',payload=dict(challenge_id=action['challenge_id'],username='forti-incomplete-marker'),success=False)
         control('connection','login',connection,'--file','-',payload=dict(challenge_id=action['challenge_id'],password='forti-password-marker'),success=False)
         credentials = dict(challenge_id=action['challenge_id'], username='forti-user', password='forti-password-marker')
+        try:
+            native_client.chmod(0o775)
+            control('connection','login',connection,'--file','-','--remember',payload=credentials,success=False)
+        finally:
+            native_client.chmod(0o755)
         control('connection','login',connection,'--file','-','--remember',payload=credentials)
         current = await_auth('authenticated')
-        forti_binary.symlink_to(native_binary)
+        forti_binary.symlink_to(native_client)
         print('Prepared Forti session retains its resolved native path after a launcher alias disappears',flush=True)
         assert current['capabilities']==[],current
         assert current['native_runtime']['dns']=='udp://10.220.0.10:53',current
@@ -467,6 +477,8 @@ with open(sys.argv[1], 'w', buffering=1) as events:
         identity=tuple(owned[0]['namespace_identity'])
         native = [pid for pid in children if Path(f'/proc/{pid}/comm').read_text().strip()=='openfortivpn' and (os.stat(f'/proc/{pid}/ns/net').st_dev,os.stat(f'/proc/{pid}/ns/net').st_ino)==identity]
         assert len(native)==1,native
+        args = Path(f'/proc/{native[0]}/cmdline').read_bytes().split(b'\0')
+        assert {b'--no-dns',b'--no-routes',b'--pppd-no-peerdns',b'--min-tls'} <= set(args)
         descendants = [int(v) for v in Path(f'/proc/{native[0]}/task/{native[0]}/children').read_text().split()]
         ppp = [pid for pid in descendants if Path(f'/proc/{pid}/comm').read_text().strip()=='pppd']
         assert len(ppp)==1,ppp

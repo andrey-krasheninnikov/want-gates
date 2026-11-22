@@ -1362,23 +1362,30 @@ impl Runtime {
         if let Some(reason) = Self::detach_bridge(record)? {
             return Ok(Some(reason));
         }
-        if present && record.firewall_digest.as_ref() != Some(&nft_digest(None, &table)?) {
-            return Ok(Some(
-                "native firewall ownership changed; retain it for inspection",
-            ));
+        if present {
+            let Ok(actual) = nft_digest(None, &table) else {
+                return Ok(Some(
+                    "native firewall could not be inspected; retain it for inspection",
+                ));
+            };
+            if record.firewall_digest.as_ref() != Some(&actual) {
+                return Ok(Some(
+                    "native firewall ownership changed; retain it for inspection",
+                ));
+            }
         }
         if Self::forti_processes_remain(record)? {
             return Ok(Some("native Forti namespace still has active processes"));
         }
-        if present {
-            nft(None, &format!("delete table inet {table}"))?;
+        if present && nft(None, &format!("delete table inet {table}")).is_err() {
+            return Ok(Some("native firewall removal could not be confirmed"));
         }
         record.firewall_digest = None;
         self.save(record)?;
         let ns_meta = match fs::symlink_metadata(&ns_path) {
             Ok(meta) => Some(meta),
             Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
+            Err(_) => return Ok(Some("native namespace could not be inspected")),
         };
         if let Some(meta) = ns_meta {
             let identity = (meta.dev(), meta.ino());
@@ -1394,7 +1401,9 @@ impl Runtime {
                     "native namespace ownership is uncertain; inspect retained resources",
                 ));
             }
-            let meta = fs::symlink_metadata(&ns_path)?;
+            let Ok(meta) = fs::symlink_metadata(&ns_path) else {
+                return Ok(Some("native namespace file could not be inspected"));
+            };
             if record.namespace_file != Some((meta.dev(), meta.ino()))
                 || !meta.is_file()
                 || meta.uid() != 0
@@ -1404,7 +1413,9 @@ impl Runtime {
                     "native namespace file changed; retain it for inspection",
                 ));
             }
-            fs::remove_file(&ns_path)?;
+            if fs::remove_file(&ns_path).is_err() {
+                return Ok(Some("native namespace file could not be removed"));
+            }
         }
         record.namespace_identity = None;
         record.namespace_file = None;

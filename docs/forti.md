@@ -51,8 +51,9 @@ names in the certificate. An IPv4 gateway address requires a verified
 
 Supported options are `host`, `port`, `realm`, `trusted-cert`, `sni`, `min-tls`
 (1.2 or 1.3), `otp-prompt`, `otp-delay` (0 through 60), and `no-ftm-push`.
-Native route/DNS flags are accepted for import but forced off; `persistent`
-must be zero. `ca-file`, `user-cert` and `user-key` package relative PEM assets
+If the client build rejects the configured minimum TLS version, login stops
+before sending credentials. The helper forces native route and DNS changes off
+even when the imported profile enables them. `persistent` must be zero. `ca-file`, `user-cert` and `user-key` package relative PEM assets
 with the same path and 1 MiB limits as OpenVPN. A client certificate and key
 must appear together. Stdin accepts canonical JSON with `protocol: "forti"`,
 `options` pairs and inline PEM assets.

@@ -496,7 +496,13 @@ impl Session {
                 config += &format!("trusted-cert = {}\n", item[1].to_ascii_lowercase());
             } else if !matches!(
                 item[0].as_str(),
-                "set-routes" | "set-dns" | "pppd-use-peerdns" | "use-resolvconf" | "persistent"
+                "set-routes"
+                    | "set-dns"
+                    | "pppd-use-peerdns"
+                    | "use-resolvconf"
+                    | "persistent"
+                    | "min-tls"
+                    | "sni"
             ) {
                 config += &format!("{} = {}\n", item[0], item[1]);
             }
@@ -505,7 +511,6 @@ impl Session {
             write_private(&runtime.join(format!("{kind}.pem")), contents)?;
             config += &format!("{kind} = /run/{kind}.pem\n");
         }
-        config += "set-routes = 0\nset-dns = 0\npppd-use-peerdns = 0\nuse-resolvconf = 0\npersistent = 0\n";
         if matches!(method, "password" | "certificate") {
             let user = if method == "password" {
                 auth.credentials.username.as_deref().unwrap()
@@ -545,7 +550,22 @@ impl Session {
         let relay = (method == "saml")
             .then(|| Relay::start(record, &self.directory))
             .transpose()?;
-        let mut args = vec!["--config", &config_path, "--pppd-ifname=wgates-tun"];
+        let min_tls = option(&self.profile, "min-tls");
+        let mut args = vec![
+            "--config",
+            &config_path,
+            "--pppd-ifname=wgates-tun",
+            "--no-routes",
+            "--no-dns",
+            "--pppd-no-peerdns",
+            "--persistent=0",
+        ];
+        if let Some(min_tls) = min_tls {
+            args.extend(["--min-tls", min_tls]);
+        }
+        if let Some(sni) = option(&self.profile, "sni") {
+            args.extend(["--sni", sni]);
+        }
         if method == "cookie" {
             args.push("--cookie-on-stdin");
         }
@@ -580,6 +600,23 @@ impl Session {
         } else {
             None
         };
+        if super::executable(&self.executable)? != self.executable {
+            return Err(invalid("prepared openfortivpn executable path changed"));
+        }
+        super::executable(Path::new("/usr/sbin/pppd"))?;
+        if let Some(min_tls) = min_tls {
+            let executable = self
+                .executable
+                .to_str()
+                .ok_or_else(|| invalid("invalid Forti executable path"))?;
+            // Unsupported TLS options produce a warning even when --version succeeds.
+            let output = super::command(executable, &["--min-tls", min_tls, "--version"])?;
+            if output.lines().count() != 1 || version(&output).ok() != Some(self.version) {
+                return Err(invalid(
+                    "Forti client cannot enforce the configured minimum TLS version",
+                ));
+            }
+        }
         let process = namespace_child(
             record,
             &self.executable,

@@ -174,7 +174,7 @@ def acceptance(context, only_helper_outage=False, mixed_adapters=False):
     helper_enabled = False
     unit = Path('/run/systemd/system') / f'{prefix}-native.service'
     forti_alias = Path('/run') / f'{prefix}-forti-client'
-    assert not forti_alias.exists()
+    forti_alias_created = False
     assert not unit.exists()
     class HelperUnit:
         def poll(self):
@@ -197,7 +197,9 @@ def acceptance(context, only_helper_outage=False, mixed_adapters=False):
         options = f' --xray-bin {xray}'
         if mixed_adapters:
             assert Path('/usr/bin/openfortivpn').is_file(), 'mixed-adapter checks require openfortivpn'
+            assert not forti_alias.exists() and not forti_alias.is_symlink()
             forti_alias.symlink_to('/usr/bin/openfortivpn')
+            forti_alias_created = True
             options += f' --openfortivpn-bin {forti_alias}'
         template = '\n'.join(line+options if line.startswith(('ExecStart=','ExecStopPost=')) else line for line in template.splitlines())+'\n'
         unit.write_text(template)
@@ -621,17 +623,20 @@ def acceptance(context, only_helper_outage=False, mixed_adapters=False):
             control('connection','restart',forti_id)
             await_connection(forti_id,lambda v:v['authentication']=='credentials_required')
             table='wgates_'+forti_record.stem
-            ns('gateway','nft','add','chain','inet',table,'retained_stand')
-            original=json.loads(ns('gateway','nft','-j','list','table','inet',table).stdout)
+            ns('gateway','nft','-f','-',input=f'add chain inet {table} retained_stand\n'+
+               f'add rule inet {table} retained_stand counter\n'*8000)
+            original=ns('gateway','nft','-j','list','table','inet',table).stdout
+            assert len(original.encode())>1024*1024
             try:
                 restart_after_crash()
                 retained=await_connection(forti_id,lambda v:v.get('native_runtime',{}).get('reason')=='native_cleanup_required')
                 assert not retained['native_runtime']['admitted'],retained
-                assert json.loads(ns('gateway','nft','-j','list','table','inet',table).stdout)==original
+                assert ns('gateway','nft','-j','list','table','inet',table).stdout==original
                 await_connection(connection,lambda v:v.get('native_runtime',{}).get('admitted') and 'tcp_ipv4' in v['capabilities'],45)
                 traffic('10.220.0.10','10.211.0.1')
             finally:
-                ns('gateway','nft','delete','chain','inet',table,'retained_stand')
+                ns('gateway','nft','-f','-',input=f'flush chain inet {table} retained_stand\n'
+                   f'delete chain inet {table} retained_stand\n')
             control('connection','restart',forti_id)
             await_connection(forti_id,lambda v:v['authentication']=='credentials_required')
             print('Forti firewall drift is preserved while OpenVPN remains usable after helper restart',flush=True)
@@ -722,7 +727,9 @@ def acceptance(context, only_helper_outage=False, mixed_adapters=False):
         print('Native helper namespace, veth and nftables cleanup confirmed',flush=True)
         if helper_enabled: stand.checked('systemctl','disable','--runtime',unit.name)
         if unit.exists(): unit.unlink(); stand.checked('systemctl','daemon-reload')
-        forti_alias.unlink(missing_ok=True)
+        if (forti_alias_created and forti_alias.is_symlink()
+                and forti_alias.readlink() == Path('/usr/bin/openfortivpn')):
+            forti_alias.unlink()
         # These paths were absent before this fixture and belong only to its helper.
         for path in (runtime, state):
             if path.exists():
