@@ -599,7 +599,12 @@ def acceptance(context, only_helper_outage=False):
         mode=executable.stat().st_mode & 0o7777
         try:
             executable.chmod(mode | 0o020)
-            stand.checked('systemctl','start',unit.name)
+            stand.checked('systemctl','start',prefix+'.service')
+            stand.checked('systemctl','is-active','--quiet',unit.name)
+            deadline=time.monotonic()+15
+            while stand.run(installed,'status','--socket',Path('/run')/prefix/'control.sock').returncode:
+                assert time.monotonic()<deadline,'control service did not become ready'
+                time.sleep(.05)
             unavailable=await_connection(connection,lambda v:v.get('native_runtime',{}).get('reason')=='native_adapter_unavailable')
             assert not unavailable['native_runtime']['resources_active'] and not unavailable['capabilities'],unavailable
         finally:
