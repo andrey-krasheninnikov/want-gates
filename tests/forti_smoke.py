@@ -20,40 +20,40 @@ def acceptance(context, legacy=False):
     repo = Path(__file__).resolve().parent.parent
     native_binary = '/usr/bin/openfortivpn' if legacy else '/opt/forti-1.24.1/bin/openfortivpn'
     alias = Path('/run') / f'{prefix}-forti-client'
-    assert not alias.exists()
-    alias.mkdir(mode=0o755)
-    forti_binary=alias/'client'
-    forti_binary.symlink_to(native_binary)
     bootstrap = Path('/run') / f'{prefix}-forti-bootstrap-hosts'
-    assert not any(p.exists() for p in [runtime, state, unit, bootstrap])
-    bootstrap.write_text('127.0.0.1 localhost\n10.213.0.2 forti-a.example.test wrong-name.example.test\n')
-    bootstrap.chmod(0o644)
-    template = (repo/'packaging/systemd/wgates-native.service').read_text().replace('wgates', prefix)
-    template = template.replace('[Service]', '[Service]\nNetworkNamespacePath=/run/netns/'+context['names']['gateway']+'\nBindReadOnlyPaths='+str(bootstrap)+':/etc/hosts')
-    template = '\n'.join(line+f' --xray-bin {context["xray"]} --openfortivpn-bin {forti_binary}' if line.startswith(('ExecStart=', 'ExecStopPost=')) else line for line in template.splitlines())+'\n'
-    unit.write_text(template)
-    tls = context['work']/'tls'
-    stand.checked('openssl', 'req', '-new', '-newkey', 'rsa:2048', '-nodes', '-subj', '/CN=Forti stand', '-keyout', str(tls/'forti.key'), '-out', str(tls/'forti.csr'))
-    (tls/'forti.ext').write_text('subjectAltName=IP:10.213.0.2,IP:10.214.0.2,DNS:forti-a.example.test,DNS:10.213.0.2,DNS:10.214.0.2\nextendedKeyUsage=serverAuth\n')
-    stand.checked('openssl', 'x509', '-req', '-in', str(tls/'forti.csr'), '-CA', str(tls/'ca.crt'), '-CAkey', str(tls/'ca.key'), '-CAcreateserial', '-days', '1', '-extfile', str(tls/'forti.ext'), '-out', str(tls/'forti.crt'))
-    mode = context['work']/'forti-mode.json'
-    def set_mode(value):
-        temporary=mode.with_suffix('.next')
-        temporary.write_text(json.dumps(value));temporary.replace(mode)
-    set_mode(dict(mode='password'))
-    server = context['spawn']('a', ['python3', repo/'tests/forti_server.py', tls, '10.213.0.2', mode], 'forti-peer')
-    context['ns']('a', 'nft', '-f', '-', input='table inet forti_stand { chain nat { type nat hook postrouting priority srcnat; ip saddr 10.231.0.0/24 oifname "w4211a" masquerade; }; }\n')
-    context['ns']('resource', 'nft', '-f', '-', input='table inet forti_dns { chain dns { type nat hook prerouting priority dstnat; ip daddr 10.220.0.10 udp dport 53 dnat ip to 10.220.0.10:15353; ip daddr 10.220.0.10 tcp dport 53 dnat ip to 10.220.0.10:15353; }; }\n')
-    deadline = time.monotonic()+5
-    while not context['ns']('a','ss','-H','-lnt','sport = :10443').stdout.strip():
-        assert server.poll() is None and time.monotonic()<deadline
-        time.sleep(.05)
+    keys = Path('/run') / f'{prefix}-saml-ssh'
+    assert not any(p.exists() or p.is_symlink() for p in (alias, runtime, state, unit, bootstrap, keys))
     frozen = []
     sshd = forwarding = None
-    keys = Path('/run') / f'{prefix}-saml-ssh'
-    assert not keys.exists()
+    start_attempted = False
     try:
+        alias.mkdir(mode=0o755)
+        forti_binary=alias/'client'
+        forti_binary.symlink_to(native_binary)
+        bootstrap.write_text('127.0.0.1 localhost\n10.213.0.2 forti-a.example.test wrong-name.example.test\n')
+        bootstrap.chmod(0o644)
+        template = (repo/'packaging/systemd/wgates-native.service').read_text().replace('wgates', prefix)
+        template = template.replace('[Service]', '[Service]\nNetworkNamespacePath=/run/netns/'+context['names']['gateway']+'\nBindReadOnlyPaths='+str(bootstrap)+':/etc/hosts')
+        template = '\n'.join(line+f' --xray-bin {context["xray"]} --openfortivpn-bin {forti_binary}' if line.startswith(('ExecStart=', 'ExecStopPost=')) else line for line in template.splitlines())+'\n'
+        unit.write_text(template)
+        tls = context['work']/'tls'
+        stand.checked('openssl', 'req', '-new', '-newkey', 'rsa:2048', '-nodes', '-subj', '/CN=Forti stand', '-keyout', str(tls/'forti.key'), '-out', str(tls/'forti.csr'))
+        (tls/'forti.ext').write_text('subjectAltName=IP:10.213.0.2,IP:10.214.0.2,DNS:forti-a.example.test,DNS:10.213.0.2,DNS:10.214.0.2\nextendedKeyUsage=serverAuth\n')
+        stand.checked('openssl', 'x509', '-req', '-in', str(tls/'forti.csr'), '-CA', str(tls/'ca.crt'), '-CAkey', str(tls/'ca.key'), '-CAcreateserial', '-days', '1', '-extfile', str(tls/'forti.ext'), '-out', str(tls/'forti.crt'))
+        mode = context['work']/'forti-mode.json'
+        def set_mode(value):
+            temporary=mode.with_suffix('.next')
+            temporary.write_text(json.dumps(value));temporary.replace(mode)
+        set_mode(dict(mode='password'))
+        server = context['spawn']('a', ['python3', repo/'tests/forti_server.py', tls, '10.213.0.2', mode], 'forti-peer')
+        context['ns']('a', 'nft', '-f', '-', input='table inet forti_stand { chain nat { type nat hook postrouting priority srcnat; ip saddr 10.231.0.0/24 oifname "w4211a" masquerade; }; }\n')
+        context['ns']('resource', 'nft', '-f', '-', input='table inet forti_dns { chain dns { type nat hook prerouting priority dstnat; ip daddr 10.220.0.10 udp dport 53 dnat ip to 10.220.0.10:15353; ip daddr 10.220.0.10 tcp dport 53 dnat ip to 10.220.0.10:15353; }; }\n')
+        deadline = time.monotonic()+5
+        while not context['ns']('a','ss','-H','-lnt','sport = :10443').stdout.strip():
+            assert server.poll() is None and time.monotonic()<deadline
+            time.sleep(.05)
         stand.checked('systemctl', 'daemon-reload')
+        start_attempted = True
         stand.checked('systemctl', 'start', unit.name)
         group = control('group', 'create', '--name', 'Forti company')['data']['id']
         profile = dict(protocol='forti', options=[['host','forti-a.example.test'],['port','10443']], inline={'ca-file':(tls/'ca.crt').read_text()})
@@ -67,6 +67,7 @@ def acceptance(context, legacy=False):
         applied = control('routing', 'apply', preview['plan_id'])['data']
         assert applied['state'] == 'blocked', applied
         assert applied['capabilities'][group]['udp_ipv6']=='protocol_limit', applied
+        assert not list(runtime.glob('*/management.sock')), 'Forti must not bind an OpenVPN management socket'
         action = control('connection', 'login', connection)['data']
         assert action['method'] == 'password', action
         assert set(action['methods']) >= {'password', 'cookie'}, action
@@ -404,7 +405,7 @@ def acceptance(context, legacy=False):
         signal.pidfd_send_signal(descriptor, signal.SIGSTOP)
         stopped = control('connection','logout',connection)['data']
         assert stopped['authentication']=='stopped' and not stopped['resources_active'],stopped
-        assert select.select([descriptor],[],[],2)[0], 'logout left a stopped PPP descendant alive'
+        assert select.select([descriptor],[],[],0)[0], 'logout returned before its PPP descendant exited'
         print('Logout stops a PPP descendant even when its separate session ignores graceful termination',flush=True)
 
     finally:
@@ -419,11 +420,12 @@ def acceptance(context, legacy=False):
                     except ProcessLookupError: pass
                 if not select.select([descriptor],[],[],2)[0]: signal.pidfd_send_signal(descriptor,signal.SIGKILL)
             os.close(descriptor)
-        stand.checked('systemctl', 'stop', unit.name)
-        result = stand.checked('systemctl','show',unit.name,'--property=Result','--value').stdout.strip()
-        if result != 'success':
-            print('Retained private runtime names:', sorted(str(p.relative_to(runtime)) for p in runtime.rglob('*')), flush=True)
-            raise AssertionError('native cleanup failed; resources retained for inspection')
+        if start_attempted:
+            stand.checked('systemctl', 'stop', unit.name)
+            result = stand.checked('systemctl','show',unit.name,'--property=Result','--value').stdout.strip()
+            if result != 'success':
+                print('Retained private runtime names:', sorted(str(p.relative_to(runtime)) for p in runtime.rglob('*')), flush=True)
+                raise AssertionError('native cleanup failed; resources retained for inspection')
         if unit.exists(): unit.unlink()
         if bootstrap.exists(): bootstrap.unlink()
         if alias.exists(): shutil.rmtree(alias)

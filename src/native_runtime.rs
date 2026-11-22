@@ -1100,13 +1100,6 @@ impl Runtime {
     fn start(&self, record: Record) -> io::Result<Instance> {
         let dir = self.directory.join(&record.prepared.generation);
         secure_directory(&dir, 0o700, 0o077)?;
-        let socket = dir.join("management.sock");
-        if socket.exists() {
-            fs::remove_file(&socket)?;
-        }
-        let listener = UnixListener::bind(&socket)?;
-        listener.set_nonblocking(true)?;
-        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
         let auth_path = self.auth_path(&record);
         let (credentials, remembered) = match private_read(&auth_path, 32768) {
             Ok(bytes) => (
@@ -1119,9 +1112,7 @@ impl Runtime {
         };
         let auth = Authentication::new(credentials, remembered)?;
         let mut instance = Instance::new(record, auth);
-        instance.listener = Some(listener);
         if instance.record.profile["protocol"] == "forti" {
-            instance.listener = None;
             let mut driver = forti::Session::new(
                 &instance.record,
                 &dir,
@@ -1136,6 +1127,14 @@ impl Runtime {
             }
             return Ok(instance);
         }
+        let socket = dir.join("management.sock");
+        if socket.exists() {
+            fs::remove_file(&socket)?;
+        }
+        let listener = UnixListener::bind(&socket)?;
+        listener.set_nonblocking(true)?;
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+        instance.listener = Some(listener);
         if !instance.record.paused {
             let profile = profile(&instance.record.profile)?;
             let mut text = String::new();
@@ -1214,19 +1213,25 @@ impl Runtime {
         Ok(instance)
     }
     fn restore(&self, mut record: Record, client_available: bool) -> io::Result<Instance> {
-        let reason = if client_available {
+        let reason = if self.cleanup_runtime_files(&record).is_err() {
+            "native_cleanup_required"
+        } else if !client_available {
+            "native_adapter_unavailable"
+        } else {
             match self
                 .create_network(&mut record)
                 .and_then(|()| self.start(record.clone()))
             {
                 Ok(instance) => return Ok(instance),
                 Err(_) => {
-                    self.cleanup(&mut record, false)?;
-                    "native_restore_failed"
+                    self.cleanup_network(&mut record)?;
+                    if self.cleanup_runtime_files(&record).is_ok() {
+                        "native_restore_failed"
+                    } else {
+                        "native_cleanup_required"
+                    }
                 }
             }
-        } else {
-            "native_adapter_unavailable"
         };
         let mut auth = Authentication::new(Credentials::default(), false)?;
         auth.fail(reason);
@@ -1258,7 +1263,25 @@ impl Runtime {
         instance.proxy_gate = Some(gate);
         Ok(())
     }
-    fn cleanup(&self, record: &mut Record, forget: bool) -> io::Result<()> {
+    fn cleanup_network(&self, record: &mut Record) -> io::Result<()> {
+        let ns_path = Path::new("/run/netns").join(&record.namespace);
+        if record.profile["protocol"] == "forti"
+            && record.namespace_identity.is_some()
+            && let Ok(meta) = fs::symlink_metadata(&ns_path)
+            && record.namespace_identity == Some((meta.dev(), meta.ino()))
+        {
+            // openfortivpn can leave pppd in a separate process group while its PTY closes.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !command("/usr/sbin/ip", &["netns", "pids", &record.namespace])?
+                .trim()
+                .is_empty()
+            {
+                if Instant::now() >= deadline {
+                    return Err(invalid("native Forti namespace still has active processes"));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
         let table = format!("wgates_{}", record.prepared.generation);
         let tables: Value =
             serde_json::from_str(&command("/usr/sbin/nft", &["-j", "list", "tables"])?)?;
@@ -1277,7 +1300,6 @@ impl Runtime {
         }
         record.firewall_digest = None;
         self.save(record)?;
-        let ns_path = Path::new("/run/netns").join(&record.namespace);
         if ns_path.exists() {
             let meta = fs::symlink_metadata(&ns_path)?;
             let identity = (meta.dev(), meta.ino());
@@ -1333,6 +1355,9 @@ impl Runtime {
                     .unwrap_or_else(|| invalid("native link removal could not be confirmed")));
             }
         }
+        Ok(())
+    }
+    fn cleanup_runtime_files(&self, record: &Record) -> io::Result<()> {
         let dir = self.directory.join(&record.prepared.generation);
         if dir.exists() {
             secure_directory(&dir, 0o700, 0o077)?;
@@ -1360,7 +1385,11 @@ impl Runtime {
             }
             fs::remove_dir(dir)?;
         }
-        record.namespace_identity = None;
+        Ok(())
+    }
+    fn cleanup(&self, record: &mut Record, forget: bool) -> io::Result<()> {
+        self.cleanup_network(record)?;
+        self.cleanup_runtime_files(record)?;
         if forget {
             if !self.instances.values().any(|i| {
                 i.record.prepared.id == record.prepared.id
@@ -1628,6 +1657,9 @@ impl Runtime {
                 Ok(json!({"prepared":i.record.prepared,"observation":Self::observation(&i)}))
             }
             "login" => {
+                if i.auth.reason == "native_cleanup_required" {
+                    self.cleanup(&mut i.record, false)?;
+                }
                 if i.record.paused
                     || i.client.is_none()
                         && (i.forti.is_none() || i.auth.action().get("challenge_id").is_none())
@@ -1714,10 +1746,16 @@ impl Runtime {
                 i.proxy_gate = None;
                 i.listener = None;
                 i.forti = None;
-                self.cleanup(&mut i.record, false)?;
+                if let Err(error) = self.cleanup(&mut i.record, false) {
+                    i.auth.fail("native_cleanup_required");
+                    return Err(error);
+                }
                 Ok(json!(Self::observation(&i)))
             }
             "restart" => {
+                if i.auth.reason == "native_cleanup_required" {
+                    self.cleanup(&mut i.record, false)?;
+                }
                 self.client_version(i.record.profile["protocol"].as_str().unwrap_or(""))?;
                 i.record.paused = false;
                 self.save(&i.record)?;
@@ -1985,11 +2023,17 @@ pub fn run(mut args: impl Iterator<Item = OsString>, cleanup_only: bool) -> io::
             retained.push(record);
         }
     }
-    for record in &mut retained {
-        runtime.cleanup(record, false)?;
-    }
     if cleanup_only {
-        return Ok(());
+        let mut first_error = None;
+        for record in &mut retained {
+            if let Err(error) = runtime.cleanup(record, false) {
+                first_error.get_or_insert(error);
+            }
+        }
+        return first_error.map_or(Ok(()), Err);
+    }
+    for record in &mut retained {
+        runtime.cleanup_network(record)?;
     }
     runtime.preflight(&[])?;
     let mut clients = BTreeMap::new();

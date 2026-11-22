@@ -606,7 +606,27 @@ impl Session {
                 self.output[index].drain(..position + prompt.len());
                 auth.require("text", "Forti one-time response", None, String::new())?;
             }
-            while let Some(end) = self.output[index].iter().position(|b| *b == b'\n') {
+            while !self.output[index].is_empty() {
+                if index == 0 && auth.state == "authenticating" {
+                    let text = &self.output[index];
+                    if text.starts_with(b"Please")
+                        || option(&self.profile, "otp-prompt")
+                            .is_some_and(|prefix| text.starts_with(prefix.as_bytes()))
+                    {
+                        if text.len() > 79 {
+                            return Err(invalid("unsupported native Forti prompt"));
+                        }
+                        let text = std::str::from_utf8(text)
+                            .map_err(|_| invalid("invalid native Forti prompt encoding"))?;
+                        let prompt = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                        auth.require("text", &prompt, None, String::new())?;
+                        self.output[index].clear();
+                        break;
+                    }
+                }
+                let Some(end) = self.output[index].iter().position(|b| *b == b'\n') else {
+                    break;
+                };
                 let line = String::from_utf8(self.output[index].drain(..=end).collect())
                     .map_err(|_| invalid("invalid native Forti output encoding"))?;
                 if line.contains("Could not authenticate")
@@ -659,20 +679,6 @@ impl Session {
                     self.ready = true;
                     auth.authenticated("native_tunnel_ready");
                     self.relay = None;
-                }
-            }
-            if index == 0 && auth.state == "authenticating" && !self.output[index].is_empty() {
-                let text = std::str::from_utf8(&self.output[index])
-                    .map_err(|_| invalid("invalid native Forti prompt encoding"))?;
-                if text.starts_with("Please")
-                    || option(&self.profile, "otp-prompt")
-                        .is_some_and(|prefix| text.starts_with(prefix))
-                {
-                    if text.len() > 79 {
-                        return Err(invalid("unsupported native Forti prompt"));
-                    }
-                    auth.require("text", text, None, String::new())?;
-                    self.output[index].clear();
                 }
             }
         }

@@ -182,8 +182,10 @@ The fixture creates its own certificates, VPN servers, namespaces, account and
 units. It uses public CLI commands and VLESS ingress traffic, then cleans its
 owned resources. It requires root and must not run on a live gateway. Native
 acceptance uses synthetic credentials and controllable servers. The helper outage
-case separately checks VLESS monitoring, fallback and native recovery. Corporate
-VPN providers and interactive identity-provider policies need separate live checks.
+case separately checks VLESS monitoring, fallback and native recovery. Run the
+first command with `--mixed-adapters` to test OpenVPN recovery during Forti
+failures. That scenario also requires OpenFortiVPN and PPP. Corporate VPN
+providers and interactive identity-provider policies need separate live checks.
 
 Runtime acceptance covers Linux aarch64, OpenVPN 2.6.19 and Xray 26.9.9.
 The stand exercises UDP over IPv4 and TCP over IPv6 as VPN transports, with

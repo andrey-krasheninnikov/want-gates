@@ -108,7 +108,7 @@ def main(directory, address, mode_path):
                 self.reply(cookie=fields.get('code')==['forti-401-marker'] and fields.get('magic')==['forti-401-state']); return
             if mode.get('deny') or self.path != '/remote/logincheck': self.reply(); return
             if mode['mode']=='otp401' and user and password:
-                self.reply(b'<FORM action="/remote/otp"><p>Please enter one-time password: </p><INPUT name="code" type="password"><INPUT name="magic" type="hidden" value="forti-401-state"></FORM>',status=401); return
+                self.reply(b'<FORM action="/remote/otp"><p>Please enter\none-time password: </p><INPUT name="code" type="password"><INPUT name="magic" type="hidden" value="forti-401-state"></FORM>',status=401); return
             if mode['mode'] == 'otp' and user and password:
                 self.reply(b'tokeninfo=token&grp=group&reqid=1&polid=1&portal=office&magic=forti-state-marker&peer=peer'); return
             if mode['mode'] == 'push' and user and password:
