@@ -88,20 +88,22 @@ fn forti_assets_are_packaged_and_unsafe_native_options_never_reach_the_service()
     let ca = directory.join("keys/ca.pem");
     std::fs::write(&ca, include_str!("fixtures/health-ca.pem")).unwrap();
     let path = directory.join("office.conf");
-    let args = [
-        "connection",
-        "import",
-        "--group",
-        group["id"].as_str().unwrap(),
-        "--name",
-        "Office",
-        "--protocol",
-        "forti",
-        "--file",
-        path.to_str().unwrap(),
-    ];
+    let args = |name| {
+        [
+            "connection",
+            "import",
+            "--group",
+            group["id"].as_str().unwrap(),
+            "--name",
+            name,
+            "--protocol",
+            "forti",
+            "--file",
+            path.to_str().unwrap(),
+        ]
+    };
     std::fs::write(&path, "host = vpn.example.test\nca-file = keys/ca.pem\n").unwrap();
-    let connection = ok(&service, &args);
+    let connection = ok(&service, &args("Office"));
     std::fs::remove_file(ca).unwrap();
     assert_eq!(
         ok(
@@ -111,26 +113,35 @@ fn forti_assets_are_packaged_and_unsafe_native_options_never_reach_the_service()
         "forti"
     );
     std::os::unix::fs::symlink("/etc/passwd", directory.join("linked.pem")).unwrap();
-    for option in [
-        "password = private-secret-marker",
-        "cookie = private-secret-marker",
-        "pppd-plugin = /tmp/plugin.so",
-        "pppd-call = peer",
-        "pinentry = /tmp/program",
-        "insecure-ssl = 1",
-        "min-tls = 1.0",
-        "ca-file = /etc/passwd",
-        "ca-file = ../outside",
-        "ca-file = linked.pem",
-        "host = other.example.test",
-        "port = 0",
-        "port = 010443",
-        "unknown = private-secret-marker",
+    let credentials = "Forti credentials belong in connection login";
+    let unsupported = "unsupported Forti option;";
+    let invalid_value = "invalid or unsupported Forti option value";
+    let outside = "assets must stay inside the profile directory";
+    for (option, reason) in [
+        ("password = private-secret-marker", credentials),
+        ("cookie = private-secret-marker", credentials),
+        ("pppd-plugin = /tmp/plugin.so", unsupported),
+        ("pppd-call = peer", unsupported),
+        ("pinentry = /tmp/program", unsupported),
+        ("insecure-ssl = 1", unsupported),
+        ("min-tls = 1.0", invalid_value),
+        ("ca-file = /etc/passwd", outside),
+        ("ca-file = ../outside", outside),
+        (
+            "ca-file = linked.pem",
+            "asset is missing, linked, or inaccessible",
+        ),
+        ("host = other.example.test", "duplicate Forti option"),
+        ("port = 0", invalid_value),
+        ("port = 010443", invalid_value),
+        ("unknown = private-secret-marker", unsupported),
     ] {
         std::fs::write(&path, format!("host = vpn.example.test\n{option}\n")).unwrap();
-        let output = call(&service, &args);
+        let output = call(&service, &args("Rejected profile"));
         assert!(!output.status.success(), "accepted {option}");
-        assert!(!String::from_utf8_lossy(&output.stderr).contains("private-secret-marker"));
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(!error.contains("private-secret-marker"));
+        assert!(error.contains(reason), "expected rejection for {reason}");
     }
     assert_eq!(
         ok(&service, &["connection", "list"])
