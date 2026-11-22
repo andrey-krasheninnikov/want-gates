@@ -44,7 +44,10 @@ The system trust store is used when `ca-file` is absent. Native certificate and
 hostname validation remain enabled. `trusted-cert` accepts an explicit SHA-256
 certificate fingerprint using openfortivpn's native trust semantics: it can
 accept that exact certificate when ordinary validation fails. Confirm the
-fingerprint through a trusted channel before importing it.
+fingerprint through a trusted channel before importing it. Use a DNS name for
+native CA and hostname checks. The supported openfortivpn versions check DNS
+names in the certificate. An IPv4 gateway address requires a verified
+`trusted-cert` fingerprint.
 
 Supported options are `host`, `port`, `realm`, `trusted-cert`, `sni`, `min-tls`
 (1.2 or 1.3), `otp-prompt`, `otp-delay` (0 through 60), and `no-ftm-push`.
@@ -56,7 +59,8 @@ must appear together. Stdin accepts canonical JSON with `protocol: "forti"`,
 
 Credentials in profiles, hooks, plugins, external credential files, PKCS#11,
 pinentry, arbitrary PPP configuration and unsafe TLS options are rejected.
-Endpoint bootstrap uses the host resolver and pins IPv4 addresses privately.
+Endpoint bootstrap uses an exact hosts-file entry or an absolute DNS query
+without search suffixes, then pins the resulting IPv4 addresses privately.
 The endpoint cannot fall under a protected domain in any group.
 
 An explicit `--dns` overrides the first supported IPv4 server DNS. The selected
@@ -115,10 +119,12 @@ to start. Stop the SSH forward afterward. An expired flow requires a fresh login
 Cookie SSO remains available on clients without native SAML. Vendor-specific
 flows outside these native methods are unsupported.
 
-`--remember` saves only account/key base credentials in root-owned plaintext
-files, as for OpenVPN. SSO input and OTP cannot be remembered. Restart closes
-admission and requires fresh resource verification; a remembered password/key
-can authenticate again. Logout removes that connection's resources.
+`--remember` saves account/key credentials in root-owned plaintext files
+after the Forti tunnel authenticates. SSO input and OTP stay transient.
+Restart closes admission and can reuse saved credentials. A fresh login
+request after rejection lets you enter replacement credentials. If a PPP
+process is still exiting, retry restart once it stops. Resource verification
+runs again for the new session. Logout removes the connection's resources.
 `connection forget-auth` deletes saved credentials without revoking an already
 established session. Unknown cleanup resources remain available for inspection.
 

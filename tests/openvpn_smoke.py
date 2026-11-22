@@ -525,11 +525,11 @@ def acceptance(context, only_helper_outage=False, mixed_adapters=False):
         print('Packaged helper/control restart preserves private preparation and re-verifies new native sessions',flush=True)
         if mixed_adapters:
             forti_group=control('group','create','--name','Forti standby')['data']['id']
-            forti_id=control('connection','import','--group',forti_group,'--name','Forti standby','--protocol','forti','--file','-',payload=dict(protocol='forti',options=[['host','10.213.0.2'],['port','10443']],inline={}))['data']['id']
+            forti_id=control('connection','import','--group',forti_group,'--name','Forti standby','--protocol','forti','--file','-',payload=dict(protocol='forti',options=[['host','10.213.0.2'],['port','10443'],['trusted-cert','ab'*32]],inline={}))['data']['id']
             assert apply()['state']=='applied'
-            forti_action=control('connection','login',forti_id)['data']
-            control('connection','login',forti_id,'--file','-','--remember',payload=dict(challenge_id=forti_action['challenge_id'],username='forti-user',password='forti-password-marker'))
-            (forti_auth,) = state.glob(forti_id+'-*.auth')
+            (forti_record,) = [p for p in state.glob('*.json') if json.loads(p.read_text())['prepared']['id']==forti_id]
+            digest=json.loads(forti_record.read_text())['prepared']['profile_digest']
+            forti_auth=state/f'{forti_id}-{digest}.auth'
             forti_alias.unlink()
             def restart_after_crash():
                 pid=stand.checked('systemctl','show','--property=MainPID','--value',unit.name).stdout.strip()
@@ -547,6 +547,7 @@ def acceptance(context, only_helper_outage=False, mixed_adapters=False):
             traffic('10.220.0.10','10.211.0.1')
             assert apply()['state']=='applied'
             forti_alias.symlink_to('/usr/bin/openfortivpn')
+            forti_auth.touch(mode=0o600,exist_ok=False)
             forti_auth.write_text('{')
             stand.checked('systemctl','restart',unit.name)
             failed=await_connection(forti_id,lambda v:v.get('native_runtime',{}).get('reason')=='native_restore_failed')
@@ -554,7 +555,6 @@ def acceptance(context, only_helper_outage=False, mixed_adapters=False):
             await_connection(connection,lambda v:v.get('native_runtime',{}).get('admitted') and 'tcp_ipv4' in v['capabilities'],45)
             await_health(connection)
             traffic('10.220.0.10','10.211.0.1')
-            (forti_record,) = [p for p in state.glob('*.json') if json.loads(p.read_text())['prepared']['id']==forti_id]
             stand.checked('systemctl','stop',unit.name)
             runtime.mkdir(mode=0o750,exist_ok=True)
             os.chown(runtime,0,gid)
@@ -592,6 +592,11 @@ def acceptance(context, only_helper_outage=False, mixed_adapters=False):
                     time.sleep(.05)
                 observed=(proc/'ns/net').stat()
                 assert (observed.st_dev,observed.st_ino)==(identity.st_dev,identity.st_ino)
+                control('connection','restart',forti_id,success=False)
+                blocked=control('connection','show',forti_id)['data']
+                assert not blocked['native_runtime']['admitted'] and not blocked['capabilities'],blocked
+                control('connection','login',forti_id,success=False)
+                assert (namespace.stat().st_dev,namespace.stat().st_ino)==(identity.st_dev,identity.st_ino)
                 restart_after_crash()
                 retained=await_connection(forti_id,lambda v:v.get('native_runtime',{}).get('reason')=='native_cleanup_required')
                 assert retained['native_runtime']['resources_active'] and not retained['native_runtime']['admitted'],retained
@@ -602,6 +607,17 @@ def acceptance(context, only_helper_outage=False, mixed_adapters=False):
             finally:
                 holder.terminate()
                 holder.wait(timeout=5)
+            control('connection','restart',forti_id)
+            await_connection(forti_id,lambda v:v['authentication']=='credentials_required')
+            control('connection','logout',forti_id)
+            ns('gateway','ip','link','add',prepared['interface'],'type','veth','peer','name','wgn9-fixture')
+            try:
+                control('connection','restart',forti_id,success=False)
+                await_connection(forti_id,lambda v:v.get('native_runtime',{}).get('reason')=='native_cleanup_required')
+                control('connection','restart',forti_id,success=False)
+                ns('gateway','ip','link','show',prepared['interface'])
+            finally:
+                ns('gateway','ip','link','delete',prepared['interface'])
             control('connection','restart',forti_id)
             await_connection(forti_id,lambda v:v['authentication']=='credentials_required')
             control('connection','delete',forti_id)

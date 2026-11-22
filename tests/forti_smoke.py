@@ -21,8 +21,9 @@ def acceptance(context, legacy=False):
     native_binary = '/usr/bin/openfortivpn' if legacy else '/opt/forti-1.24.1/bin/openfortivpn'
     alias = Path('/run') / f'{prefix}-forti-client'
     bootstrap = Path('/run') / f'{prefix}-forti-bootstrap-hosts'
+    resolver = Path('/run') / f'{prefix}-forti-resolv'
     keys = Path('/run') / f'{prefix}-saml-ssh'
-    assert not any(p.exists() or p.is_symlink() for p in (alias, runtime, state, unit, bootstrap, keys))
+    assert not any(p.exists() or p.is_symlink() for p in (alias, runtime, state, unit, bootstrap, resolver, keys))
     frozen = []
     sshd = forwarding = None
     start_attempted = False
@@ -30,15 +31,43 @@ def acceptance(context, legacy=False):
         alias.mkdir(mode=0o755)
         forti_binary=alias/'client'
         forti_binary.symlink_to(native_binary)
-        bootstrap.write_text('127.0.0.1 localhost\n10.213.0.2 forti-a.example.test wrong-name.example.test\n')
+        bootstrap.write_text('127.0.0.1 localhost\n10.213.0.2 wrong-name.example.test\n')
         bootstrap.chmod(0o644)
+        resolver.write_text('nameserver 127.0.0.1\nsearch corp.test\noptions ndots:15 attempts:1 timeout:1\n')
+        dns_events = context['work']/'forti-bootstrap-queries'
+        dns_peer = r"""
+import socket, struct, sys
+server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+server.bind(('127.0.0.1', 53))
+with open(sys.argv[1], 'w', buffering=1) as events:
+    while True:
+        query, peer = server.recvfrom(2048)
+        offset, labels = 12, []
+        while query[offset]:
+            size = query[offset]
+            labels.append(query[offset + 1:offset + 1 + size])
+            offset += size + 1
+        name = b'.'.join(labels)
+        events.write(name.decode() + '\n')
+        question = query[12:offset + 5]
+        answer = b''
+        if name == b'forti-a.example.test':
+            answer = struct.pack('!HHHIH4s', 0xc00c, 1, 1, 0, 4, socket.inet_aton('10.213.0.2'))
+        flags = 0x8180 if answer else 0x8183
+        server.sendto(query[:2] + struct.pack('!5H', flags, 1, bool(answer), 0, 0) + question + answer, peer)
+"""
+        resolver_process = context['spawn']('gateway', ['python3', '-c', dns_peer, dns_events], 'forti-bootstrap-dns')
+        deadline = time.monotonic()+5
+        while not dns_events.exists():
+            assert resolver_process.poll() is None and time.monotonic()<deadline
+            time.sleep(.05)
         template = (repo/'packaging/systemd/wgates-native.service').read_text().replace('wgates', prefix)
-        template = template.replace('[Service]', '[Service]\nNetworkNamespacePath=/run/netns/'+context['names']['gateway']+'\nBindReadOnlyPaths='+str(bootstrap)+':/etc/hosts')
+        template = template.replace('[Service]', '[Service]\nNetworkNamespacePath=/run/netns/'+context['names']['gateway']+'\nBindReadOnlyPaths='+str(bootstrap)+':/etc/hosts '+str(resolver)+':/etc/resolv.conf')
         template = '\n'.join(line+f' --xray-bin {context["xray"]} --openfortivpn-bin {forti_binary}' if line.startswith(('ExecStart=', 'ExecStopPost=')) else line for line in template.splitlines())+'\n'
         unit.write_text(template)
         tls = context['work']/'tls'
         stand.checked('openssl', 'req', '-new', '-newkey', 'rsa:2048', '-nodes', '-subj', '/CN=Forti stand', '-keyout', str(tls/'forti.key'), '-out', str(tls/'forti.csr'))
-        (tls/'forti.ext').write_text('subjectAltName=IP:10.213.0.2,IP:10.214.0.2,DNS:forti-a.example.test,DNS:10.213.0.2,DNS:10.214.0.2\nextendedKeyUsage=serverAuth\n')
+        (tls/'forti.ext').write_text('subjectAltName=IP:10.213.0.2,IP:10.214.0.2,DNS:forti-a.example.test\nextendedKeyUsage=serverAuth\n')
         stand.checked('openssl', 'x509', '-req', '-in', str(tls/'forti.csr'), '-CA', str(tls/'ca.crt'), '-CAkey', str(tls/'ca.key'), '-CAcreateserial', '-days', '1', '-extfile', str(tls/'forti.ext'), '-out', str(tls/'forti.crt'))
         mode = context['work']/'forti-mode.json'
         def set_mode(value):
@@ -66,6 +95,8 @@ def acceptance(context, legacy=False):
         assert preview['eligibility'][ipv6_rule]['tcp_ipv6']['reason']=='protocol_limit', preview
         applied = control('routing', 'apply', preview['plan_id'])['data']
         assert applied['state'] == 'blocked', applied
+        bootstrap_queries = dns_events.read_text().splitlines()
+        assert bootstrap_queries and set(bootstrap_queries)=={'forti-a.example.test'},bootstrap_queries
         assert applied['capabilities'][group]['udp_ipv6']=='protocol_limit', applied
         assert not list(runtime.glob('*/management.sock')), 'Forti must not bind an OpenVPN management socket'
         action = control('connection', 'login', connection)['data']
@@ -119,6 +150,18 @@ def acceptance(context, legacy=False):
         control('connection','restart',connection)
         current = await_auth('authenticated')
         assert current['capabilities']==[], 'restart reused an earlier native admission'
+        set_mode(dict(mode='password', password='forti-replacement-marker'))
+        control('connection','restart',connection)
+        rejected=await_auth('failed')
+        assert rejected['native_runtime']['reason']=='authentication_rejected',rejected
+        replacement=control('connection','login',connection)['data']
+        assert replacement['method']=='password' and replacement['challenge_id'],replacement
+        control('connection','login',connection,'--file','-','--remember',payload=dict(challenge_id=replacement['challenge_id'],username='forti-user',password='forti-wrong-marker'))
+        await_auth('failed')
+        set_mode(dict(mode='password'))
+        control('connection','restart',connection)
+        await_auth('authenticated')
+        print('Rejected remembered credentials allow a fresh login and a failed replacement leaves the last working password saved',flush=True)
         control('connection','forget-auth',connection)
         max_password = 'p' * 256
         set_mode(dict(mode='otp', password=max_password))
@@ -126,7 +169,8 @@ def acceptance(context, legacy=False):
         await_auth('credentials_required')
         action = control('connection','login',connection)['data']
         control('connection','login',connection,'--file','-','--remember',payload=dict(challenge_id=action['challenge_id'],username='forti-user',password=max_password))
-        await_auth('challenge_required')
+        pending=await_auth('challenge_required')
+        assert not pending['native_runtime']['remembered'],pending
         challenge = control('connection','login',connection)['data']
         assert challenge['method']=='text',challenge
         answer = dict(challenge_id=challenge['challenge_id'],response='forti-otp-marker')
@@ -320,6 +364,8 @@ def acceptance(context, legacy=False):
         context['ns']('resource','nft','-f','-',input='add rule inet forti_dns dns ip daddr 10.221.0.10 udp dport 53 dnat ip to 10.221.0.10:15353\nadd rule inet forti_dns dns ip daddr 10.221.0.10 tcp dport 53 dnat ip to 10.221.0.10:15353\n')
         group_b=control('group','create','--name','Independent Forti company')['data']['id']
         profile_b=json.loads(json.dumps(profile));profile_b['options'][0][1]='10.214.0.2'
+        control('connection','import','--group',group_b,'--name','Forti B without pin','--protocol','forti','--file','-',payload=profile_b,success=False)
+        profile_b['options'].append(['trusted-cert',pin])
         connection_b=control('connection','import','--group',group_b,'--name','Forti B','--protocol','forti','--file','-','--dns','udp://10.221.0.10:53',payload=profile_b)['data']['id']
         probes_b=dict(tcp_ipv4=dict(url='http://10.221.0.10:18080/forti-b'),udp_ipv4=dict(server='10.221.0.10:15353',query_name='probe.example.test',query_type='A'),dns=dict(query_name='v4.dev.corp.test',query_type='A'))
         control('group','update',group_b,'--primary',connection_b,'--probe-file','-',payload=probes_b)
@@ -440,7 +486,8 @@ def acceptance(context, legacy=False):
                 print('Retained private runtime names:', sorted(str(p.relative_to(runtime)) for p in runtime.rglob('*')), flush=True)
                 raise AssertionError('native cleanup failed; resources retained for inspection')
         if unit.exists(): unit.unlink()
-        if bootstrap.exists(): bootstrap.unlink()
+        bootstrap.unlink(missing_ok=True)
+        resolver.unlink(missing_ok=True)
         if alias.exists(): shutil.rmtree(alias)
         stand.checked('systemctl', 'daemon-reload')
         for p in [runtime, state]:

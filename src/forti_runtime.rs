@@ -195,6 +195,7 @@ pub struct Session {
     output: [Vec<u8>; 2],
     dns: Option<String>,
     ready: bool,
+    pub remember_pending: bool,
     relay: Option<Relay>,
 }
 impl Session {
@@ -222,6 +223,7 @@ impl Session {
             output: [Vec::new(), Vec::new()],
             dns: None,
             ready: false,
+            remember_pending: false,
             relay: None,
         };
         if !record.paused {
@@ -259,13 +261,14 @@ impl Session {
         }
         let accepted = relay.thread.take().unwrap().join().unwrap_or(false);
         self.relay = None;
-        if auth.state == "browser_required" {
-            if accepted {
+        if matches!(
+            auth.state.as_str(),
+            "browser_required" | "challenge_required" | "authenticating"
+        ) {
+            if accepted && auth.state == "browser_required" {
                 auth.submitted();
-                auth.expires_at = Some(now() + 300);
-            } else {
-                auth.expires_at = Some(now());
             }
+            auth.expires_at = Some(now() + if accepted { 300 } else { 0 });
         }
         false
     }
@@ -435,9 +438,7 @@ impl Session {
             ));
         }
         self.launch(record, &mut staged, child, method, reply.cookie.as_deref())?;
-        if remember {
-            staged.remembered = true;
-        }
+        self.remember_pending = remember;
         *auth = staged;
         Ok(())
     }
@@ -473,6 +474,7 @@ impl Session {
             &self.directory.join("forti-ppp/options"),
             "noauth\nnoipv6\nnodefaultroute\nnoproxyarp\nnolog\n",
         )?;
+        crate::forti::check_gateway_identity(&self.profile)?;
         let host = option(&self.profile, "host").unwrap();
         let hosts = record
             .endpoints
@@ -727,6 +729,7 @@ impl Session {
         self.relay = None;
         self.dns = None;
         self.ready = false;
+        self.remember_pending = false;
     }
 }
 fn write_private(path: &Path, text: &str) -> io::Result<()> {
@@ -886,6 +889,7 @@ mod tests {
             output: Default::default(),
             dns: None,
             ready: false,
+            remember_pending: false,
             relay: Some(Relay {
                 path: PathBuf::new(),
                 expires_at: now() + SAML_CALLBACK_SECONDS,
@@ -894,15 +898,20 @@ mod tests {
             }),
         };
         let mut auth = Authentication::new(Default::default(), false).unwrap();
+        let browser_deadline = now() + 1;
+        auth.expires_at = Some(browser_deadline);
         auth.require("text", "One-time code", None, String::new())
             .unwrap();
-        let challenge = auth.action();
+        let mut challenge = auth.action();
+        assert_eq!(challenge["expires_at"], browser_deadline);
         let deadline = Instant::now() + Duration::from_secs(2);
         while session.relay.is_some() {
             assert!(Instant::now() < deadline);
             session.poll_callback(&mut auth);
             thread::yield_now();
         }
+        assert!(auth.expires_at.unwrap() >= browser_deadline + 299);
+        challenge["expires_at"] = json!(auth.expires_at);
         assert_eq!(auth.action(), challenge);
     }
 
