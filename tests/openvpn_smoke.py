@@ -534,7 +534,7 @@ def acceptance(context, only_helper_outage=False):
             time.sleep(.1)
         fault_state=await_connection(forti_id,lambda v:v.get('native_runtime',{}).get('reason')=='native_adapter_unavailable')
         assert not fault_state['native_runtime']['admitted']
-        await_connection(connection,lambda v:v['authentication']=='authenticated')
+        await_connection(connection,lambda v:v.get('native_runtime',{}).get('admitted') and 'tcp_ipv4' in v['capabilities'],45)
         await_health(connection)
         traffic('10.220.0.10','10.211.0.1')
         assert apply()['state']=='applied'
@@ -543,7 +543,7 @@ def acceptance(context, only_helper_outage=False):
         stand.checked('systemctl','restart',unit.name)
         failed=await_connection(forti_id,lambda v:v.get('native_runtime',{}).get('reason')=='native_restore_failed')
         assert not failed['native_runtime']['resources_active'] and not failed['capabilities'],failed
-        await_connection(connection,lambda v:v['authentication']=='authenticated')
+        await_connection(connection,lambda v:v.get('native_runtime',{}).get('admitted') and 'tcp_ipv4' in v['capabilities'],45)
         await_health(connection)
         traffic('10.220.0.10','10.211.0.1')
         control('connection','forget-auth',forti_id)
