@@ -111,6 +111,24 @@ struct Instance {
     admitted_session: Option<String>,
     proxy_gate: Option<bool>,
 }
+impl Instance {
+    fn new(record: Record, auth: Authentication) -> Self {
+        Self {
+            record,
+            auth,
+            client: None,
+            forti: None,
+            proxy: None,
+            listener: None,
+            management: None,
+            buffer: Vec::new(),
+            environment: None,
+            dns: None,
+            admitted_session: None,
+            proxy_gate: None,
+        }
+    }
+}
 struct Runtime {
     root: PathBuf,
     directory: PathBuf,
@@ -340,11 +358,12 @@ fn namespace_child(
     args: &[&str],
     stdin: Stdio,
     uid: Option<(u32, u32)>,
-    forti_directory: Option<&Path>,
+    forti: Option<(&Path, &File)>,
 ) -> io::Result<Child> {
     let namespace = File::open(Path::new("/run/netns").join(&record.namespace))?;
-    let mounts = forti_directory
-        .map(forti::mounts)
+    let config_fd = forti.map(|(_, config)| config.as_raw_fd());
+    let mounts = forti
+        .map(|(directory, _)| forti::mounts(directory))
         .transpose()?
         .unwrap_or_default();
     let mut cmd = Command::new(program);
@@ -423,6 +442,12 @@ fn namespace_child(
                         return Err(io::Error::last_os_error());
                     }
                 }
+            }
+            // Only the selected Forti child inherits its memory-backed config.
+            if let Some(fd) = config_fd
+                && libc::fcntl(fd, libc::F_SETFD, 0) != 0
+            {
+                return Err(io::Error::last_os_error());
             }
             // Changing UID clears PDEATHSIG, so arm it after credentials and check the parent again.
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 || libc::getppid() != parent
@@ -609,39 +634,8 @@ impl Runtime {
         }
         let mut versions = serde_json::Map::new();
         for protocol in protocols {
-            match protocol.as_str() {
-                "openvpn" => {
-                    executable(Path::new("/usr/sbin/openvpn"))?;
-                    let version = command("/usr/sbin/openvpn", &["--version"])?;
-                    if !version.starts_with("OpenVPN 2.6.") {
-                        return Err(invalid("native runtime requires supported OpenVPN 2.6.x"));
-                    }
-                    if !Path::new("/dev/net/tun").exists() {
-                        return Err(invalid(
-                            "TUN unavailable; provide /dev/net/tun to the native runtime",
-                        ));
-                    }
-                    versions.insert("openvpn".into(), json!(version.lines().next()));
-                }
-                "forti" => {
-                    let openfortivpn = executable(&self.openfortivpn)?;
-                    executable(Path::new("/usr/sbin/pppd"))?;
-                    let version = command(
-                        openfortivpn
-                            .to_str()
-                            .ok_or_else(|| invalid("invalid Forti executable path"))?,
-                        &["--version"],
-                    )?;
-                    forti::version(&version)?;
-                    if !Path::new("/dev/ppp").exists() {
-                        return Err(invalid(
-                            "PPP unavailable; provide kernel PPP and /dev/ppp to the native runtime",
-                        ));
-                    }
-                    versions.insert("openfortivpn".into(), json!(version.trim()));
-                }
-                _ => return Err(invalid("unsupported native preflight protocol")),
-            }
+            let (name, version) = self.client_version(protocol)?;
+            versions.insert(name.into(), json!(version));
         }
         if !command(
             self.xray
@@ -661,6 +655,41 @@ impl Runtime {
         Ok(
             json!({"clients":versions,"xray":"26.9.9","ipv4_forwarding":true,"ipv6_forwarding":fs::read_to_string("/proc/sys/net/ipv6/conf/all/forwarding").ok().is_some_and(|s|s.trim()=="1")}),
         )
+    }
+    fn client_version(&self, protocol: &str) -> io::Result<(&'static str, String)> {
+        match protocol {
+            "openvpn" => {
+                executable(Path::new("/usr/sbin/openvpn"))?;
+                let version = command("/usr/sbin/openvpn", &["--version"])?;
+                if !version.starts_with("OpenVPN 2.6.") {
+                    return Err(invalid("native runtime requires supported OpenVPN 2.6.x"));
+                }
+                if !Path::new("/dev/net/tun").exists() {
+                    return Err(invalid(
+                        "TUN unavailable; provide /dev/net/tun to the native runtime",
+                    ));
+                }
+                Ok(("openvpn", version.lines().next().unwrap().into()))
+            }
+            "forti" => {
+                let openfortivpn = executable(&self.openfortivpn)?;
+                executable(Path::new("/usr/sbin/pppd"))?;
+                let version = command(
+                    openfortivpn
+                        .to_str()
+                        .ok_or_else(|| invalid("invalid Forti executable path"))?,
+                    &["--version"],
+                )?;
+                forti::version(&version)?;
+                if !Path::new("/dev/ppp").exists() {
+                    return Err(invalid(
+                        "PPP unavailable; provide kernel PPP and /dev/ppp to the native runtime",
+                    ));
+                }
+                Ok(("openfortivpn", version.trim().into()))
+            }
+            _ => Err(invalid("unsupported native preflight protocol")),
+        }
     }
     fn prepare(&mut self, id: &str, generation: &str, value: &Value) -> io::Result<Value> {
         if !valid_id(id) || !valid_generation(generation) {
@@ -1089,20 +1118,8 @@ impl Runtime {
             Err(e) => return Err(e),
         };
         let auth = Authentication::new(credentials, remembered)?;
-        let mut instance = Instance {
-            record,
-            auth,
-            client: None,
-            forti: None,
-            proxy: None,
-            listener: Some(listener),
-            management: None,
-            buffer: Vec::new(),
-            environment: None,
-            dns: None,
-            admitted_session: None,
-            proxy_gate: None,
-        };
+        let mut instance = Instance::new(record, auth);
+        instance.listener = Some(listener);
         if instance.record.profile["protocol"] == "forti" {
             instance.listener = None;
             let mut driver = forti::Session::new(
@@ -1592,6 +1609,7 @@ impl Runtime {
                     || i.client.is_none()
                         && (i.forti.is_none() || i.auth.action().get("challenge_id").is_none())
                 {
+                    self.client_version(i.record.profile["protocol"].as_str().unwrap_or(""))?;
                     i.record.paused = false;
                     self.save(&i.record)?;
                     stop(&mut i.proxy);
@@ -1677,6 +1695,7 @@ impl Runtime {
                 Ok(json!(Self::observation(&i)))
             }
             "restart" => {
+                self.client_version(i.record.profile["protocol"].as_str().unwrap_or(""))?;
                 i.record.paused = false;
                 self.save(&i.record)?;
                 stop(&mut i.proxy);
@@ -1949,15 +1968,31 @@ pub fn run(mut args: impl Iterator<Item = OsString>, cleanup_only: bool) -> io::
     if cleanup_only {
         return Ok(());
     }
-    runtime.preflight(
-        &retained
-            .iter()
-            .filter_map(|r| r.profile["protocol"].as_str().map(str::to_owned))
-            .collect::<Vec<_>>(),
-    )?;
+    runtime.preflight(&[])?;
+    let mut clients = BTreeMap::new();
+    for record in &retained {
+        let protocol = record.profile["protocol"]
+            .as_str()
+            .ok_or_else(|| invalid("native protocol required"))?;
+        clients
+            .entry(protocol.to_owned())
+            .or_insert_with(|| runtime.client_version(protocol));
+    }
+    if clients.values().all(Result::is_err)
+        && let Some((_, Err(error))) = clients.pop_first()
+    {
+        return Err(error);
+    }
     for mut record in retained {
-        runtime.create_network(&mut record)?;
-        let instance = runtime.start(record)?;
+        let protocol = record.profile["protocol"].as_str().unwrap();
+        let instance = if clients[protocol].is_ok() {
+            runtime.create_network(&mut record)?;
+            runtime.start(record)?
+        } else {
+            let mut auth = Authentication::new(Credentials::default(), false)?;
+            auth.fail("native_adapter_unavailable");
+            Instance::new(record, auth)
+        };
         runtime
             .instances
             .insert(instance.record.prepared.generation.clone(), instance);

@@ -104,11 +104,12 @@ def acceptance(context, legacy=False):
         current = await_auth('authenticated')
         assert current['capabilities']==[], 'restart reused an earlier native admission'
         control('connection','forget-auth',connection)
-        set_mode(dict(mode='otp'))
+        max_password = 'p' * 256
+        set_mode(dict(mode='otp', password=max_password))
         control('connection','restart',connection)
         await_auth('credentials_required')
         action = control('connection','login',connection)['data']
-        control('connection','login',connection,'--file','-','--remember',payload=dict(challenge_id=action['challenge_id'],username='forti-user',password='forti-password-marker'))
+        control('connection','login',connection,'--file','-','--remember',payload=dict(challenge_id=action['challenge_id'],username='forti-user',password=max_password))
         await_auth('challenge_required')
         challenge = control('connection','login',connection)['data']
         assert challenge['method']=='text',challenge
@@ -117,14 +118,14 @@ def acceptance(context, legacy=False):
         control('connection','login',connection,'--file','-',payload=answer)
         await_auth('authenticated')
         control('connection','login',connection,'--file','-',payload=answer,success=False)
-        set_mode(dict(mode='otp401'))
+        set_mode(dict(mode='otp401', password=max_password))
         control('connection','restart',connection)
         await_auth('challenge_required')
         challenge=control('connection','login',connection)['data']
         control('connection','login',connection,'--file','-',payload=dict(challenge_id=challenge['challenge_id'],response='forti-401-marker'))
         await_auth('authenticated')
         print('Native HTTP 401 form challenge completes through the same login interface',flush=True)
-        set_mode(dict(mode='push'))
+        set_mode(dict(mode='push', password=max_password))
         control('connection','restart',connection)
         await_auth('authenticated')
         control('connection','forget-auth',connection)
@@ -184,8 +185,12 @@ def acceptance(context, legacy=False):
             while not context['ns']('gateway','ss','-H','-lnt','sport = :8020').stdout.strip():
                 assert forwarding.poll() is None and time.monotonic()<deadline
                 time.sleep(.05)
+            stand.run('ip','netns','exec',context['names']['gateway'],'curl','--noproxy','*','--max-time','3','-sS','http://127.0.0.1:8020/?id=invalid_test_id')
             context['ns']('gateway','curl','--noproxy','*','--max-time','5','--max-redirs','3','--cacert',tls/'ca.crt','--resolve','forti-a.example.test:10443:10.213.0.2','-fsSL',web['url'])
             current=await_auth('authenticated')
+            settled=control('connection','login',connection)['data']
+            assert settled['authentication']=='authenticated' and not settled['requires_input'],settled
+            assert not any(k in settled for k in ('challenge_id','url','ssh_forward')),settled
             assert not current['native_runtime']['remembered'] and current['capabilities']==[],current
             assert 'forti-saml-marker' not in json.dumps(current)
             replay=stand.run('ip','netns','exec',context['names']['gateway'],'curl','--noproxy','*','--max-time','2','-fsS','http://127.0.0.1:8020/?id=forti-saml-marker')
@@ -269,6 +274,9 @@ def acceptance(context, legacy=False):
         control('connection','login',connection,'--file','-',payload=dict(challenge_id=action['challenge_id'],method='cookie',cookie='SVPNCOOKIE=forti-cookie-marker',private_key_password='forti-key-password-marker'))
         current=await_auth('authenticated')
         assert not current['native_runtime']['remembered'],current
+        control('connection','forget-auth',connection)
+        assert control('connection','show',connection)['data']['authentication']=='authenticated'
+        assert not list(runtime.glob('*/forti-runtime/forti.conf')), 'passphrase config survived login and forget-auth'
         control('connection','restart',connection)
         await_auth('credentials_required')
         action=control('connection','login',connection)['data']

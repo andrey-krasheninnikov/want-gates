@@ -96,6 +96,15 @@ impl Authentication {
         self.state = "authenticating".into();
         self.reason = "operator_input_submitted".into();
     }
+    pub fn authenticated(&mut self, reason: &str) {
+        self.state = "authenticated".into();
+        self.reason = reason.into();
+        self.action = None;
+        self.expires_at = None;
+        self.connected_before = true;
+        self.dynamic_ready = false;
+        self.dynamic_response = None;
+    }
     pub fn describe(&self) -> Value {
         json!({"authentication":self.state,"reason":self.reason,"requires_input":self.action.is_some(),"action":self.action.as_ref().map(|a|a.kind),"expires_at":self.expires_at,"remembered":self.remembered})
     }
@@ -303,13 +312,7 @@ impl Authentication {
             let fields: Vec<_> = state.split(',').collect();
             match fields.get(1).copied() {
                 Some("CONNECTED") => {
-                    self.state = "authenticated".into();
-                    self.reason = "native_session_established".into();
-                    self.action = None;
-                    self.expires_at = None;
-                    self.connected_before = true;
-                    self.dynamic_ready = false;
-                    self.dynamic_response = None;
+                    self.authenticated("native_session_established");
                 }
                 Some("RECONNECTING" | "EXITING") => {
                     if self.state == "authenticated" {

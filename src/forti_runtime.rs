@@ -6,9 +6,10 @@ use crate::{invalid, secure_directory};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::{
@@ -17,6 +18,17 @@ use std::sync::{
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+const PASSWORD_LIMIT: usize = 256;
+const OTP_LIMIT: usize = 64;
+
+fn write_input(input: &mut ChildStdin, value: &str, limit: usize) -> io::Result<()> {
+    if value.len() == limit {
+        input.write_all(value.as_bytes())
+    } else {
+        writeln!(input, "{value}")
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -59,9 +71,8 @@ impl Relay {
             while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut browser, _)) => {
-                        if Self::exchange(&mut browser).is_ok() {
-                            break;
-                        }
+                        // A rejected native callback may still return an HTTP response.
+                        let _ = Self::exchange(&mut browser);
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(20))
@@ -104,14 +115,10 @@ impl Relay {
         {
             return Err(invalid("unsupported SAML callback request"));
         }
-        let url = url::Url::parse(&format!("http://127.0.0.1:8020{path}"))
-            .map_err(|_| invalid("invalid SAML callback URL"))?;
-        let pairs: Vec<_> = url.query_pairs().collect();
-        if pairs.len() != 1
-            || pairs[0].0 != "id"
-            || pairs[0].1.is_empty()
-            || pairs[0].1.len() > 1024
-            || pairs[0].1.chars().any(char::is_control)
+        let id = path.strip_prefix("/?id=").unwrap();
+        if id.is_empty()
+            || id.len() > 1024
+            || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
         {
             return Err(invalid("invalid SAML callback identifier"));
         }
@@ -260,12 +267,15 @@ impl Session {
             }
         }
         if reply.username.as_ref().is_some_and(|s| s.len() > 64)
-            || reply.password.as_ref().is_some_and(|s| s.len() > 256)
+            || reply
+                .password
+                .as_ref()
+                .is_some_and(|s| s.len() > PASSWORD_LIMIT)
             || reply
                 .private_key_password
                 .as_ref()
                 .is_some_and(|s| s.len() > 31)
-            || reply.response.as_ref().is_some_and(|s| s.len() > 64)
+            || reply.response.as_ref().is_some_and(|s| s.len() > OTP_LIMIT)
         {
             return Err(invalid(
                 "Forti authentication value exceeds its native limit",
@@ -289,7 +299,7 @@ impl Session {
                 .stdin
                 .as_mut()
                 .ok_or_else(|| invalid("native Forti challenge is no longer pending"))?;
-            writeln!(stdin, "{response}")?;
+            write_input(stdin, &response, OTP_LIMIT)?;
             auth.submitted();
             auth.expires_at = Some(now() + 300);
             return Ok(());
@@ -443,8 +453,19 @@ impl Session {
             }
             config += &format!("pem-passphrase = {password}\n");
         }
-        write_private(&runtime.join("forti.conf"), &config)?;
-        let mut args = vec!["--config", "/run/forti.conf", "--pppd-ifname=wgates-tun"];
+        // The native client reads the config once. Its PEM passphrase has no named file.
+        // SAFETY: the name is a static C string. A successful call returns a new owned fd.
+        let fd = unsafe { libc::memfd_create(c"wgates-forti-config".as_ptr(), libc::MFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: successful memfd_create transferred ownership of fd to this File.
+        let mut config_file = unsafe { File::from_raw_fd(fd) };
+        config_file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        config_file.write_all(config.as_bytes())?;
+        config_file.rewind()?;
+        let config_path = format!("/proc/self/fd/{fd}");
+        let mut args = vec!["--config", &config_path, "--pppd-ifname=wgates-tun"];
         if method == "cookie" {
             args.push("--cookie-on-stdin");
         }
@@ -457,7 +478,7 @@ impl Session {
             &args,
             Stdio::piped(),
             None,
-            Some(&self.directory),
+            Some((&self.directory, &config_file)),
         )?;
         self.stdin = process.stdin.take();
         *child = Some(process);
@@ -533,7 +554,7 @@ impl Session {
                     .stdin
                     .as_mut()
                     .ok_or_else(|| invalid("Forti password input unavailable"))?;
-                writeln!(stdin, "{password}")?;
+                write_input(stdin, password, PASSWORD_LIMIT)?;
             }
             let prompt = b"Two-factor authentication token: ";
             if let Some(position) = self.output[index]
@@ -594,9 +615,7 @@ impl Session {
                         ],
                     )?;
                     self.ready = true;
-                    auth.state = "authenticated".into();
-                    auth.reason = "native_tunnel_ready".into();
-                    auth.expires_at = None;
+                    auth.authenticated("native_tunnel_ready");
                     self.relay = None;
                 }
             }

@@ -102,7 +102,7 @@ def main(directory, address, mode_path):
             fields = parse_qs(read_exact(self.rfile, int(self.headers.get('Content-Length', '0'))).decode(), keep_blank_values=True)
             mode = json.loads(mode_path.read_text())
             user = fields.get('username') == ['forti-user']
-            password = fields.get('credential') == ['forti-password-marker']
+            password = fields.get('credential') == [mode.get('password', 'forti-password-marker')]
             if mode['mode']=='otp401' and self.path=='/remote/otp':
                 self.reply(cookie=fields.get('code')==['forti-401-marker'] and fields.get('magic')==['forti-401-state']); return
             if mode.get('deny') or self.path != '/remote/logincheck': self.reply(); return

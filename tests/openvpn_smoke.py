@@ -172,6 +172,8 @@ def acceptance(context, only_helper_outage=False):
     authentication = None
     helper_enabled = False
     unit = Path('/run/systemd/system') / f'{prefix}-native.service'
+    forti_alias = Path('/run') / f'{prefix}-forti-client'
+    assert not forti_alias.exists()
     assert not unit.exists()
     class HelperUnit:
         def poll(self):
@@ -191,7 +193,8 @@ def acceptance(context, only_helper_outage=False):
         ns('resource', 'nft', '-f', '-', input='table inet native_dns { chain input { type nat hook prerouting priority dstnat; ip daddr 10.220.0.10 udp dport 53 dnat ip to 10.220.0.10:15353; ip daddr 10.220.0.10 tcp dport 53 dnat ip to 10.220.0.10:15353; }; }\n')
         template = (Path(__file__).resolve().parent.parent/'packaging/systemd/wgates-native.service').read_text().replace('wgates',prefix)
         template = template.replace('[Service]', '[Service]\nNetworkNamespacePath=/run/netns/'+context['names']['gateway'])
-        template = '\n'.join(line+f' --xray-bin {xray}' if line.startswith(('ExecStart=','ExecStopPost=')) else line for line in template.splitlines())+'\n'
+        forti_alias.symlink_to('/usr/bin/openfortivpn')
+        template = '\n'.join(line+f' --xray-bin {xray} --openfortivpn-bin {forti_alias}' if line.startswith(('ExecStart=','ExecStopPost=')) else line for line in template.splitlines())+'\n'
         unit.write_text(template)
         stand.checked('systemd-analyze','verify',str(unit))
         stand.checked('systemctl','daemon-reload')
@@ -515,6 +518,28 @@ def acceptance(context, only_helper_outage=False):
         traffic('10.220.0.10','10.211.0.1')
         traffic('10.221.0.10','10.212.0.1')
         print('Packaged helper/control restart preserves private preparation and re-verifies new native sessions',flush=True)
+        forti_group=control('group','create','--name','Forti standby')['data']['id']
+        forti_id=control('connection','import','--group',forti_group,'--name','Forti standby','--protocol','forti','--file','-',payload=dict(protocol='forti',options=[['host','10.213.0.2'],['port','10443']],inline={}))['data']['id']
+        assert apply()['state']=='applied'
+        forti_alias.unlink()
+        pid=stand.checked('systemctl','show','--property=MainPID','--value',unit.name).stdout.strip()
+        assert int(pid)>0
+        stand.checked('systemctl','kill','--kill-who=main','--signal=SIGKILL',unit.name)
+        deadline=time.monotonic()+25
+        while not (runtime/'control.sock').is_socket() or stand.checked('systemctl','show','--property=MainPID','--value',unit.name).stdout.strip() in ('0',pid):
+            assert time.monotonic()<deadline,'native helper did not restart after abrupt exit'
+            time.sleep(.1)
+        fault_state=await_connection(forti_id,lambda v:v.get('native_runtime',{}).get('reason')=='native_adapter_unavailable')
+        assert not fault_state['native_runtime']['admitted']
+        await_connection(connection,lambda v:v['authentication']=='authenticated')
+        await_health(connection)
+        traffic('10.220.0.10','10.211.0.1')
+        forti_alias.symlink_to('/usr/bin/openfortivpn')
+        control('connection','restart',forti_id)
+        await_connection(forti_id,lambda v:v['authentication']=='credentials_required')
+        control('connection','delete',forti_id)
+        assert apply()['state']=='applied'
+        print('Packaged helper recovers after abrupt exit and isolates a missing Forti adapter',flush=True)
         fault=control('connection','import','--group',group,'--name','Native preparation collision','--protocol','openvpn','--file','-',payload=profile)['data']['id']
         plan=control('routing','preview')['data']['plan_id']
         # The private plan is used only to inject a deterministic ownership collision.
@@ -593,6 +618,7 @@ def acceptance(context, only_helper_outage=False):
         print('Native helper namespace, veth and nftables cleanup confirmed',flush=True)
         if helper_enabled: stand.checked('systemctl','disable','--runtime',unit.name)
         if unit.exists(): unit.unlink(); stand.checked('systemctl','daemon-reload')
+        forti_alias.unlink(missing_ok=True)
         # These paths were absent before this fixture and belong only to its helper.
         for path in (runtime, state):
             if path.exists():
