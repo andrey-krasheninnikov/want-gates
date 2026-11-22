@@ -173,13 +173,14 @@ def acceptance(context, legacy=False):
             assert callback.parent==runtime and callback.is_socket() and callback.stat().st_mode & 0o777==0o660
             denied=stand.run('runuser','-u','nobody','--','python3','-c','import socket, sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1])',callback)
             assert denied.returncode!=0 and 'PermissionError' in denied.stderr, denied.stderr
+            stand.checked('runuser','-u',prefix,'--','test','-w',callback)
             keys.mkdir(mode=0o700)
             for label in ['host','operator']:
                 stand.checked('ssh-keygen','-q','-t','ed25519','-N','','-C','Forti acceptance','-f',str(keys/label))
             host_type, host_key = (keys/'host.pub').read_text().split()[:2]
             (keys/'known_hosts').write_text(f'[127.0.0.1]:22222 {host_type} {host_key}\n')
             configuration = keys/'sshd.conf'
-            configuration.write_text(f'Port 22222\nListenAddress 127.0.0.1\nHostKey {keys}/host\nPidFile {keys}/sshd.pid\nAuthorizedKeysFile {keys}/operator.pub\nPermitRootLogin prohibit-password\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM yes\nAllowTcpForwarding no\nAllowStreamLocalForwarding local\nGatewayPorts no\nLogLevel VERBOSE\n')
+            configuration.write_text(f'Port 22222\nListenAddress 127.0.0.1\nHostKey {keys}/host\nPidFile {keys}/sshd.pid\nAuthorizedKeysFile {keys}/operator.pub\nPermitRootLogin prohibit-password\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM yes\nAllowTcpForwarding local\nAllowStreamLocalForwarding local\nGatewayPorts no\nLogLevel VERBOSE\n')
             Path('/run/sshd').mkdir(mode=0o755,exist_ok=True)
             sshd = context['spawn']('gateway',['/usr/sbin/sshd','-D','-e','-f',configuration],'saml-sshd')
             deadline=time.monotonic()+5

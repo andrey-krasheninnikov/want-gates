@@ -106,9 +106,10 @@ ssh -N -L 127.0.0.1:8020:REMOTE_SOCKET VPS_ALIAS
 ```
 
 Replace `REMOTE_SOCKET` with the returned path. Local port 8020 must be free.
-The VPS SSH account needs access to the `wgates` group and permission to
-forward Unix sockets. Complete the browser step within 50 seconds. The relay
-closes when openfortivpn accepts the callback, when the deadline expires, or
+Use a VPS SSH account that can access the `wgates` control socket. OpenSSH
+must allow local TCP and Unix socket forwarding for that account. Complete the
+browser step within 50 seconds. The relay closes when openfortivpn accepts
+the callback, when the deadline expires, or
 when you log out. Once the callback is accepted, the VPN has up to five minutes
 to start. Stop the SSH forward afterward. An expired flow requires a fresh login.
 Cookie SSO remains available on clients without native SAML. Vendor-specific
