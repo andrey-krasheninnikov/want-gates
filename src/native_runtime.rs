@@ -1751,7 +1751,10 @@ impl Runtime {
                 if i.auth.reason == "native_cleanup_required" {
                     self.cleanup(&mut i.record, false)?;
                 }
+                let forti_auth_ended =
+                    i.forti.is_some() && matches!(i.auth.state.as_str(), "failed" | "expired");
                 if i.record.paused
+                    || forti_auth_ended
                     || i.client.is_none()
                         && (i.forti.is_none() || i.auth.action().get("challenge_id").is_none())
                 {
