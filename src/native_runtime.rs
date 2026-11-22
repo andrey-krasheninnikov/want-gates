@@ -624,10 +624,10 @@ impl Runtime {
                     versions.insert("openvpn".into(), json!(version.lines().next()));
                 }
                 "forti" => {
-                    executable(&self.openfortivpn)?;
+                    let openfortivpn = executable(&self.openfortivpn)?;
                     executable(Path::new("/usr/sbin/pppd"))?;
                     let version = command(
-                        self.openfortivpn
+                        openfortivpn
                             .to_str()
                             .ok_or_else(|| invalid("invalid Forti executable path"))?,
                         &["--version"],
@@ -1405,8 +1405,13 @@ impl Runtime {
         if let Some(child) = i.client.as_mut()
             && child_exited(child)?
         {
+            if let Some(driver) = i.forti.as_mut() {
+                driver.poll(&i.record, &mut i.auth, child)?;
+            }
             stop(&mut i.client);
-            i.auth.fail("native_client_exited");
+            if !matches!(i.auth.state.as_str(), "failed" | "expired") {
+                i.auth.fail("native_client_exited");
+            }
             i.dns = None;
             i.admitted_session = None;
             stop(&mut i.proxy);

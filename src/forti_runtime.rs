@@ -152,6 +152,7 @@ impl Session {
         auth: &mut Authentication,
     ) -> io::Result<Self> {
         let profile = decoded_profile(&record.profile)?;
+        let executable = super::executable(executable)?;
         let output = super::command(
             executable
                 .to_str()
@@ -162,7 +163,7 @@ impl Session {
         let session = Self {
             profile,
             directory: directory.to_owned(),
-            executable: executable.to_owned(),
+            executable,
             version,
             stdin: None,
             output: [Vec::new(), Vec::new()],

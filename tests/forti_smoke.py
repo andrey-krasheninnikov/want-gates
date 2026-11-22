@@ -18,7 +18,12 @@ def acceptance(context, legacy=False):
     runtime, state = Path('/run') / f'{prefix}-native', Path('/var/lib') / f'{prefix}-native'
     unit = Path('/run/systemd/system') / f'{prefix}-native.service'
     repo = Path(__file__).resolve().parent.parent
-    forti_binary = '/usr/bin/openfortivpn' if legacy else '/opt/forti-1.24.1/bin/openfortivpn'
+    native_binary = '/usr/bin/openfortivpn' if legacy else '/opt/forti-1.24.1/bin/openfortivpn'
+    alias = Path('/run') / f'{prefix}-forti-client'
+    assert not alias.exists()
+    alias.mkdir(mode=0o755)
+    forti_binary=alias/'client'
+    forti_binary.symlink_to(native_binary)
     bootstrap = Path('/run') / f'{prefix}-forti-bootstrap-hosts'
     assert not any(p.exists() for p in [runtime, state, unit, bootstrap])
     bootstrap.write_text('127.0.0.1 localhost\n10.213.0.2 forti-a.example.test wrong-name.example.test\n')
@@ -73,9 +78,12 @@ def acceptance(context, legacy=False):
                 if value['authentication']==expected:return value
                 assert time.monotonic()<deadline,value
                 time.sleep(.05)
+        forti_binary.unlink()
         credentials = dict(challenge_id=action['challenge_id'], username='forti-user', password='forti-password-marker')
         control('connection','login',connection,'--file','-','--remember',payload=credentials)
         current = await_auth('authenticated')
+        forti_binary.symlink_to(native_binary)
+        print('Prepared Forti session retains its resolved native path after a launcher alias disappears',flush=True)
         assert current['capabilities']==[],current
         assert current['native_runtime']['dns']=='udp://10.220.0.10:53',current
         control('connection','login',connection,'--file','-',payload=credentials,success=False)
@@ -134,6 +142,17 @@ def acceptance(context, legacy=False):
             assert marker not in public
             assert all(marker.encode() not in p.read_bytes() for p in state.glob('*.auth'))
         print('Remember/forget, fresh-session admission, native OTP/push, replay rejection and cookie SSO passed',flush=True)
+        set_mode(dict(mode='password',deny=True))
+        control('connection','restart',connection)
+        await_auth('credentials_required')
+        action=control('connection','login',connection)['data']
+        control('connection','login',connection,'--file','-',payload=dict(challenge_id=action['challenge_id'],username='forti-user',password='forti-password-marker'))
+        rejected=await_auth('failed')
+        assert rejected['native_runtime']['reason']=='authentication_rejected',rejected
+        time.sleep(.2)
+        rejected=control('connection','show',connection)['data']
+        assert rejected['authentication']=='failed' and rejected['native_runtime']['reason']=='authentication_rejected',rejected
+        print('Rejected native credentials keep their terminal authentication reason after client exit',flush=True)
         set_mode(dict(mode='saml'))
         control('connection','restart',connection)
         await_auth('credentials_required')
@@ -388,6 +407,7 @@ def acceptance(context, legacy=False):
             raise AssertionError('native cleanup failed; resources retained for inspection')
         if unit.exists(): unit.unlink()
         if bootstrap.exists(): bootstrap.unlink()
+        if alias.exists(): shutil.rmtree(alias)
         stand.checked('systemctl', 'daemon-reload')
         for p in [runtime, state]:
             if p.exists(): shutil.rmtree(p)
