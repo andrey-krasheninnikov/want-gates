@@ -7,16 +7,13 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, Write};
-use std::net::{Ipv4Addr, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, chown};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Stdio};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -46,15 +43,29 @@ struct Reply {
     response: Option<String>,
     cookie: Option<String>,
 }
+#[derive(Default)]
+struct RelaySockets {
+    browser: Option<UnixStream>,
+    native: Option<TcpStream>,
+}
+
 struct Relay {
     path: PathBuf,
     expires_at: u64,
-    stopping: Arc<AtomicBool>,
+    sockets: Arc<Mutex<Option<RelaySockets>>>,
     thread: Option<JoinHandle<bool>>,
 }
 impl Drop for Relay {
     fn drop(&mut self) {
-        self.stopping.store(true, Ordering::Relaxed);
+        let sockets = self.sockets.lock().unwrap().take();
+        if let Some(sockets) = sockets {
+            if let Some(browser) = sockets.browser {
+                let _ = browser.shutdown(Shutdown::Both);
+            }
+            if let Some(native) = sockets.native {
+                let _ = native.shutdown(Shutdown::Both);
+            }
+        }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -77,8 +88,8 @@ impl Relay {
         chown(&path, Some(0), Some(fs::metadata(root)?.gid()))?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o660))?;
         listener.set_nonblocking(true)?;
-        let stopping = Arc::new(AtomicBool::new(false));
-        let stop = stopping.clone();
+        let sockets = Arc::new(Mutex::new(Some(RelaySockets::default())));
+        let active = sockets.clone();
         let expires_at = now() + SAML_CALLBACK_SECONDS;
         let deadline = Instant::now() + Duration::from_secs(SAML_CALLBACK_SECONDS);
         let thread = thread::Builder::new().spawn(move || {
@@ -87,10 +98,14 @@ impl Relay {
             if unsafe { libc::setns(namespace.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
                 return false;
             }
-            while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+            while active.lock().unwrap().is_some() && Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut browser, _)) => {
-                        if Self::exchange(&mut browser, deadline).unwrap_or(false) {
+                        let accepted = Self::exchange(&mut browser, deadline, &active);
+                        if let Some(sockets) = active.lock().unwrap().as_mut() {
+                            *sockets = RelaySockets::default();
+                        }
+                        if accepted.unwrap_or(false) {
                             return true;
                         }
                     }
@@ -105,7 +120,7 @@ impl Relay {
         Ok(Self {
             path,
             expires_at,
-            stopping,
+            sockets,
             thread: Some(thread),
         })
     }
@@ -149,7 +164,17 @@ impl Relay {
         }
         Ok(id)
     }
-    fn exchange(browser: &mut UnixStream, deadline: Instant) -> io::Result<bool> {
+    fn exchange(
+        browser: &mut UnixStream,
+        deadline: Instant,
+        active: &Mutex<Option<RelaySockets>>,
+    ) -> io::Result<bool> {
+        active
+            .lock()
+            .unwrap()
+            .as_mut()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::ConnectionAborted))?
+            .browser = Some(browser.try_clone()?);
         browser.set_write_timeout(Some(Duration::from_secs(1)))?;
         let mut request = Vec::new();
         let request_deadline = deadline.min(Instant::now() + Duration::from_secs(2));
@@ -167,8 +192,15 @@ impl Relay {
         let id = Self::callback_id(text)?;
         let mut native = TcpStream::connect_timeout(
             &"127.0.0.1:8020".parse().unwrap(),
-            Self::timeout_until(deadline)?,
+            // Drop can cancel socket I/O after connect returns.
+            Self::timeout_until(deadline)?.min(Duration::from_millis(100)),
         )?;
+        active
+            .lock()
+            .unwrap()
+            .as_mut()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::ConnectionAborted))?
+            .native = Some(native.try_clone()?);
         native.set_read_timeout(Some(Duration::from_secs(1)))?;
         native.set_write_timeout(Some(Self::timeout_until(deadline)?))?;
         native.write_all(
@@ -763,7 +795,6 @@ impl Session {
                     )?;
                     self.ready = true;
                     auth.authenticated("native_tunnel_ready");
-                    self.relay = None;
                 }
             }
         }
@@ -969,7 +1000,7 @@ mod tests {
             relay: Some(Relay {
                 path: PathBuf::new(),
                 expires_at: now() + SAML_CALLBACK_SECONDS,
-                stopping: Arc::new(AtomicBool::new(false)),
+                sockets: Arc::new(Mutex::new(Some(RelaySockets::default()))),
                 thread: Some(thread::spawn(|| true)),
             }),
         };
@@ -994,7 +1025,42 @@ mod tests {
     #[test]
     fn expired_saml_callback_returns_before_reading_the_request() {
         let (mut relay, _browser) = UnixStream::pair().unwrap();
-        let error = Relay::exchange(&mut relay, Instant::now()).unwrap_err();
+        let sockets = Mutex::new(Some(RelaySockets::default()));
+        let error = Relay::exchange(&mut relay, Instant::now(), &sockets).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn stopping_saml_relay_interrupts_pending_browser_read() {
+        let (mut server, mut browser) = UnixStream::pair().unwrap();
+        browser
+            .write_all(b"GET /?id=fixture-id HTTP/1.1\r\n")
+            .unwrap();
+        let sockets = Arc::new(Mutex::new(Some(RelaySockets::default())));
+        let active = sockets.clone();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let relay = Relay {
+            path: PathBuf::new(),
+            expires_at: now() + SAML_CALLBACK_SECONDS,
+            sockets,
+            thread: Some(thread::spawn(move || {
+                Relay::exchange(&mut server, deadline, &active).unwrap_or(false)
+            })),
+        };
+        while relay
+            .sockets
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .browser
+            .is_none()
+        {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        let start = Instant::now();
+        drop(relay);
+        assert!(start.elapsed() < Duration::from_millis(500));
     }
 }
