@@ -25,6 +25,9 @@ const OTP_LIMIT: usize = 64;
 const SAML_CALLBACK_SECONDS: u64 = 50;
 
 fn write_input(input: &mut ChildStdin, value: &str, limit: usize) -> io::Result<()> {
+    if value.len() > limit {
+        return Err(invalid("Forti input exceeds its native limit"));
+    }
     if value.len() == limit {
         input.write_all(value.as_bytes())
     } else {
@@ -195,6 +198,7 @@ pub struct Session {
     output: [Vec<u8>; 2],
     dns: Option<String>,
     ready: bool,
+    gateway_connected: bool,
     pub remember_pending: bool,
     relay: Option<Relay>,
 }
@@ -223,6 +227,7 @@ impl Session {
             output: [Vec::new(), Vec::new()],
             dns: None,
             ready: false,
+            gateway_connected: false,
             remember_pending: false,
             relay: None,
         };
@@ -565,6 +570,16 @@ impl Session {
             )?;
             auth.expires_at = Some(relay.expires_at);
         }
+        let password = if method == "password" {
+            Some(
+                auth.credentials
+                    .password
+                    .as_deref()
+                    .ok_or_else(|| invalid("Forti password unavailable"))?,
+            )
+        } else {
+            None
+        };
         let process = namespace_child(
             record,
             &self.executable,
@@ -575,9 +590,15 @@ impl Session {
         )?;
         let mut process = Some(process);
         let mut stdin = process.as_mut().unwrap().stdin.take();
-        if let Some(cookie) = cookie
-            && let Err(error) = stdin.take().unwrap().write_all(cookie.as_bytes())
-        {
+        let initial_input = if let Some(cookie) = cookie {
+            stdin.take().unwrap().write_all(cookie.as_bytes())
+        } else if let Some(password) = password {
+            // openfortivpn reads the account password before connecting to the gateway.
+            write_input(stdin.as_mut().unwrap(), password, PASSWORD_LIMIT)
+        } else {
+            Ok(())
+        };
+        if let Err(error) = initial_input {
             super::stop(&mut process);
             return Err(error);
         }
@@ -590,6 +611,7 @@ impl Session {
         *child = process;
         self.output = [Vec::new(), Vec::new()];
         self.ready = false;
+        self.gateway_connected = false;
         self.dns = None;
         Ok(())
     }
@@ -619,37 +641,19 @@ impl Session {
                     Err(e) => return Err(e),
                 }
             }
-            let password_prompt = b"VPN account password: ";
-            if let Some(position) = self.output[index]
-                .windows(password_prompt.len())
-                .position(|w| w == password_prompt)
-            {
-                self.output[index].drain(..position + password_prompt.len());
-                let password = auth
-                    .credentials
-                    .password
-                    .as_deref()
-                    .ok_or_else(|| invalid("Forti password unavailable"))?;
-                let stdin = self
-                    .stdin
-                    .as_mut()
-                    .ok_or_else(|| invalid("Forti password input unavailable"))?;
-                write_input(stdin, password, PASSWORD_LIMIT)?;
-            }
-            let prompt = b"Two-factor authentication token: ";
-            if let Some(position) = self.output[index]
-                .windows(prompt.len())
-                .position(|w| w == prompt)
-            {
-                self.output[index].drain(..position + prompt.len());
-                auth.require("text", "Forti one-time response", None, String::new())?;
-            }
             while !self.output[index].is_empty() {
+                let text = &self.output[index];
+                let log_prefixes: &[&[u8]] = &[b"INFO:   ", b"WARN:   ", b"ERROR:  ", b"DEBUG:  "];
                 if index == 0
+                    && self.gateway_connected
                     && matches!(auth.state.as_str(), "authenticating" | "browser_required")
+                    && !log_prefixes
+                        .iter()
+                        .any(|prefix| text.starts_with(prefix) || prefix.starts_with(text))
                 {
-                    let text = &self.output[index];
-                    if text.starts_with(b"Please")
+                    let challenge = if text.starts_with(b"Two-factor authentication token: ") {
+                        Some("Forti one-time response".to_owned())
+                    } else if text.starts_with(b"Please")
                         || option(&self.profile, "otp-prompt")
                             .is_some_and(|prefix| text.starts_with(prefix.as_bytes()))
                     {
@@ -658,7 +662,11 @@ impl Session {
                         }
                         let text = std::str::from_utf8(text)
                             .map_err(|_| invalid("invalid native Forti prompt encoding"))?;
-                        let prompt = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                        Some(text.split_whitespace().collect::<Vec<_>>().join(" "))
+                    } else {
+                        None
+                    };
+                    if let Some(prompt) = challenge {
                         auth.require("text", &prompt, None, String::new())?;
                         self.output[index].clear();
                         break;
@@ -678,7 +686,8 @@ impl Session {
                     || line.contains("certificate verify failed")
                 {
                     return Err(invalid("server_certificate_verification_failed"));
-                } else if line.contains("Connected to gateway") {
+                } else if line.trim_end() == "INFO:   Connected to gateway." {
+                    self.gateway_connected = true;
                     auth.reason = "forti_gateway_connected".into();
                 } else if line.contains("Authenticated") {
                     auth.reason = "forti_authentication_accepted".into();
@@ -702,6 +711,8 @@ impl Session {
                             })
                             .map(|ip| format!("udp://{ip}:53"));
                     }
+                } else if line.trim_end() == "INFO:   Setting wgates-tun interface down." {
+                    return Err(invalid("native_tunnel_down"));
                 } else if line.contains("Tunnel is up and running") {
                     super::ns(
                         record,
@@ -889,6 +900,7 @@ mod tests {
             output: Default::default(),
             dns: None,
             ready: false,
+            gateway_connected: false,
             remember_pending: false,
             relay: Some(Relay {
                 path: PathBuf::new(),

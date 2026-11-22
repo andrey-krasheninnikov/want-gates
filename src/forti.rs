@@ -140,10 +140,14 @@ fn validate_and_normalize(profile: &mut Profile) -> io::Result<()> {
                 _ => false,
             },
             "otp-prompt" => false,
-            "no-ftm-push" => matches!(value, "0" | "1"),
             "min-tls" => matches!(value, "1.2" | "1.3"),
-            "set-dns" | "set-routes" | "pppd-use-peerdns" | "use-resolvconf" => {
-                matches!(value, "0" | "1")
+            "no-ftm-push" | "set-dns" | "set-routes" | "pppd-use-peerdns" | "use-resolvconf" => {
+                match value.to_ascii_lowercase().as_str() {
+                    "true" | "1" => *stored_value = "1".into(),
+                    "false" | "0" => *stored_value = "0".into(),
+                    _ => return Err(invalid("invalid Forti boolean option")),
+                }
+                true
             }
             "persistent" => value == "0",
             "password" | "username" | "otp" | "cookie" | "pem-passphrase" => {
@@ -220,6 +224,19 @@ mod tests {
         let restored = decoded_profile(&saved).unwrap();
         assert_eq!(option(&restored, "host"), Some("xn--bro-hoa.example"));
         assert_eq!(option(&restored, "sni"), Some("xn--bro-hoa.example"));
+    }
+
+    #[test]
+    fn normalizes_native_forti_boolean_options() {
+        let profile = parse(
+            "host = vpn.example.test
+set-dns = False
+no-ftm-push = TRUE
+",
+        )
+        .unwrap();
+        assert_eq!(profile["options"][1], json!(["set-dns", "0"]));
+        assert_eq!(profile["options"][2], json!(["no-ftm-push", "1"]));
     }
 
     #[test]

@@ -620,6 +620,21 @@ def acceptance(context, only_helper_outage=False, mixed_adapters=False):
                 ns('gateway','ip','link','delete',prepared['interface'])
             control('connection','restart',forti_id)
             await_connection(forti_id,lambda v:v['authentication']=='credentials_required')
+            table='wgates_'+forti_record.stem
+            ns('gateway','nft','add','chain','inet',table,'retained_stand')
+            original=json.loads(ns('gateway','nft','-j','list','table','inet',table).stdout)
+            try:
+                restart_after_crash()
+                retained=await_connection(forti_id,lambda v:v.get('native_runtime',{}).get('reason')=='native_cleanup_required')
+                assert not retained['native_runtime']['admitted'],retained
+                assert json.loads(ns('gateway','nft','-j','list','table','inet',table).stdout)==original
+                await_connection(connection,lambda v:v.get('native_runtime',{}).get('admitted') and 'tcp_ipv4' in v['capabilities'],45)
+                traffic('10.220.0.10','10.211.0.1')
+            finally:
+                ns('gateway','nft','delete','chain','inet',table,'retained_stand')
+            control('connection','restart',forti_id)
+            await_connection(forti_id,lambda v:v['authentication']=='credentials_required')
+            print('Forti firewall drift is preserved while OpenVPN remains usable after helper restart',flush=True)
             control('connection','delete',forti_id)
             assert apply()['state']=='applied'
             print('Packaged helper recovers after abrupt exit and isolates a missing Forti adapter',flush=True)

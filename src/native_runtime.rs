@@ -1261,7 +1261,7 @@ impl Runtime {
             {
                 Ok(instance) => return Ok(instance),
                 Err(_) => {
-                    if self.cleanup_network(&mut record)?
+                    if self.cleanup_network(&mut record)?.is_none()
                         && self.cleanup_runtime_files(&record).is_ok()
                     {
                         "native_restore_failed"
@@ -1348,45 +1348,49 @@ impl Runtime {
         }
         Ok(false)
     }
-    fn cleanup_network(&self, record: &mut Record) -> io::Result<bool> {
+    fn cleanup_network(&self, record: &mut Record) -> io::Result<Option<&'static str>> {
         let ns_path = Path::new("/run/netns").join(&record.namespace);
         let table = format!("wgates_{}", record.prepared.generation);
         let tables: Value =
             serde_json::from_str(&command("/usr/sbin/nft", &["-j", "list", "tables"])?)?;
-        let present = tables["nftables"].as_array().is_some_and(|a| {
-            a.iter()
-                .any(|v| v["table"]["family"] == "inet" && v["table"]["name"] == table)
-        });
-        if present {
-            let actual = nft_digest(None, &table)?;
-            if record.firewall_digest.as_ref() != Some(&actual) {
-                return Err(invalid(
-                    "owned native firewall changed or ownership is uncertain; retain resources for inspection",
-                ));
-            }
+        let present = tables["nftables"]
+            .as_array()
+            .ok_or_else(|| invalid("invalid native firewall table list"))?
+            .iter()
+            .any(|v| v["table"]["family"] == "inet" && v["table"]["name"] == table);
+        // Detach the verified bridge before leaving any retained namespace or firewall in place.
+        if let Some(reason) = Self::detach_bridge(record)? {
+            return Ok(Some(reason));
+        }
+        if present && record.firewall_digest.as_ref() != Some(&nft_digest(None, &table)?) {
+            return Ok(Some(
+                "native firewall ownership changed; retain it for inspection",
+            ));
         }
         if Self::forti_processes_remain(record)? {
-            // A disconnected namespace cannot keep an old bridge reachable.
-            Self::detach_bridge(record)?;
-            return Ok(false);
+            return Ok(Some("native Forti namespace still has active processes"));
         }
         if present {
             nft(None, &format!("delete table inet {table}"))?;
         }
         record.firewall_digest = None;
         self.save(record)?;
-        if ns_path.exists() {
-            let meta = fs::symlink_metadata(&ns_path)?;
+        let ns_meta = match fs::symlink_metadata(&ns_path) {
+            Ok(meta) => Some(meta),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        if let Some(meta) = ns_meta {
             let identity = (meta.dev(), meta.ino());
             if record.namespace_identity == Some(identity) {
                 let path = CString::new(ns_path.as_os_str().as_encoded_bytes())
                     .map_err(|_| invalid("invalid namespace path"))?;
                 // SAFETY: fresh metadata confirms this exact owned namespace mount before detaching it.
                 if unsafe { libc::umount2(path.as_ptr(), libc::MNT_DETACH) } != 0 {
-                    return Err(io::Error::last_os_error());
+                    return Ok(Some("native namespace mount could not be detached"));
                 }
             } else if record.namespace_file != Some(identity) {
-                return Err(invalid(
+                return Ok(Some(
                     "native namespace ownership is uncertain; inspect retained resources",
                 ));
             }
@@ -1396,7 +1400,7 @@ impl Runtime {
                 || meta.uid() != 0
                 || meta.nlink() != 1
             {
-                return Err(invalid(
+                return Ok(Some(
                     "native namespace file changed; retain it for inspection",
                 ));
             }
@@ -1405,36 +1409,35 @@ impl Runtime {
         record.namespace_identity = None;
         record.namespace_file = None;
         self.save(record)?;
-        Self::detach_bridge(record)?;
-        Ok(true)
+        Ok(None)
     }
-    fn detach_bridge(record: &Record) -> io::Result<()> {
+    fn detach_bridge(record: &Record) -> io::Result<Option<&'static str>> {
         let links: Value =
             serde_json::from_str(&command("/usr/sbin/ip", &["-d", "-j", "link", "show"])?)?;
         if let Some(link) = links
             .as_array()
-            .unwrap()
+            .ok_or_else(|| invalid("invalid native link list"))?
             .iter()
             .find(|v| v["ifname"] == record.interface)
         {
             if link["ifalias"] != record.prepared.generation {
-                return Err(invalid(
+                return Ok(Some(
                     "native link ownership changed; retain it for inspection",
                 ));
             }
-            let deletion = command("/usr/sbin/ip", &["link", "delete", &record.interface]);
+            let _ = command("/usr/sbin/ip", &["link", "delete", &record.interface]);
             let remaining: Value =
                 serde_json::from_str(&command("/usr/sbin/ip", &["-j", "link", "show"])?)?;
             if remaining
                 .as_array()
-                .is_none_or(|links| links.iter().any(|link| link["ifname"] == record.interface))
+                .ok_or_else(|| invalid("invalid native link list"))?
+                .iter()
+                .any(|link| link["ifname"] == record.interface)
             {
-                return Err(deletion
-                    .err()
-                    .unwrap_or_else(|| invalid("native link removal could not be confirmed")));
+                return Ok(Some("native link removal could not be confirmed"));
             }
         }
-        Ok(())
+        Ok(None)
     }
     fn cleanup_runtime_files(&self, record: &Record) -> io::Result<()> {
         let dir = self.directory.join(&record.prepared.generation);
@@ -1467,8 +1470,8 @@ impl Runtime {
         Ok(())
     }
     fn cleanup(&self, record: &mut Record, forget: bool) -> io::Result<()> {
-        if !self.cleanup_network(record)? {
-            return Err(invalid("native Forti namespace still has active processes"));
+        if let Some(reason) = self.cleanup_network(record)? {
+            return Err(invalid(reason));
         }
         self.cleanup_runtime_files(record)?;
         if forget {
@@ -2116,7 +2119,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>, cleanup_only: bool) -> io::
     }
     let mut generations = Vec::with_capacity(retained.len());
     for mut record in retained {
-        let network_clean = runtime.cleanup_network(&mut record)?;
+        let network_clean = runtime.cleanup_network(&mut record)?.is_none();
         generations.push((record, network_clean));
     }
     runtime.preflight(&[])?;

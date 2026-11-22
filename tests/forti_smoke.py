@@ -85,7 +85,7 @@ with open(sys.argv[1], 'w', buffering=1) as events:
         start_attempted = True
         stand.checked('systemctl', 'start', unit.name)
         group = control('group', 'create', '--name', 'Forti company')['data']['id']
-        profile = dict(protocol='forti', options=[['host','forti-a.example.test'],['port','10443']], inline={'ca-file':(tls/'ca.crt').read_text()})
+        profile = dict(protocol='forti', options=[['host','forti-a.example.test'],['port','10443'],['otp-prompt','I']], inline={'ca-file':(tls/'ca.crt').read_text()})
         connection = control('connection', 'import', '--group', group, '--name', 'Forti native', '--protocol', 'forti', '--file', '-', payload=profile)['data']['id']
         control('group', 'update', group, '--primary', connection, '--probe-file', '-', payload=dict(tcp_ipv4=dict(url='http://10.220.0.10:18080/forti'),udp_ipv4=dict(server='10.220.0.10:15353',query_name='probe.example.test',query_type='A'),dns=dict(query_name='v4.corp.test',query_type='A')))
         control('rule','create','--group',group,'--destination','corp.test')
@@ -136,6 +136,17 @@ with open(sys.argv[1], 'w', buffering=1) as events:
             result=stand.run('ip','netns','exec',context['names']['client'],'curl','--noproxy','','--socks5-hostname','127.0.0.1:10880','--max-time','2','-fsS',f'http://[{address}]:18080/forti')
             assert result.returncode!=0,'unsupported Forti IPv6 escaped'
         print('Real openfortivpn/pppd authentication, private DNS and VLESS TCP/UDP over IPv4 passed; IPv6 blocked',flush=True)
+        set_mode(dict(mode='password', disconnect=True))
+        stand.run('ip','netns','exec',context['names']['client'],'curl','--noproxy','','--socks5-hostname','127.0.0.1:10880','--max-time','2','-fsS','http://10.220.0.10:18080/forti-disconnect')
+        disconnected=await_auth('unknown')
+        assert disconnected['native_runtime']['reason']=='native_tunnel_down',disconnected
+        assert not disconnected['native_runtime']['admitted'] and disconnected['native_runtime']['dns'] is None,disconnected
+        set_mode(dict(mode='password'))
+        control('connection','restart',connection)
+        await_auth('authenticated')
+        plan=control('routing','preview')['data']['plan_id']
+        assert control('routing','apply',plan)['data']['capabilities'][group]['tcp_ipv4']=='verified'
+        print('Stock Forti PPP down notification revokes admission and DNS',flush=True)
         (record,) = [p for p in state.glob('*.json') if json.loads(p.read_text())['prepared']['id']==connection]
         private_runtime=runtime/record.stem/'forti-runtime'
         permissions=private_runtime.stat().st_mode & 0o777
@@ -182,6 +193,7 @@ with open(sys.argv[1], 'w', buffering=1) as events:
         control('connection','restart',connection)
         await_auth('challenge_required')
         challenge=control('connection','login',connection)['data']
+        assert challenge['prompt']=='Input access code:',challenge
         control('connection','login',connection,'--file','-',payload=dict(challenge_id=challenge['challenge_id'],response='forti-401-marker'))
         await_auth('authenticated')
         print('Native HTTP 401 form challenge completes through the same login interface',flush=True)
