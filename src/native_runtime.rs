@@ -695,8 +695,8 @@ impl Runtime {
                 Ok(("openvpn", version.lines().next().unwrap().into()))
             }
             "forti" => {
-                let openfortivpn = executable(&self.openfortivpn)?;
-                executable(Path::new("/usr/sbin/pppd"))?;
+                let openfortivpn = forti::checked_executable(&self.openfortivpn)?;
+                forti::checked_executable(Path::new("/usr/sbin/pppd"))?;
                 let version = command(
                     openfortivpn
                         .to_str()

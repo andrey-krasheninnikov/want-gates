@@ -210,7 +210,7 @@ impl Session {
         auth: &mut Authentication,
     ) -> io::Result<Self> {
         let profile = decoded_profile(&record.profile)?;
-        let executable = super::executable(executable)?;
+        let executable = checked_executable(executable)?;
         let output = super::command(
             executable
                 .to_str()
@@ -600,10 +600,10 @@ impl Session {
         } else {
             None
         };
-        if super::executable(&self.executable)? != self.executable {
+        if checked_executable(&self.executable)? != self.executable {
             return Err(invalid("prepared openfortivpn executable path changed"));
         }
-        super::executable(Path::new("/usr/sbin/pppd"))?;
+        checked_executable(Path::new("/usr/sbin/pppd"))?;
         if let Some(min_tls) = min_tls {
             let executable = self
                 .executable
@@ -801,8 +801,8 @@ pub fn version(output: &str) -> io::Result<(u32, u32)> {
     }
 }
 
-pub fn mounts(directory: &Path) -> io::Result<Vec<(std::ffi::CString, std::ffi::CString)>> {
-    use std::ffi::{CStr, CString};
+fn mount_targets() -> io::Result<[PathBuf; 5]> {
+    use std::ffi::CStr;
     // SAFETY: getpwuid returns a libc-owned record; copy its home path immediately.
     let home = unsafe {
         let account = libc::getpwuid(0);
@@ -818,19 +818,49 @@ pub fn mounts(directory: &Path) -> io::Result<Vec<(std::ffi::CString, std::ffi::
     if !home.is_absolute() || home == Path::new("/") {
         return Err(invalid("unsupported root home for PPP isolation"));
     }
+    let mut targets = [
+        PathBuf::from("/etc/ppp"),
+        home,
+        PathBuf::from("/etc/hosts"),
+        PathBuf::from("/var/lock"),
+        PathBuf::from("/run"),
+    ];
+    for target in &mut targets {
+        *target = target.canonicalize()?;
+        if target == Path::new("/") {
+            return Err(invalid("invalid root target for a private Forti mount"));
+        }
+    }
+    Ok(targets)
+}
+
+pub fn checked_executable(path: &Path) -> io::Result<PathBuf> {
+    let executable = super::executable(path)?;
+    if mount_targets()?
+        .iter()
+        .any(|target| executable.starts_with(target))
+    {
+        return Err(invalid(
+            "Forti private mounts would hide the executable; install it outside /run, /etc/ppp and root's home",
+        ));
+    }
+    Ok(executable)
+}
+
+pub fn mounts(directory: &Path) -> io::Result<Vec<(std::ffi::CString, std::ffi::CString)>> {
+    use std::ffi::CString;
     let sources = [
-        (directory.join("forti-ppp"), PathBuf::from("/etc/ppp")),
-        (directory.join("forti-home"), home),
-        (directory.join("forti-hosts"), PathBuf::from("/etc/hosts")),
-        (
-            directory.join("forti-runtime/lock"),
-            Path::new("/var/lock").canonicalize()?,
-        ),
-        (directory.join("forti-runtime"), PathBuf::from("/run")),
+        "forti-ppp",
+        "forti-home",
+        "forti-hosts",
+        "forti-runtime/lock",
+        "forti-runtime",
     ];
     sources
         .into_iter()
+        .zip(mount_targets()?)
         .map(|(source, target)| {
+            let source = directory.join(source);
             let source = CString::new(source.as_os_str().as_encoded_bytes())
                 .map_err(|_| invalid("invalid private Forti mount source"))?;
             let target = CString::new(target.as_os_str().as_encoded_bytes())
