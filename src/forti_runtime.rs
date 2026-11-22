@@ -683,10 +683,7 @@ impl Session {
                 if index == 0
                     && self.gateway_connected
                     && matches!(auth.state.as_str(), "authenticating" | "browser_required")
-                    && !crate::forti::LOG_LABELS.iter().any(|label| {
-                        let prefix = label.as_bytes();
-                        text.starts_with(prefix) || prefix.starts_with(text)
-                    })
+                    && !crate::forti::overlaps_log_label(text)
                 {
                     let challenge = if text.starts_with(b"Two-factor authentication token: ") {
                         Some("Forti one-time response".to_owned())

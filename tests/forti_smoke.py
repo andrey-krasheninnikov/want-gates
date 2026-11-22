@@ -88,7 +88,7 @@ with open(sys.argv[1], 'w', buffering=1) as events:
         start_attempted = True
         stand.checked('systemctl', 'start', unit.name)
         group = control('group', 'create', '--name', 'Forti company')['data']['id']
-        profile = dict(protocol='forti', options=[['host','forti-a.example.test'],['port','10443'],['otp-prompt','I'],['min-tls','1.2']], inline={'ca-file':(tls/'ca.crt').read_text()})
+        profile = dict(protocol='forti', options=[['host','forti-a.example.test'],['port','10443'],['otp-prompt','Input'],['min-tls','1.2']], inline={'ca-file':(tls/'ca.crt').read_text()})
         if not legacy:
             profile['options'].append(['sni','forti-a.example.test'])
         connection = control('connection', 'import', '--group', group, '--name', 'Forti native', '--protocol', 'forti', '--file', '-', payload=profile)['data']['id']
@@ -423,6 +423,22 @@ with open(sys.argv[1], 'w', buffering=1) as events:
                 assert time.monotonic()<deadline,value
                 time.sleep(.1)
         selected(connection)
+        set_mode(dict(mode='certificate',disconnect=True,logout_delay=4))
+        stand.run('ip','netns','exec',context['names']['client'],'curl','--noproxy','','--socks5-hostname','127.0.0.1:10880','--max-time','1','-fsS','http://10.220.0.10:18080/forti-slow-logout')
+        deadline=time.monotonic()+2.5
+        while time.monotonic()<deadline:
+            other=control('connection','show',connection_b)['data']
+            assert other['native_runtime']['admitted'],other
+            time.sleep(.05)
+        failed=await_auth('unknown')
+        assert failed['native_runtime']['reason']=='native_tunnel_down',failed
+        selected(reserve)
+        traffic('v4.dev.corp.test','10.212.0.1')
+        set_mode(dict(mode='certificate'))
+        control('connection','restart',connection)
+        await_auth('authenticated')
+        selected(connection)
+        print('A slow Forti gateway logout leaves the other company admitted',flush=True)
         set_mode(dict(mode='certificate',drop_data=True))
         selected(reserve)
         assert control('connection','show',connection)['data']['authentication']=='authenticated','the test must break resource access while keeping the native session up'

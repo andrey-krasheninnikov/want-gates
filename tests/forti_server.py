@@ -121,6 +121,10 @@ def main(directory, address, mode_path):
         def do_GET(self):
             parsed = urlsplit(self.path)
             mode = json.loads(mode_path.read_text())
+            if parsed.path == '/remote/logout' and mode.get('logout_delay'):
+                time.sleep(mode['logout_delay'])
+                self.reply()
+                return
             if parsed.path == '/remote/saml/start': self.reply(redirect='http://127.0.0.1:8020/?id=forti-saml-marker'); return
             if parsed.path == '/remote/saml/auth_id':
                 time.sleep(mode.get('saml_delay', 0))

@@ -148,6 +148,7 @@ struct Runtime {
     xray: PathBuf,
     openfortivpn: PathBuf,
     instances: BTreeMap<String, Instance>,
+    reaping: Vec<Child>,
 }
 
 fn valid_generation(s: &str) -> bool {
@@ -1517,7 +1518,20 @@ impl Runtime {
             remembered: instance.auth.remembered,
         }
     }
+    fn stop_in_poll(&mut self, process: &mut Option<Child>, forti: bool) {
+        if !forti {
+            stop(process);
+        } else if let Some(child) = process.take()
+            && child_exited(&child).is_ok()
+        {
+            // SAFETY: waitid with WNOWAIT still holds the owned group leader's PID.
+            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+            self.reaping.push(child);
+        }
+    }
     fn poll(&mut self) {
+        self.reaping
+            .retain_mut(|child| matches!(child.try_wait(), Ok(None)));
         let keys: Vec<_> = self.instances.keys().cloned().collect();
         for key in keys {
             let mut instance = self.instances.remove(&key).unwrap();
@@ -1527,9 +1541,10 @@ impl Runtime {
                 instance.auth.reason = error.to_string();
                 instance.dns = None;
                 instance.admitted_session = None;
-                stop(&mut instance.proxy);
+                let forti = instance.forti.is_some();
+                self.stop_in_poll(&mut instance.proxy, forti);
                 instance.proxy_gate = None;
-                stop(&mut instance.client);
+                self.stop_in_poll(&mut instance.client, forti);
                 if let Some(driver) = instance.forti.as_mut() {
                     driver.stopped();
                 }
@@ -1538,8 +1553,9 @@ impl Runtime {
             self.instances.insert(key, instance);
         }
     }
-    fn poll_instance(&self, i: &mut Instance) -> io::Result<()> {
-        if let Some(reason) = (if i.forti.is_none() {
+    fn poll_instance(&mut self, i: &mut Instance) -> io::Result<()> {
+        let forti = i.forti.is_some();
+        if let Some(reason) = (if !forti {
             child_diagnostic(&mut i.client)?
         } else {
             None
@@ -1556,9 +1572,9 @@ impl Runtime {
         if !awaiting_callback && i.auth.expire() {
             i.dns = None;
             i.admitted_session = None;
-            stop(&mut i.proxy);
+            self.stop_in_poll(&mut i.proxy, forti);
             i.proxy_gate = None;
-            stop(&mut i.client);
+            self.stop_in_poll(&mut i.client, forti);
             i.management = None;
         }
         if let Some(child) = i.proxy.as_mut()
@@ -1578,7 +1594,7 @@ impl Runtime {
             }
             i.dns = None;
             i.admitted_session = None;
-            stop(&mut i.proxy);
+            self.stop_in_poll(&mut i.proxy, forti);
             i.proxy_gate = None;
             i.management = None;
         }
@@ -1607,7 +1623,7 @@ impl Runtime {
                 self.proxy(i, i.admitted_session.as_ref() == Some(&i.auth.session))?;
             } else {
                 i.admitted_session = None;
-                stop(&mut i.proxy);
+                self.stop_in_poll(&mut i.proxy, true);
                 i.proxy_gate = None;
             }
             return Ok(());
@@ -2097,6 +2113,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>, cleanup_only: bool) -> io::
         xray,
         openfortivpn,
         instances: BTreeMap::new(),
+        reaping: Vec::new(),
     };
     let mut retained = Vec::new();
     for entry in fs::read_dir(&runtime.root)? {
@@ -2205,6 +2222,9 @@ pub fn run(mut args: impl Iterator<Item = OsString>, cleanup_only: bool) -> io::
             }
             Err(e) => return Err(e),
         }
+    }
+    for mut child in runtime.reaping.drain(..) {
+        let _ = child.wait();
     }
     let keys: Vec<_> = runtime.instances.keys().cloned().collect();
     let mut failed = false;

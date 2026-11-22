@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use std::{collections::BTreeMap, io, path::Path};
 
 const ASSETS: &[&str] = &["ca-file", "user-cert", "user-key"];
-pub const LOG_LABELS: &[&str] = &["INFO:", "WARN:", "ERROR:", "DEBUG:"];
+const LOG_LABELS: &[&str] = &["INFO:", "WARN:", "ERROR:", "DEBUG:"];
 
 pub fn parse(input: &str) -> io::Result<Value> {
     bundle(input, None).and_then(|s| crate::profile::strict_json(&s))
@@ -89,14 +89,19 @@ pub fn validate_client_options(profile: &Profile) -> io::Result<()> {
             "an IPv4 Forti gateway requires a verified trusted-cert fingerprint; use a DNS name for native CA and hostname validation",
         ));
     }
-    if option(profile, "otp-prompt")
-        .is_some_and(|prompt| LOG_LABELS.iter().any(|label| prompt.starts_with(label)))
-    {
+    if option(profile, "otp-prompt").is_some_and(|prompt| overlaps_log_label(prompt.as_bytes())) {
         return Err(invalid(
-            "Forti otp-prompt cannot begin with a native log label",
+            "Forti otp-prompt must differ from native log labels and their prefixes",
         ));
     }
     Ok(())
+}
+
+pub fn overlaps_log_label(text: &[u8]) -> bool {
+    LOG_LABELS.iter().any(|label| {
+        let prefix = label.as_bytes();
+        text.starts_with(prefix) || prefix.starts_with(text)
+    })
 }
 
 fn validate_and_normalize(profile: &mut Profile) -> io::Result<()> {
@@ -235,18 +240,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_forti_otp_prompt_that_starts_with_a_log_label() {
-        let input = "host = vpn.example.test\notp-prompt = INFO: access code\n";
-        assert!(
-            parse(input)
-                .unwrap_err()
-                .to_string()
-                .contains("native log label")
-        );
-        let input = "host = vpn.example.test\notp-prompt = I\n";
+    fn rejects_forti_otp_prompts_that_overlap_log_labels() {
+        for prompt in ["I", "INFO", "INFO: access code"] {
+            let input = format!("host = vpn.example.test\notp-prompt = {prompt}\n");
+            assert!(
+                parse(&input)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("native log label")
+            );
+        }
+        let input = "host = vpn.example.test\notp-prompt = Input\n";
         assert_eq!(
             parse(input).unwrap()["options"][1],
-            json!(["otp-prompt", "I"])
+            json!(["otp-prompt", "Input"])
         );
     }
 
