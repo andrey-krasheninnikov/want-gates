@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 const PASSWORD_LIMIT: usize = 256;
 const OTP_LIMIT: usize = 64;
+const SAML_CALLBACK_SECONDS: u64 = 50;
 
 fn write_input(input: &mut ChildStdin, value: &str, limit: usize) -> io::Result<()> {
     if value.len() == limit {
@@ -44,6 +45,7 @@ struct Reply {
 }
 struct Relay {
     path: PathBuf,
+    expires_at: u64,
     stopping: Arc<AtomicBool>,
     thread: Option<JoinHandle<bool>>,
 }
@@ -74,17 +76,18 @@ impl Relay {
         listener.set_nonblocking(true)?;
         let stopping = Arc::new(AtomicBool::new(false));
         let stop = stopping.clone();
+        let expires_at = now() + SAML_CALLBACK_SECONDS;
+        let deadline = Instant::now() + Duration::from_secs(SAML_CALLBACK_SECONDS);
         let thread = thread::Builder::new().spawn(move || {
             let _socket = socket;
             // SAFETY: namespace is a live network namespace descriptor; only this dedicated thread changes namespace.
             if unsafe { libc::setns(namespace.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
                 return false;
             }
-            let deadline = Instant::now() + Duration::from_secs(50);
             while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut browser, _)) => {
-                        if Self::exchange(&mut browser).unwrap_or(false) {
+                        if Self::exchange(&mut browser, deadline).unwrap_or(false) {
                             return true;
                         }
                     }
@@ -98,25 +101,24 @@ impl Relay {
         })?;
         Ok(Self {
             path,
+            expires_at,
             stopping,
             thread: Some(thread),
         })
     }
-    fn exchange(browser: &mut UnixStream) -> io::Result<bool> {
-        browser.set_read_timeout(Some(Duration::from_secs(1)))?;
-        browser.set_write_timeout(Some(Duration::from_secs(1)))?;
-        let mut request = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !request.ends_with(b"\r\n\r\n") {
-            if request.len() >= 8192 || Instant::now() >= deadline {
-                return Err(invalid("invalid SAML callback request"));
-            }
-            let mut byte = [0];
-            browser.read_exact(&mut byte)?;
-            request.push(byte[0]);
+    fn timeout_until(deadline: Instant) -> io::Result<Duration> {
+        let timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_secs(1));
+        if timeout.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "SAML callback timed out",
+            ));
         }
-        let text =
-            std::str::from_utf8(&request).map_err(|_| invalid("invalid SAML callback encoding"))?;
+        Ok(timeout)
+    }
+    fn callback_id(text: &str) -> io::Result<&str> {
         let mut parts = text.lines().next().unwrap_or("").split_whitespace();
         let method = parts.next();
         let path = parts
@@ -130,20 +132,45 @@ impl Relay {
         {
             return Err(invalid("unsupported SAML callback request"));
         }
-        let id = path.strip_prefix("/?id=").unwrap();
+        let id = path
+            .strip_prefix("/?id=")
+            .unwrap()
+            .split('&')
+            .next()
+            .unwrap();
         if id.is_empty()
             || id.len() > 1024
             || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
         {
             return Err(invalid("invalid SAML callback identifier"));
         }
-        let mut native =
-            TcpStream::connect_timeout(&"127.0.0.1:8020".parse().unwrap(), Duration::from_secs(1))?;
+        Ok(id)
+    }
+    fn exchange(browser: &mut UnixStream, deadline: Instant) -> io::Result<bool> {
+        browser.set_write_timeout(Some(Duration::from_secs(1)))?;
+        let mut request = Vec::new();
+        let request_deadline = deadline.min(Instant::now() + Duration::from_secs(2));
+        while !request.ends_with(b"\r\n\r\n") {
+            if request.len() >= 8192 {
+                return Err(invalid("invalid SAML callback request"));
+            }
+            browser.set_read_timeout(Some(Self::timeout_until(request_deadline)?))?;
+            let mut byte = [0];
+            browser.read_exact(&mut byte)?;
+            request.push(byte[0]);
+        }
+        let text =
+            std::str::from_utf8(&request).map_err(|_| invalid("invalid SAML callback encoding"))?;
+        let id = Self::callback_id(text)?;
+        let mut native = TcpStream::connect_timeout(
+            &"127.0.0.1:8020".parse().unwrap(),
+            Self::timeout_until(deadline)?,
+        )?;
         native.set_read_timeout(Some(Duration::from_secs(1)))?;
-        native.set_write_timeout(Some(Duration::from_secs(1)))?;
-        write!(
-            native,
-            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:8020\r\nConnection: close\r\n\r\n"
+        native.set_write_timeout(Some(Self::timeout_until(deadline)?))?;
+        native.write_all(
+            format!("GET /?id={id} HTTP/1.1\r\nHost: 127.0.0.1:8020\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
         )?;
         let mut response = Vec::new();
         native.take(16385).read_to_end(&mut response)?;
@@ -535,6 +562,7 @@ impl Session {
             result?;
         }
         if let Some(relay) = relay {
+            let expires_at = relay.expires_at;
             self.relay = Some(relay);
             let mut url = url::Url::parse(&format!(
                 "https://{host}:{}/remote/saml/start",
@@ -551,7 +579,7 @@ impl Session {
                 Some(url.to_string()),
                 String::new(),
             )?;
-            auth.expires_at = Some(now() + 50);
+            auth.expires_at = Some(expires_at);
         }
         Ok(())
     }
@@ -822,4 +850,22 @@ pub fn cleanup(path: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saml_callback_keeps_the_native_identifier_with_extra_parameters() {
+        let request = "GET /?id=fixture-id&realm=office HTTP/1.1\r\n\r\n";
+        assert_eq!(Relay::callback_id(request).unwrap(), "fixture-id");
+    }
+
+    #[test]
+    fn expired_saml_callback_returns_before_reading_the_request() {
+        let (mut relay, _browser) = UnixStream::pair().unwrap();
+        let error = Relay::exchange(&mut relay, Instant::now()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
 }

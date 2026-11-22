@@ -13,7 +13,7 @@ pub fn bundle(input: &str, directory: Option<&Path>) -> io::Result<String> {
     if input.len() > MAX_PROFILE || input.contains('\0') {
         return Err(invalid("invalid or oversized Forti profile"));
     }
-    let profile = if input.trim_start().starts_with('{') {
+    let mut profile = if input.trim_start().starts_with('{') {
         let mut value = crate::profile::strict_json(input)?;
         if value.as_object_mut().and_then(|o| o.remove("protocol")) != Some(json!("forti")) {
             return Err(invalid("invalid Forti protocol"));
@@ -49,7 +49,7 @@ pub fn bundle(input: &str, directory: Option<&Path>) -> io::Result<String> {
         }
         profile
     };
-    validate(&profile)?;
+    validate_and_normalize(&mut profile)?;
     let mut value = serde_json::to_value(profile)?;
     value["protocol"] = json!("forti");
     let result = value.to_string();
@@ -73,20 +73,22 @@ pub fn option<'a>(profile: &'a Profile, key: &str) -> Option<&'a str> {
         .map(|o| o[1].as_str())
 }
 
-fn validate(profile: &Profile) -> io::Result<()> {
+fn validate_and_normalize(profile: &mut Profile) -> io::Result<()> {
     if profile.options.len() > 64 || profile.inline.keys().any(|k| !ASSETS.contains(&k.as_str())) {
         return Err(invalid("unsupported Forti profile structure"));
     }
     let mut seen = BTreeMap::new();
-    for option in &profile.options {
-        if option.len() != 2
-            || option
-                .iter()
-                .any(|v| v.is_empty() || v.len() > 4096 || v.chars().any(char::is_control))
+    for option in &mut profile.options {
+        let [key, stored_value] = option.as_mut_slice() else {
+            return Err(invalid("invalid Forti option value"));
+        };
+        let (key, value) = (key.as_str(), stored_value.as_str());
+        if [key, value]
+            .into_iter()
+            .any(|v| v.is_empty() || v.len() > 4096 || v.chars().any(char::is_control))
         {
             return Err(invalid("invalid Forti option value"));
         }
-        let (key, value) = (option[0].as_str(), option[1].as_str());
         let count = seen.entry(key).or_insert(0);
         *count += 1;
         if *count > 1 && key != "trusted-cert" {
@@ -105,8 +107,18 @@ fn validate(profile: &Profile) -> io::Result<()> {
                 *count <= 16 && value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
             }
             "sni" => crate::policy::domain_name(value).is_ok(),
-            "otp-prompt" => value.len() <= 255,
-            "otp-delay" => value.parse::<u8>().is_ok_and(|v| v <= 60),
+            "otp-prompt" if value.len() <= 255 => {
+                *stored_value = value.trim_matches(' ').to_owned();
+                true
+            }
+            "otp-delay" => match value.parse::<u8>() {
+                Ok(delay @ 0..=60) => {
+                    *stored_value = delay.to_string();
+                    true
+                }
+                _ => false,
+            },
+            "otp-prompt" => false,
             "no-ftm-push" => matches!(value, "0" | "1"),
             "min-tls" => matches!(value, "1.2" | "1.3"),
             "set-dns" | "set-routes" | "pppd-use-peerdns" | "use-resolvconf" => {
@@ -128,6 +140,7 @@ fn validate(profile: &Profile) -> io::Result<()> {
             return Err(invalid("invalid or unsupported Forti option value"));
         }
     }
+    profile.options.retain(|option| !option[1].is_empty());
     if option(profile, "host").is_none() {
         return Err(invalid("Forti host is required"));
     }
@@ -156,4 +169,36 @@ fn validate(profile: &Profile) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_forti_otp_options_on_import_and_restore() {
+        let saved = json!({
+            "protocol": "forti",
+            "options": [["host", "vpn.example.test"], ["otp-delay", "08"], ["otp-prompt", " Entrez "]],
+            "inline": {}
+        });
+        let restored = decoded_profile(&saved).unwrap();
+        assert_eq!(option(&restored, "otp-delay"), Some("8"));
+        assert_eq!(option(&restored, "otp-prompt"), Some("Entrez"));
+        let raw = parse("host = vpn.example.test\notp-delay = 08\notp-prompt = Entrez\n").unwrap();
+        assert_eq!(parse(&saved.to_string()).unwrap(), raw);
+    }
+
+    #[test]
+    fn omits_an_empty_forti_otp_prompt_from_saved_profiles() {
+        let saved = json!({
+            "protocol": "forti",
+            "options": [["host", "vpn.example.test"], ["otp-prompt", "  "]],
+            "inline": {}
+        });
+        assert_eq!(
+            option(&decoded_profile(&saved).unwrap(), "otp-prompt"),
+            None
+        );
+    }
 }
