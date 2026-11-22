@@ -521,6 +521,9 @@ def acceptance(context, only_helper_outage=False):
         forti_group=control('group','create','--name','Forti standby')['data']['id']
         forti_id=control('connection','import','--group',forti_group,'--name','Forti standby','--protocol','forti','--file','-',payload=dict(protocol='forti',options=[['host','10.213.0.2'],['port','10443']],inline={}))['data']['id']
         assert apply()['state']=='applied'
+        forti_action=control('connection','login',forti_id)['data']
+        control('connection','login',forti_id,'--file','-','--remember',payload=dict(challenge_id=forti_action['challenge_id'],username='forti-user',password='forti-password-marker'))
+        (forti_auth,) = state.glob(forti_id+'-*.auth')
         forti_alias.unlink()
         pid=stand.checked('systemctl','show','--property=MainPID','--value',unit.name).stdout.strip()
         assert int(pid)>0
@@ -534,7 +537,16 @@ def acceptance(context, only_helper_outage=False):
         await_connection(connection,lambda v:v['authentication']=='authenticated')
         await_health(connection)
         traffic('10.220.0.10','10.211.0.1')
+        assert apply()['state']=='applied'
         forti_alias.symlink_to('/usr/bin/openfortivpn')
+        forti_auth.write_text('{')
+        stand.checked('systemctl','restart',unit.name)
+        failed=await_connection(forti_id,lambda v:v.get('native_runtime',{}).get('reason')=='native_restore_failed')
+        assert not failed['native_runtime']['resources_active'] and not failed['capabilities'],failed
+        await_connection(connection,lambda v:v['authentication']=='authenticated')
+        await_health(connection)
+        traffic('10.220.0.10','10.211.0.1')
+        control('connection','forget-auth',forti_id)
         control('connection','restart',forti_id)
         await_connection(forti_id,lambda v:v['authentication']=='credentials_required')
         control('connection','delete',forti_id)
@@ -587,8 +599,9 @@ def acceptance(context, only_helper_outage=False):
         mode=executable.stat().st_mode & 0o7777
         try:
             executable.chmod(mode | 0o020)
-            result=stand.run('systemctl','start',unit.name,timeout=30)
-            assert result.returncode!=0,'helper restart executed an unsafe native dependency'
+            stand.checked('systemctl','start',unit.name)
+            unavailable=await_connection(connection,lambda v:v.get('native_runtime',{}).get('reason')=='native_adapter_unavailable')
+            assert not unavailable['native_runtime']['resources_active'] and not unavailable['capabilities'],unavailable
         finally:
             executable.chmod(mode)
         stand.checked('systemctl','stop',prefix+'.service')

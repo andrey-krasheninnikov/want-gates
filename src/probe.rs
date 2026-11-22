@@ -306,10 +306,10 @@ fn transport_at(
     let mut results = std::collections::BTreeMap::new();
     for capability in CAPABILITIES {
         client.check()?;
-        let reason = if connection.protocol == "forti" && capability.ends_with("_ipv6") {
-            "protocol_limit".to_owned()
-        } else if !crate::capability::permits_connection(connection, capability) {
-            "configured_limit".to_owned()
+        let reason = if let Some(reason) =
+            crate::capability::connection_limit(connection, capability)
+        {
+            reason.to_owned()
         } else if only_verified.is_some_and(|m| m.get(capability).is_none_or(|r| r != "verified")) {
             "not_rechecked".to_owned()
         } else {
@@ -436,7 +436,7 @@ pub fn check(
             (None, _, _) => "primary_missing".to_owned(),
             (_, None, _) => "dns_missing".to_owned(),
             (_, _, None) => "probe_missing".to_owned(),
-            (_, Some(server), Some(probe)) => {
+            (Some(connection), Some(server), Some(probe)) => {
                 if only_verified.is_some_and(|m| {
                     m.get(&group.id)
                         .and_then(|r| r.get("dns"))
@@ -445,11 +445,10 @@ pub fn check(
                     "not_rechecked".to_owned()
                 } else {
                     let resolver = crate::policy::Resolver::parse(server)?;
-                    if matrix[&group.id]
-                        .get(&resolver.capability())
-                        .is_some_and(|v| v == "configured_limit")
+                    if let Some(reason) =
+                        crate::capability::connection_limit(connection, &resolver.capability())
                     {
-                        "configured_limit".to_owned()
+                        reason.to_owned()
                     } else if matrix[&group.id]
                         .get(&resolver.capability())
                         .is_none_or(|v| v != "verified")
@@ -522,8 +521,10 @@ fn connection_at(
         (_, None) => "probe_missing".to_owned(),
         (Some(server), Some(probe)) => {
             let resolver = crate::policy::Resolver::parse(server)?;
-            if !crate::capability::permits_connection(connection, &resolver.capability()) {
-                "configured_limit".to_owned()
+            if let Some(reason) =
+                crate::capability::connection_limit(connection, &resolver.capability())
+            {
+                reason.to_owned()
             } else if results
                 .get(&resolver.capability())
                 .is_none_or(|v| v != "verified")

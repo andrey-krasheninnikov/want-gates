@@ -2,14 +2,15 @@ use crate::forti::{decoded_profile, option};
 use crate::native_runtime::{Record, namespace_child, private_text};
 use crate::openvpn::Profile;
 use crate::openvpn_auth::{Authentication, now};
-use crate::{invalid, secure_directory};
+use crate::{OwnedSocket, invalid, secure_directory, store::random_id};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, Write};
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt, chown};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::{
@@ -42,9 +43,9 @@ struct Reply {
     cookie: Option<String>,
 }
 struct Relay {
-    port: u16,
+    path: PathBuf,
     stopping: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    thread: Option<JoinHandle<bool>>,
 }
 impl Drop for Relay {
     fn drop(&mut self) {
@@ -55,39 +56,53 @@ impl Drop for Relay {
     }
 }
 impl Relay {
-    fn start(record: &Record) -> io::Result<Self> {
+    fn start(record: &Record, directory: &Path) -> io::Result<Self> {
         let namespace = File::open(Path::new("/run/netns").join(&record.namespace))?;
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
-        let port = listener.local_addr()?.port();
+        let root = directory
+            .parent()
+            .ok_or_else(|| invalid("missing native runtime directory"))?;
+        let path = root.join(format!("saml-{}.sock", random_id()?));
+        let listener = UnixListener::bind(&path)?;
+        let metadata = fs::symlink_metadata(&path)?;
+        let socket = OwnedSocket {
+            path: path.clone(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        };
+        chown(&path, Some(0), Some(fs::metadata(root)?.gid()))?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o660))?;
         listener.set_nonblocking(true)?;
         let stopping = Arc::new(AtomicBool::new(false));
         let stop = stopping.clone();
-        let thread = thread::spawn(move || {
+        let thread = thread::Builder::new().spawn(move || {
+            let _socket = socket;
             // SAFETY: namespace is a live network namespace descriptor; only this dedicated thread changes namespace.
             if unsafe { libc::setns(namespace.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
-                return;
+                return false;
             }
             let deadline = Instant::now() + Duration::from_secs(50);
             while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
                 match listener.accept() {
                     Ok((mut browser, _)) => {
-                        // A rejected native callback may still return an HTTP response.
-                        let _ = Self::exchange(&mut browser);
+                        if Self::exchange(&mut browser).unwrap_or(false) {
+                            return true;
+                        }
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(20))
+                        thread::sleep(Duration::from_millis(20));
                     }
                     Err(_) => break,
                 }
             }
-        });
+            false
+        })?;
         Ok(Self {
-            port,
+            path,
             stopping,
             thread: Some(thread),
         })
     }
-    fn exchange(browser: &mut TcpStream) -> io::Result<()> {
+    fn exchange(browser: &mut UnixStream) -> io::Result<bool> {
         browser.set_read_timeout(Some(Duration::from_secs(1)))?;
         browser.set_write_timeout(Some(Duration::from_secs(1)))?;
         let mut request = Vec::new();
@@ -135,8 +150,12 @@ impl Relay {
         if response.len() > 16384 {
             return Err(invalid("native SAML callback response exceeds limit"));
         }
-        browser.write_all(&response)?;
-        Ok(())
+        // openfortivpn sends HTTP 200 for both accepted and rejected callbacks.
+        let accepted = b"VPN will be established";
+        let _ = browser.write_all(&response);
+        Ok(response
+            .windows(accepted.len())
+            .any(|part| part == accepted))
     }
 }
 
@@ -199,9 +218,27 @@ impl Session {
         }
         value["methods"] = json!(methods);
         if let Some(relay) = &self.relay {
-            value["ssh_forward"] = json!({"local_host":"127.0.0.1","local_port":8020,"remote_host":"127.0.0.1","remote_port":relay.port});
+            value["ssh_forward"] =
+                json!({"local_host":"127.0.0.1","local_port":8020,"remote_socket":relay.path});
         }
         value
+    }
+    pub fn poll_callback(&mut self, auth: &mut Authentication) -> bool {
+        let Some(relay) = self.relay.as_mut() else {
+            return false;
+        };
+        if !relay.thread.as_ref().unwrap().is_finished() {
+            return true;
+        }
+        let accepted = relay.thread.take().unwrap().join().unwrap_or(false);
+        self.relay = None;
+        if accepted {
+            auth.submitted();
+            auth.expires_at = Some(now() + 300);
+        } else {
+            auth.expires_at = Some(now());
+        }
+        false
     }
     pub fn automatic(
         &mut self,
@@ -417,7 +454,9 @@ impl Session {
         )?;
         let mut config = String::new();
         for item in &self.profile.options {
-            if !matches!(
+            if item[0] == "trusted-cert" {
+                config += &format!("trusted-cert = {}\n", item[1].to_ascii_lowercase());
+            } else if !matches!(
                 item[0].as_str(),
                 "set-routes" | "set-dns" | "pppd-use-peerdns" | "use-resolvconf" | "persistent"
             ) {
@@ -465,6 +504,9 @@ impl Session {
         config_file.write_all(config.as_bytes())?;
         config_file.rewind()?;
         let config_path = format!("/proc/self/fd/{fd}");
+        let relay = (method == "saml")
+            .then(|| Relay::start(record, &self.directory))
+            .transpose()?;
         let mut args = vec!["--config", &config_path, "--pppd-ifname=wgates-tun"];
         if method == "cookie" {
             args.push("--cookie-on-stdin");
@@ -492,8 +534,8 @@ impl Session {
             self.stdin = None;
             result?;
         }
-        if method == "saml" {
-            self.relay = Some(Relay::start(record)?);
+        if let Some(relay) = relay {
+            self.relay = Some(relay);
             let mut url = url::Url::parse(&format!(
                 "https://{host}:{}/remote/saml/start",
                 option(&self.profile, "port").unwrap_or("443")

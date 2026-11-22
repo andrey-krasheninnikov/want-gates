@@ -60,11 +60,13 @@ def acceptance(context, legacy=False):
         connection = control('connection', 'import', '--group', group, '--name', 'Forti native', '--protocol', 'forti', '--file', '-', payload=profile)['data']['id']
         control('group', 'update', group, '--primary', connection, '--probe-file', '-', payload=dict(tcp_ipv4=dict(url='http://10.220.0.10:18080/forti'),udp_ipv4=dict(server='10.220.0.10:15353',query_name='probe.example.test',query_type='A'),dns=dict(query_name='v4.corp.test',query_type='A')))
         control('rule','create','--group',group,'--destination','corp.test')
-        control('rule','create','--group',group,'--destination','fd42:220::/64')
+        ipv6_rule = control('rule','create','--group',group,'--destination','fd42:220::/64')['data']['id']
         control('rule', 'create', '--group', group, '--destination', '10.220.0.0/24')
-        plan = control('routing', 'preview')['data']['plan_id']
-        applied = control('routing', 'apply', plan)['data']
+        preview = control('routing', 'preview')['data']
+        assert preview['eligibility'][ipv6_rule]['tcp_ipv6']['reason']=='protocol_limit', preview
+        applied = control('routing', 'apply', preview['plan_id'])['data']
         assert applied['state'] == 'blocked', applied
+        assert applied['capabilities'][group]['udp_ipv6']=='protocol_limit', applied
         action = control('connection', 'login', connection)['data']
         assert action['method'] == 'password', action
         assert set(action['methods']) >= {'password', 'cookie'}, action
@@ -166,27 +168,37 @@ def acceptance(context, legacy=False):
             web = control('connection','login',connection,'--file','-',payload=dict(challenge_id=action['challenge_id'],method='saml'))['data']
             assert web['authentication']=='browser_required' and web['method']=='web',web
             forward = web['ssh_forward']
-            assert forward['local_host']==forward['remote_host']=='127.0.0.1' and forward['local_port']==8020,forward
+            callback = Path(forward['remote_socket'])
+            assert forward['local_host']=='127.0.0.1' and forward['local_port']==8020,forward
+            assert callback.parent==runtime and callback.is_socket() and callback.stat().st_mode & 0o777==0o660
+            denied=stand.run('runuser','-u','nobody','--','python3','-c','import socket, sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1])',callback)
+            assert denied.returncode!=0 and 'PermissionError' in denied.stderr, denied.stderr
             keys.mkdir(mode=0o700)
             for label in ['host','operator']:
                 stand.checked('ssh-keygen','-q','-t','ed25519','-N','','-C','Forti acceptance','-f',str(keys/label))
             host_type, host_key = (keys/'host.pub').read_text().split()[:2]
             (keys/'known_hosts').write_text(f'[127.0.0.1]:22222 {host_type} {host_key}\n')
             configuration = keys/'sshd.conf'
-            configuration.write_text(f'Port 22222\nListenAddress 127.0.0.1\nHostKey {keys}/host\nPidFile {keys}/sshd.pid\nAuthorizedKeysFile {keys}/operator.pub\nPermitRootLogin prohibit-password\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM yes\nAllowTcpForwarding local\nGatewayPorts no\nPermitOpen 127.0.0.1:{forward["remote_port"]}\nLogLevel VERBOSE\n')
+            configuration.write_text(f'Port 22222\nListenAddress 127.0.0.1\nHostKey {keys}/host\nPidFile {keys}/sshd.pid\nAuthorizedKeysFile {keys}/operator.pub\nPermitRootLogin prohibit-password\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM yes\nAllowTcpForwarding no\nAllowStreamLocalForwarding local\nGatewayPorts no\nLogLevel VERBOSE\n')
             Path('/run/sshd').mkdir(mode=0o755,exist_ok=True)
             sshd = context['spawn']('gateway',['/usr/sbin/sshd','-D','-e','-f',configuration],'saml-sshd')
             deadline=time.monotonic()+5
             while not context['ns']('gateway','ss','-H','-lnt','sport = :22222').stdout.strip():
                 assert sshd.poll() is None and time.monotonic()<deadline
                 time.sleep(.05)
-            forwarding = context['spawn']('gateway',['ssh','-F','/dev/null','-N','-o','BatchMode=yes','-o','ExitOnForwardFailure=yes','-o','IdentitiesOnly=yes','-o','StrictHostKeyChecking=yes','-o',f'UserKnownHostsFile={keys}/known_hosts','-i',keys/'operator','-p','22222','-L',f'127.0.0.1:8020:127.0.0.1:{forward["remote_port"]}','root@127.0.0.1'],'saml-forward')
+            forwarding = context['spawn']('gateway',['ssh','-F','/dev/null','-N','-o','BatchMode=yes','-o','ExitOnForwardFailure=yes','-o','IdentitiesOnly=yes','-o','StrictHostKeyChecking=yes','-o',f'UserKnownHostsFile={keys}/known_hosts','-i',keys/'operator','-p','22222','-L',f'127.0.0.1:8020:{callback}','root@127.0.0.1'],'saml-forward')
             deadline=time.monotonic()+5
             while not context['ns']('gateway','ss','-H','-lnt','sport = :8020').stdout.strip():
                 assert forwarding.poll() is None and time.monotonic()<deadline
                 time.sleep(.05)
-            stand.run('ip','netns','exec',context['names']['gateway'],'curl','--noproxy','*','--max-time','3','-sS','http://127.0.0.1:8020/?id=invalid_test_id')
+            rejected=stand.run('ip','netns','exec',context['names']['gateway'],'curl','--noproxy','*','--max-time','3','-fsS','http://127.0.0.1:8020/?id=invalid_test_id')
+            assert rejected.returncode!=0 and callback.is_socket()
+            set_mode(dict(mode='saml',saml_delay=4))
+            time.sleep(max(0, web['expires_at']-time.time()-2))
             context['ns']('gateway','curl','--noproxy','*','--max-time','5','--max-redirs','3','--cacert',tls/'ca.crt','--resolve','forti-a.example.test:10443:10.213.0.2','-fsSL',web['url'])
+            accepted=control('connection','login',connection)['data']
+            assert accepted['authentication']=='authenticating' and not accepted['requires_input'],accepted
+            assert accepted['expires_at'] > web['expires_at'] and not callback.exists(), accepted
             current=await_auth('authenticated')
             settled=control('connection','login',connection)['data']
             assert settled['authentication']=='authenticated' and not settled['requires_input'],settled
@@ -209,15 +221,13 @@ def acceptance(context, legacy=False):
                 assert time.monotonic()-started<60,pending
                 time.sleep(.1)
             assert time.monotonic()-started>=45 and pending['authentication'] in ('expired','unknown','failed'),pending
-            closed=stand.run('ip','netns','exec',context['names']['gateway'],'python3','-c',f'import socket;socket.create_connection(("127.0.0.1",{pending_web["ssh_forward"]["remote_port"]}),timeout=.3)')
-            assert closed.returncode!=0,'expired SAML callback is still open'
+            assert not Path(pending_web['ssh_forward']['remote_socket']).exists(), 'expired SAML callback is still open'
             control('connection','login',connection,'--file','-',payload=dict(challenge_id=pending_web['challenge_id'],method='saml'),success=False)
             action=control('connection','login',connection)['data']
             cancelled=control('connection','login',connection,'--file','-',payload=dict(challenge_id=action['challenge_id'],method='saml'))['data']
             stopped=control('connection','logout',connection)['data']
             assert stopped['authentication']=='stopped' and not stopped['resources_active'],stopped
-            closed=stand.run('ip','netns','exec',context['names']['gateway'],'python3','-c',f'import socket;socket.create_connection(("127.0.0.1",{cancelled["ssh_forward"]["remote_port"]}),timeout=.3)')
-            assert closed.returncode!=0,'cancelled SAML callback is still open'
+            assert not Path(cancelled['ssh_forward']['remote_socket']).exists(), 'cancelled SAML callback is still open'
             print('Native SAML deadline and logout close callbacks and reject stale responses',flush=True)
 
         stand.checked('openssl','req','-new','-newkey','rsa:2048','-nodes','-subj','/CN=Forti stand client','-keyout',str(tls/'client.key'),'-out',str(tls/'client.csr'))
@@ -250,7 +260,7 @@ def acceptance(context, legacy=False):
         control('connection','login',connection,'--file','-',payload=dict(challenge_id=action['challenge_id'],username='forti-user',password='forti-password-marker'))
         failed=await_auth('unknown')
         assert failed['capabilities']==[] and failed['native_runtime']['reason']=='server_certificate_verification_failed',failed
-        pin=hashlib.sha256(ssl.PEM_cert_to_DER_cert((tls/'forti.crt').read_text())).hexdigest()
+        pin=hashlib.sha256(ssl.PEM_cert_to_DER_cert((tls/'forti.crt').read_text())).hexdigest().upper()
         bad_profile['options'].append(['trusted-cert',pin])
         control('connection','update',connection,'--file','-',payload=bad_profile)
         plan=control('routing','preview')['data']['plan_id'];control('routing','apply',plan)

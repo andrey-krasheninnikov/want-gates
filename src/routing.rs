@@ -393,13 +393,14 @@ fn initial_matrix(config: &Config) -> Matrix {
                         c.to_string(),
                         match crate::domain::connection(config, g) {
                             None => "primary_missing",
-                            Some(connection)
-                                if !crate::capability::permits_connection(connection, c) =>
-                            {
-                                "configured_limit"
-                            }
-                            Some(_) if !probe_configured(g, c) => "probe_missing",
-                            Some(_) => "candidate",
+                            Some(connection) => crate::capability::connection_limit(connection, c)
+                                .unwrap_or_else(|| {
+                                    if probe_configured(g, c) {
+                                        "candidate"
+                                    } else {
+                                        "probe_missing"
+                                    }
+                                }),
                         }
                         .to_owned(),
                     )
@@ -422,19 +423,13 @@ fn initial_matrix(config: &Config) -> Matrix {
                     .and_then(|c| c.dns.as_ref())
                     .and_then(|d| crate::policy::Resolver::parse(d).ok())
                 {
-                    if result
+                    result
                         .get(&resolver.capability())
-                        .is_some_and(|r| r == "configured_limit")
-                    {
-                        "configured_limit"
-                    } else if result
-                        .get(&resolver.capability())
-                        .is_none_or(|r| r != "candidate")
-                    {
-                        "dns_transport_unverified"
-                    } else {
-                        "candidate"
-                    }
+                        .map(String::as_str)
+                        .filter(|reason| {
+                            matches!(*reason, "configured_limit" | "protocol_limit" | "candidate")
+                        })
+                        .unwrap_or("dns_transport_unverified")
                 } else {
                     "dns_missing"
                 };
@@ -442,7 +437,9 @@ fn initial_matrix(config: &Config) -> Matrix {
             }
             if g.healthcheck.is_some() {
                 for reason in result.values_mut() {
-                    *reason = "healthcheck_pending".into();
+                    if !matches!(reason.as_str(), "configured_limit" | "protocol_limit") {
+                        *reason = "healthcheck_pending".into();
+                    }
                 }
             }
             (g.id.clone(), result)
@@ -1004,14 +1001,7 @@ fn execute(
         )?;
         let previous: Option<Working> = optional(&root.join("working.json"))?;
         let mut native_intents = BTreeMap::new();
-        if input
-            .config
-            .connections
-            .iter()
-            .any(|c| crate::native::is_native(&c.protocol))
-        {
-            native.call(json!({"command":"preflight","protocols":input.config.connections.iter().filter(|c| crate::native::is_native(&c.protocol)).map(|c|c.protocol.clone()).collect::<std::collections::BTreeSet<_>>()}))?;
-        }
+        let mut protocols = BTreeSet::new();
         for connection in input
             .config
             .connections
@@ -1029,9 +1019,18 @@ fn execute(
                         })
                         .and_then(|_| w.native.get(&connection.id))
                 })
-                .map(|p| p.generation.clone())
-                .unwrap_or(random_id()?);
+                .map(|p| p.generation.clone());
+            let generation = match generation {
+                Some(generation) => generation,
+                None => {
+                    protocols.insert(&connection.protocol);
+                    random_id()?
+                }
+            };
             native_intents.insert(connection.id.clone(), generation);
+        }
+        if !native_intents.is_empty() {
+            native.call(json!({"command":"preflight","protocols":protocols}))?;
         }
         let plan = Plan {
             id: random_id()?,

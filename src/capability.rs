@@ -33,8 +33,19 @@ pub fn permits(values: &[String], capability: &str) -> bool {
     values.iter().any(|s| s == capability)
 }
 pub fn permits_connection(connection: &crate::store::Connection, capability: &str) -> bool {
-    permits(&connection.allowed_capabilities, capability)
-        && !(connection.protocol == "forti" && capability.ends_with("_ipv6"))
+    connection_limit(connection, capability).is_none()
+}
+pub fn connection_limit(
+    connection: &crate::store::Connection,
+    capability: &str,
+) -> Option<&'static str> {
+    if connection.protocol == "forti" && capability.ends_with("_ipv6") {
+        Some("protocol_limit")
+    } else if !permits(&connection.allowed_capabilities, capability) {
+        Some("configured_limit")
+    } else {
+        None
+    }
 }
 pub fn observations(
     connection: &crate::store::Connection,
@@ -43,10 +54,8 @@ pub fn observations(
 ) -> Value {
     let mut output = serde_json::Map::new();
     for capability in ALL {
-        let reason = if connection.protocol == "forti" && capability.ends_with("_ipv6") {
-            "protocol_limit"
-        } else if !permits(&connection.allowed_capabilities, capability) {
-            "configured_limit"
+        let reason = if let Some(reason) = connection_limit(connection, capability) {
+            reason
         } else if stale {
             "inputs_changed"
         } else {

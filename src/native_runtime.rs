@@ -1213,6 +1213,25 @@ impl Runtime {
         }
         Ok(instance)
     }
+    fn restore(&self, mut record: Record, client_available: bool) -> io::Result<Instance> {
+        let reason = if client_available {
+            match self
+                .create_network(&mut record)
+                .and_then(|()| self.start(record.clone()))
+            {
+                Ok(instance) => return Ok(instance),
+                Err(_) => {
+                    self.cleanup(&mut record, false)?;
+                    "native_restore_failed"
+                }
+            }
+        } else {
+            "native_adapter_unavailable"
+        };
+        let mut auth = Authentication::new(Credentials::default(), false)?;
+        auth.fail(reason);
+        Ok(Instance::new(record, auth))
+    }
     fn proxy(&self, instance: &mut Instance, gate: bool) -> io::Result<()> {
         if instance.proxy_gate == Some(gate)
             && instance
@@ -1406,7 +1425,11 @@ impl Runtime {
             i.auth.reason = reason.into();
         }
 
-        if i.auth.expire() {
+        let awaiting_callback = i
+            .forti
+            .as_mut()
+            .is_some_and(|driver| driver.poll_callback(&mut i.auth));
+        if !awaiting_callback && i.auth.expire() {
             i.dns = None;
             i.admitted_session = None;
             stop(&mut i.proxy);
@@ -1976,23 +1999,11 @@ pub fn run(mut args: impl Iterator<Item = OsString>, cleanup_only: bool) -> io::
             .ok_or_else(|| invalid("native protocol required"))?;
         clients
             .entry(protocol.to_owned())
-            .or_insert_with(|| runtime.client_version(protocol));
+            .or_insert_with(|| runtime.client_version(protocol).is_ok());
     }
-    if clients.values().all(Result::is_err)
-        && let Some((_, Err(error))) = clients.pop_first()
-    {
-        return Err(error);
-    }
-    for mut record in retained {
-        let protocol = record.profile["protocol"].as_str().unwrap();
-        let instance = if clients[protocol].is_ok() {
-            runtime.create_network(&mut record)?;
-            runtime.start(record)?
-        } else {
-            let mut auth = Authentication::new(Credentials::default(), false)?;
-            auth.fail("native_adapter_unavailable");
-            Instance::new(record, auth)
-        };
+    for record in retained {
+        let client_available = clients[record.profile["protocol"].as_str().unwrap()];
+        let instance = runtime.restore(record, client_available)?;
         runtime
             .instances
             .insert(instance.record.prepared.generation.clone(), instance);

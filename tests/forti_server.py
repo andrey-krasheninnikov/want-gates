@@ -10,6 +10,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
@@ -118,7 +119,10 @@ def main(directory, address, mode_path):
             parsed = urlsplit(self.path)
             mode = json.loads(mode_path.read_text())
             if parsed.path == '/remote/saml/start': self.reply(redirect='http://127.0.0.1:8020/?id=forti-saml-marker'); return
-            if parsed.path == '/remote/saml/auth_id': self.reply(cookie=not mode.get('deny') and mode['mode']=='saml' and parse_qs(parsed.query).get('id')==['forti-saml-marker']); return
+            if parsed.path == '/remote/saml/auth_id':
+                time.sleep(mode.get('saml_delay', 0))
+                self.reply(cookie=not mode.get('deny') and mode['mode']=='saml' and parse_qs(parsed.query).get('id')==['forti-saml-marker'])
+                return
             if parsed.path == '/remote/login': self.reply(cookie=mode['mode']=='certificate' and bool(self.connection.getpeercert())); return
             if 'SVPNCOOKIE=forti-cookie-marker' not in self.headers.get('Cookie', '') or mode.get('deny'):
                 self.reply(); return

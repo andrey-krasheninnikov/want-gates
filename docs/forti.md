@@ -56,8 +56,8 @@ must appear together. Stdin accepts canonical JSON with `protocol: "forti"`,
 
 Credentials in profiles, hooks, plugins, external credential files, PKCS#11,
 pinentry, arbitrary PPP configuration and unsafe TLS options are rejected.
-Endpoint bootstrap uses the host resolver and pins IPv4 addresses privately;
-protecting that endpoint's own domain with the same group is rejected.
+Endpoint bootstrap uses the host resolver and pins IPv4 addresses privately.
+The endpoint cannot fall under a protected domain in any group.
 
 An explicit `--dns` overrides the first supported IPv4 server DNS. The selected
 resolver is reached through the connection; failure never selects a public
@@ -98,17 +98,19 @@ Cookie SSO accepts the native cookie value over private stdin:
 ```
 
 Native SAML starts with `method: "saml"`. Its web action returns an HTTPS `url`
-and `ssh_forward` containing the VPS relay's loopback port. Before opening the
-URL on the operator's computer, start:
+and `ssh_forward.remote_socket` containing the VPS relay's Unix socket path.
+Start the SSH forward from the computer where you will open the URL.
 
 ```sh
-ssh -N -L 127.0.0.1:8020:127.0.0.1:REMOTE_PORT VPS_ALIAS
+ssh -N -L 127.0.0.1:8020:REMOTE_SOCKET VPS_ALIAS
 ```
 
-Use the returned `remote_port` for `REMOTE_PORT`. Local port 8020 must be free.
-Complete the browser flow within 50 seconds. The VPS opens only a temporary
-loopback listener. Completion, expiry and logout close it. Stop the SSH forward
-afterward. An expired flow requires a fresh login; stale replies are rejected.
+Replace `REMOTE_SOCKET` with the returned path. Local port 8020 must be free.
+The VPS SSH account needs access to the `wgates` group and permission to
+forward Unix sockets. Complete the browser step within 50 seconds. The relay
+closes when openfortivpn accepts the callback, when the deadline expires, or
+when you log out. Once the callback is accepted, the VPN has up to five minutes
+to start. Stop the SSH forward afterward. An expired flow requires a fresh login.
 Cookie SSO remains available on clients without native SAML. Vendor-specific
 flows outside these native methods are unsupported.
 
