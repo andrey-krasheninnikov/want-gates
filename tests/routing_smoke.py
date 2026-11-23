@@ -33,7 +33,7 @@ def dns_query(name, kind=1):
     return query + b'\0' + struct.pack('!HH', kind, 1)
 
 
-def resource(events):
+def resource(events, *extra_udp_witnesses):
     lock = threading.Lock()
 
     def record(transport, peer, marker):
@@ -136,6 +136,8 @@ def resource(events):
 
     endpoints=[(socket.AF_INET,a,p) for a,p in [('10.220.0.10',15353),('10.221.0.10',15353),('1.1.1.1',53)]]
     endpoints += [(socket.AF_INET6,a,p) for a,p in [('fd42:220::10',15353),('fd42:221::10',15353),('2606:4700::1111',53)]]
+    endpoints += [(socket.AF_INET6 if ':' in address else socket.AF_INET, address, 15353)
+                  for address in extra_udp_witnesses]
     for family,address,port in endpoints:
         for transport in ['udp','tcp']:
             sock=socket.socket(family,socket.SOCK_DGRAM if transport=='udp' else socket.SOCK_STREAM)
@@ -259,7 +261,7 @@ def checked(*args, **kwargs):
     return result
 
 
-def main(binary, panel_root, native_acceptance=None):
+def main(binary, panel_root, native_acceptance=None, extra_udp_targets=(), extra_udp_witnesses=()):
     if sys.platform != 'linux' or os.geteuid() != 0:
         raise SystemExit('Run only as root on a disposable Linux systemd host.')
     repo = Path(__file__).resolve().parent.parent
@@ -336,7 +338,7 @@ def main(binary, panel_root, native_acceptance=None):
             (tls/'extensions').write_text(f'subjectAltName=DNS:{host}\nextendedKeyUsage=serverAuth\n')
             checked('openssl','x509','-req','-in',str(tls/f'{label}.csr'),'-CA',str(tls/'ca.crt'),'-CAkey',str(tls/'ca.key'),'-CAcreateserial','-days',days,'-extfile',str(tls/'extensions'),'-out',str(tls/f'{label}.crt'))
         events = work / 'events.jsonl'
-        resource_process = spawn('resource', ['python3', __file__, '--resource', events], 'resources')
+        resource_process = spawn('resource', ['python3', __file__, '--resource', events, *extra_udp_witnesses], 'resources')
         capture = spawn('resource',['tcpdump','-ni','any','-l','tcp port 18080 or port 15353 or port 53'],'resource-packets')
         ids = {key: str(uuid.uuid4()) for key in ['ingress', 'a', 'b']}
 
@@ -395,7 +397,7 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
         inbounds=[dict(tag='client-socks',listen='127.0.0.1',port=10880,protocol='socks',settings=dict(auth='noauth',udp=True))]
         for port,address in [(15354,'10.220.0.10'),(15355,'10.221.0.10'),(15356,'fd42:220::10'),(15357,'fd42:221::10')]:
             inbounds.append(dict(tag=f'udp-{port}',listen='127.0.0.1',port=port,protocol='dokodemo-door',settings=dict(address=address,port=15353,network='udp')))
-        for port,address in [(15358,'v4.corp.test'),(15359,'v6.corp.test'),(15361,'v4.dev.corp.test'),(15362,'v6.dev.corp.test')]:
+        for port,address in [(15358,'v4.corp.test'),(15359,'v6.corp.test'),(15361,'v4.dev.corp.test'),(15362,'v6.dev.corp.test'), *extra_udp_targets]:
             inbounds.append(dict(tag=f'domain-{port}',listen='127.0.0.1',port=port,protocol='dokodemo-door',settings=dict(address=address,port=15353,network='udp')))
         inbounds.append(dict(tag='dns-client',listen='127.0.0.1',port=15360,protocol='dokodemo-door',settings=dict(address='1.1.1.1',port=53,network='udp')))
         client=start_xray('client',dict(log=dict(loglevel='warning'),inbounds=inbounds,outbounds=[outbound('10.215.0.1',19000,ids['ingress'])]))
@@ -958,7 +960,7 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
 
 
 if __name__=='__main__':
-    if len(sys.argv)>1 and sys.argv[1]=='--resource':resource(sys.argv[2])
+    if len(sys.argv)>1 and sys.argv[1]=='--resource':resource(*sys.argv[2:])
     elif len(sys.argv)>1 and sys.argv[1]=='--udp':udp_client(sys.argv[2],sys.argv[3])
     elif len(sys.argv)>1 and sys.argv[1]=='--dns-query':dns_client(*sys.argv[2:])
     elif len(sys.argv)>1 and sys.argv[1]=='--proxy':fault_proxy(sys.argv[2])
