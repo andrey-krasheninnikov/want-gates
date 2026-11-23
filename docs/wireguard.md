@@ -32,8 +32,8 @@ are optional. The import rejects other fields, including hooks, custom tables
 and firewall marks. The helper passes keys to `wg setconf` through private
 input and uses its own firewall mark to route encrypted packets to the peer.
 When the profile omits MTU, the helper uses the gateway's endpoint path MTU
-and budgets for WireGuard encapsulation. Set `MTU` for paths with a lower
-known limit.
+and budgets for WireGuard encapsulation. Without a route measurement it uses
+1420. Set `MTU` for paths with a lower known limit.
 The default profile resolver uses UDP port 53 through the tunnel. An explicit
 connection `--dns` overrides it, and `--dns -` restores the profile value.
 

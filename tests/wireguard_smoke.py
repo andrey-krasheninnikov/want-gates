@@ -93,7 +93,7 @@ def acceptance(context):
 
     for name in ('gateway', 'a', 'b'):
         ns(name, 'sysctl', '-q', '-w', 'net.ipv4.ip_forward=1', 'net.ipv6.conf.all.forwarding=1')
-    ns('gateway', 'ip', 'link', 'set', 'w4214a', 'mtu', '1360')
+    ns('gateway', 'ip', '-6', 'route', 'add', 'fd42:214::2/128', 'dev', 'w4214a', 'mtu', '1360')
     ns('a', 'ip', 'address', 'add', '10.211.0.3/24', 'dev', 'w4211a')
     ns('a', 'ip', '-6', 'address', 'add', 'fd42:211::3/64', 'dev', 'w4211a', 'nodad')
     profiles = {
@@ -155,8 +155,8 @@ def acceptance(context):
             for destination in (f'10.{index}.0.0/24', f'fd42:{index}::/64', f'{label}.corp.test'):
                 data('rule', 'create', '--group', group, '--destination', destination)
 
-        for key in ('net.ipv4.ip_forward', 'net.ipv6.conf.all.forwarding'):
-            assert ns('gateway', 'sysctl', '-n', key).stdout.strip() == '1', key
+        for setting in ('net.ipv4.ip_forward', 'net.ipv6.conf.all.forwarding'):
+            assert ns('gateway', 'sysctl', '-n', setting).stdout.strip() == '1', setting
         protected_endpoint = profiles['primary'].replace('10.213.0.2:51821', 'peer.a.corp.test:51821')
         data('connection', 'update', primary, '--file', '-', payload=protected_endpoint)
         refused = control('routing', 'preview', success=False)
@@ -257,13 +257,28 @@ def acceptance(context):
         assert 'wireguard-denied' not in context['events'].read_text()
 
         previous = inventory()[other]
+        data('connection', 'logout', other)
+        alternate = data(
+            'connection', 'import', '--group', b, '--name', 'Replacement', '--protocol',
+            'wireguard', '--file', '-', '--dns', 'udp://10.221.0.10:53', payload=refreshed,
+        )['id']
+        data('group', 'update', b, '--primary', alternate)
+        apply()
+        refused = control('connection', 'restart', other, success=False)
+        assert 'WireGuard peer already has an active connection' in refused.stderr
+        assert inventory()[other]['paused'], 'a refused restart enabled the old profile on disk'
+        tcp('v4.b.corp.test', 'wireguard-active-after-restart-conflict', '10.212.0.1')
+
+        replacement = inventory()[alternate]
         data('group', 'update', b, '--primary', '-')
         data('connection', 'delete', other)
+        data('connection', 'delete', alternate)
         apply()
-        assert not (Path('/run/netns') / previous['namespace']).exists()
-        assert other not in inventory() and primary in inventory()
-        assert previous['interface'] not in ns('gateway', 'ip', 'link', 'show').stdout
-        assert previous['prepared']['generation'] not in ns('gateway', 'nft', 'list', 'tables').stdout
+        assert {other, alternate}.isdisjoint(inventory()) and primary in inventory()
+        for removed in (previous, replacement):
+            assert not (Path('/run/netns') / removed['namespace']).exists()
+            assert removed['interface'] not in ns('gateway', 'ip', 'link', 'show').stdout
+            assert removed['prepared']['generation'] not in ns('gateway', 'nft', 'list', 'tables').stdout
         assert baseline == [ns('gateway', 'ip', family, 'route', 'show', 'default').stdout
                             for family in ('-4', '-6')]
         assert context['api']('server/status')['xray']['state'] == 'running'

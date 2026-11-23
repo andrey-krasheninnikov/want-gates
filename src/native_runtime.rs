@@ -872,10 +872,7 @@ impl Runtime {
         result?;
         Ok(json!(record.prepared))
     }
-    fn create_network(&self, record: &mut Record) -> io::Result<()> {
-        if record.paused {
-            return Ok(());
-        }
+    fn ensure_wireguard_peer_available(&self, record: &Record) -> io::Result<()> {
         if record.profile["protocol"] == "wireguard" {
             let profile = crate::wireguard::decoded_profile(&record.profile)?;
             for instance in self.instances.values().filter(|instance| {
@@ -890,6 +887,13 @@ impl Runtime {
                 }
             }
         }
+        Ok(())
+    }
+    fn create_network(&self, record: &mut Record) -> io::Result<()> {
+        if record.paused {
+            return Ok(());
+        }
+        self.ensure_wireguard_peer_available(record)?;
         let generation = record.prepared.generation.clone();
         let generation = generation.as_str();
         let host = record.host;
@@ -1353,6 +1357,7 @@ impl Runtime {
         Ok(Instance::new(record, auth))
     }
     fn restart(&self, instance: &mut Instance, automatic_forti: bool) -> io::Result<()> {
+        self.ensure_wireguard_peer_available(&instance.record)?;
         instance.stop_for_restart();
         if instance.record.profile["protocol"] == "wireguard"
             && let Err(error) = self.cleanup(&mut instance.record, false)

@@ -214,32 +214,49 @@ fn setconf(record: &Record, profile: &Profile) -> io::Result<()> {
     Ok(())
 }
 
-fn default_mtu(endpoint: IpAddr, ipv6: bool) -> io::Result<u64> {
-    let family = if endpoint.is_ipv4() { "-4" } else { "-6" };
-    let route: Vec<Value> = serde_json::from_str(&command(
-        "/usr/sbin/ip",
-        &[family, "-j", "route", "get", &endpoint.to_string()],
-    )?)
-    .map_err(|_| invalid("invalid WireGuard endpoint route"))?;
-    let route = route
-        .first()
-        .ok_or_else(|| invalid("WireGuard endpoint route is unavailable"))?;
-    let device = route["dev"]
-        .as_str()
-        .ok_or_else(|| invalid("WireGuard endpoint route has no interface"))?;
-    let links: Vec<Value> = serde_json::from_str(&command(
-        "/usr/sbin/ip",
-        &["-j", "link", "show", "dev", device],
-    )?)
-    .map_err(|_| invalid("invalid WireGuard endpoint interface"))?;
-    let link_mtu = links
-        .first()
-        .and_then(|link| link["mtu"].as_u64())
-        .ok_or_else(|| invalid("cannot read WireGuard endpoint interface MTU"))?;
-    let path_mtu = route["mtu"].as_u64().unwrap_or(link_mtu).min(link_mtu);
-    let minimum = if ipv6 { 1280 } else { 68 };
-    // Budget for IPv6 encapsulation while retaining the inner IP family's minimum MTU.
-    Ok(path_mtu.saturating_sub(80).clamp(minimum, 1420))
+fn endpoint_mtu(record: &Record) -> Option<u64> {
+    let endpoint = &record.endpoints[0];
+    let (family, source) = if endpoint.address.is_ipv4() {
+        ("-4", record.prepared.address)
+    } else {
+        ("-6", IpAddr::V6(record.peer6))
+    };
+    let route: Vec<Value> = serde_json::from_str(
+        &command(
+            "/usr/sbin/ip",
+            &[
+                family,
+                "-j",
+                "route",
+                "get",
+                &endpoint.address.to_string(),
+                "from",
+                &source.to_string(),
+                "iif",
+                &record.interface,
+                "ipproto",
+                "udp",
+                "dport",
+                &endpoint.port.to_string(),
+            ],
+        )
+        .ok()?,
+    )
+    .ok()?;
+    let route = route.first()?;
+    let device = route["dev"].as_str()?;
+    let links: Vec<Value> = serde_json::from_str(
+        &command("/usr/sbin/ip", &["-j", "link", "show", "dev", device]).ok()?,
+    )
+    .ok()?;
+    let link_mtu = links.first()?.get("mtu")?.as_u64()?;
+    route["metrics"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|metric| metric["mtu"].as_u64())
+        .chain(std::iter::once(link_mtu))
+        .min()
 }
 
 pub(super) fn start(record: &Record) -> io::Result<Option<String>> {
@@ -255,16 +272,22 @@ pub(super) fn start(record: &Record) -> io::Result<Option<String>> {
         record,
         &["link", "set", "dev", INTERFACE, "addrgenmode", "none"],
     )?;
-    let mtu = match profile.mtu {
-        Some(mtu) => u64::from(mtu),
-        None => default_mtu(
-            record.endpoints[0].address,
-            profile
-                .addresses
-                .iter()
-                .any(|address| address.contains(':')),
-        )?,
-    };
+    let mtu = profile.mtu.map(u64::from).unwrap_or_else(|| {
+        let minimum = if profile
+            .addresses
+            .iter()
+            .any(|address| address.contains(':'))
+        {
+            1280
+        } else {
+            68
+        };
+        // Budget for IPv6 encapsulation while retaining the inner IP family's minimum MTU.
+        endpoint_mtu(record)
+            .unwrap_or(1500)
+            .saturating_sub(80)
+            .clamp(minimum, 1420)
+    });
     ns(
         record,
         &["link", "set", "dev", INTERFACE, "mtu", &mtu.to_string()],
