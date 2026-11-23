@@ -1,5 +1,7 @@
 #[path = "forti_runtime.rs"]
 mod forti;
+#[cfg(test)]
+mod netbird_fixture;
 #[path = "wireguard_runtime.rs"]
 mod wireguard;
 use crate::native::{Observation, Prepared};

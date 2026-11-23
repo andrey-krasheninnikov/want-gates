@@ -259,7 +259,7 @@ def checked(*args, **kwargs):
     return result
 
 
-def main(binary, panel_root, native_acceptance=None):
+def main(binary, panel_root, native_acceptance=None, extra_udp_targets=()):
     if sys.platform != 'linux' or os.geteuid() != 0:
         raise SystemExit('Run only as root on a disposable Linux systemd host.')
     repo = Path(__file__).resolve().parent.parent
@@ -395,7 +395,7 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
         inbounds=[dict(tag='client-socks',listen='127.0.0.1',port=10880,protocol='socks',settings=dict(auth='noauth',udp=True))]
         for port,address in [(15354,'10.220.0.10'),(15355,'10.221.0.10'),(15356,'fd42:220::10'),(15357,'fd42:221::10')]:
             inbounds.append(dict(tag=f'udp-{port}',listen='127.0.0.1',port=port,protocol='dokodemo-door',settings=dict(address=address,port=15353,network='udp')))
-        for port,address in [(15358,'v4.corp.test'),(15359,'v6.corp.test'),(15361,'v4.dev.corp.test'),(15362,'v6.dev.corp.test')]:
+        for port,address in [(15358,'v4.corp.test'),(15359,'v6.corp.test'),(15361,'v4.dev.corp.test'),(15362,'v6.dev.corp.test'), *extra_udp_targets]:
             inbounds.append(dict(tag=f'domain-{port}',listen='127.0.0.1',port=port,protocol='dokodemo-door',settings=dict(address=address,port=15353,network='udp')))
         inbounds.append(dict(tag='dns-client',listen='127.0.0.1',port=15360,protocol='dokodemo-door',settings=dict(address='1.1.1.1',port=53,network='udp')))
         client=start_xray('client',dict(log=dict(loglevel='warning'),inbounds=inbounds,outbounds=[outbound('10.215.0.1',19000,ids['ingress'])]))
