@@ -14,7 +14,7 @@ fi
 [ "$#" -eq 2 ] || usage
 pr=$1
 merge=$2
-case "$pr" in ''|*[!0-9]*) usage ;; esac
+[ "$pr" = 31 ] || usage
 case "$merge" in ''|*[!0-9a-f]*) usage ;; esac
 [ "$(printf '%s' "$merge" | wc -c | tr -d ' ')" -eq 40 ] || usage
 
@@ -24,10 +24,10 @@ case "$(git remote get-url origin)" in
     "https://github.com/$repo.git"|"git@github.com:$repo.git") ;;
     *) echo 'Unexpected origin' >&2; exit 1 ;;
 esac
-live=$(gh pr view "$pr" --repo "$repo" --json state,baseRefName,headRefName,headRefOid,mergeCommit \
-    --jq '[.state, .baseRefName, .headRefName, .headRefOid, .mergeCommit.oid] | join(" ")')
+live=$(gh pr view "$pr" --repo "$repo" --json state,baseRefName,headRefName,headRefOid,mergeCommit,isCrossRepository,headRepositoryOwner \
+    --jq '[.state, .baseRefName, .headRefName, .headRefOid, .mergeCommit.oid, (.isCrossRepository|tostring), .headRepositoryOwner.login] | join(" ")')
 head=$(git rev-parse "$merge^2")
-[ "$live" = "MERGED main $branch $head $merge" ] || {
+[ "$live" = "MERGED main $branch $head $merge false andrey-krasheninnikov" ] || {
     echo 'PR, merge SHA, or source revision does not match issue #11' >&2
     exit 1
 }

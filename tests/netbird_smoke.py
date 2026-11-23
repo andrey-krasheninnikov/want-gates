@@ -28,6 +28,7 @@ COMPANIES = ('a', 'b')
 PRIVATE = ('10.220.0.10', 'fd42:220::10')
 EXIT = ('1.1.1.1', '2606:4700::1111')
 CAPABILITIES = ('tcp_ipv4', 'udp_ipv4', 'tcp_ipv6', 'udp_ipv6')
+DIRECT_UDP = list(zip((15420, 15421), EXIT, strict=True))
 
 
 def host(mode, family, company):
@@ -410,12 +411,11 @@ def acceptance(context, native_test, client, server, geodata):
         value = json.loads(result.stdout)['answer'] if not result.returncode else None
         assert value == expected, f'wrong DNS result for {name}'
 
-    def udp(mode, family, company, expected):
+    def udp(port, expected):
         marker = secrets.token_hex(8) + '.payload.test'
-        result = client_run(sys.executable, stand.__file__, '--udp',
-                            UDP_TARGETS[mode, family, company], marker)
+        result = client_run(sys.executable, stand.__file__, '--udp', port, marker)
         value = json.loads(result.stdout)['answer'] if not result.returncode else None
-        assert value == expected, f'wrong UDP result for {mode}/IPv{family}/{company}'
+        assert value == expected, f'wrong UDP result on client port {port}'
         return marker
 
     def events(company):
@@ -498,74 +498,73 @@ def acceptance(context, native_test, client, server, geodata):
                                f'sport = :{company.gateway_port}').stdout.strip(), 'missing WireGuard port'
         print('IPv4 and private DNS passed resource probes in both namespaces', flush=True)
 
-        for index, company in enumerate(companies):
-            other = companies[1 - index]
-            # The normal direct route and witness are still available.
-            result = client_run('curl', '--noproxy', '', '--socks5-hostname', '127.0.0.1:10880',
-                                '--max-time', '5', '-fsS', 'http://1.1.1.1:18080/netbird-direct')
-            assert result.returncode == 0 and json.loads(result.stdout)['peer'] == '10.210.0.1'
-            denied(companies, tcp(host('exit', 4, company.name)))
-            tag = secrets.token_hex(8)
-            query(f'{tag}.who.private.v4.{company.name}.corp.test', f'198.18.{index+1}.1')
-            verify_path(company, other, tag)
+        def check_traffic(mode, company, other, allowed):
+            answer = f'198.18.{COMPANIES.index(company.name)+1}.1'
             for family in (4, 6):
-                allowed = verified[company.name]
-                target = host('private', family, company.name)
+                target = host(mode, family, company.name)
                 if f'tcp_ipv{family}' in allowed:
                     verify_path(company, other, tcp(target, company.name))
                 else:
                     denied(companies, tcp(target))
-                tag = udp('private', family, company.name, f'198.18.{index+1}.1'
-                          if f'udp_ipv{family}' in allowed else None)
-                if f'udp_ipv{family}' in allowed:
-                    verify_path(company, other, tag)
+                can_use_udp = f'udp_ipv{family}' in allowed
+                marker = udp(UDP_TARGETS[mode, family, company.name], answer if can_use_udp else None)
+                if can_use_udp:
+                    verify_path(company, other, marker)
                 else:
-                    denied(companies, tag)
+                    denied(companies, marker)
 
-        for company in companies:
-            company.select_exit()
+        for address, source in zip(EXIT, ('10.210.0.1', 'fd42:210::1'), strict=True):
+            target = f'[{address}]' if ':' in address else address
+            result = client_run('curl', '--noproxy', '', '--socks5-hostname', '127.0.0.1:10880',
+                                '--max-time', '5', '-fsS', f'http://{target}:18080/netbird-direct')
+            assert result.returncode == 0 and json.loads(result.stdout)['peer'] == source
+        for port, _ in DIRECT_UDP:
+            marker = udp(port, '198.18.0.1')
+            assert seen(direct(), marker), 'direct UDP witness did not receive probe'
+
+        a, b = companies
+        for index, (company, other) in enumerate(((a, b), (b, a)), 1):
+            tag = secrets.token_hex(8)
+            query(f'{tag}.who.private.v4.{company.name}.corp.test', f'198.18.{index}.1')
+            verify_path(company, other, tag)
+            check_traffic('private', company, other, verified[company.name])
+            check_traffic('exit', company, other, ())
         print('Private routes, overlapping resources and DNS isolated', flush=True)
-        for index, company in enumerate(companies):
-            other = companies[1 - index]
+
+        for index, (company, other) in enumerate(((a, b), (b, a)), 1):
+            company.select_exit()
             wait_for(f'{company.name} exit route', lambda: client_run(
                 'curl', '--noproxy', '', '--socks5-hostname', '127.0.0.1:10880', '--max-time', '3',
                 '-fsS', f'http://{host("exit", 4, company.name)}:18080/exit-ready').returncode == 0)
-            for family in (4, 6):
-                target = host('exit', family, company.name)
-                allowed = verified[company.name]
-                if f'tcp_ipv{family}' in allowed:
-                    verify_path(company, other, tcp(target, company.name))
-                else:
-                    denied(companies, tcp(target))
-                tag = udp('exit', family, company.name, f'198.18.{index+1}.1'
-                          if f'udp_ipv{family}' in allowed else None)
-                if f'udp_ipv{family}' in allowed:
-                    verify_path(company, other, tag)
-                else:
-                    denied(companies, tag)
+            check_traffic('exit', company, other, verified[company.name])
             tag = secrets.token_hex(8)
-            query(f'{tag}.who.exit.v4.{company.name}.corp.test', f'198.18.{index+1}.1')
+            query(f'{tag}.who.exit.v4.{company.name}.corp.test', f'198.18.{index}.1')
             verify_path(company, other, tag)
+            if company is a:
+                check_traffic('exit', b, a, ())
         assert management_path() == baseline
 
-        a, b = companies
         keep_running = threading.Event()
         witnessed = threading.Event()
+
+        def check_b():
+            verify_path(b, a, tcp(host('exit', 4, 'b'), 'b'))
+            tag = secrets.token_hex(8)
+            query(f'{tag}.who.private.v4.b.corp.test', '198.18.2.1')
+            verify_path(b, a, tag)
 
         def monitor_b():
             count = 0
             while not keep_running.is_set():
-                verify_path(b, a, tcp(host('exit', 4, 'b'), 'b'))
-                tag = secrets.token_hex(8)
-                query(f'{tag}.who.private.v4.b.corp.test', '198.18.2.1')
-                verify_path(b, a, tag)
+                check_b()
                 count += 1
                 witnessed.set()
                 keep_running.wait(.25)
             return count
 
         def assert_a_blocked():
-            denied(companies, tcp(host('exit', 4, 'a')))
+            check_traffic('exit', a, b, ())
+            check_b()
             tag = secrets.token_hex(8)
             query(f'{tag}.who.private.v4.a.corp.test')
             denied(companies, tag)
@@ -617,7 +616,8 @@ def main():
     geodata = list(geodata_files(args.geodata))
     os.umask(0o077)
     stand.main(*paths[:2], native_acceptance=lambda context: acceptance(context, *paths[2:], geodata),
-               extra_udp_targets=[(port, host(*target)) for target, port in UDP_TARGETS.items()])
+               extra_udp_targets=[(port, host(*target)) for target, port in UDP_TARGETS.items()] + DIRECT_UDP,
+               extra_udp_witnesses=EXIT)
 
 
 if __name__ == '__main__':

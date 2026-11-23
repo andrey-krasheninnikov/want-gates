@@ -7,7 +7,7 @@ two native NetBird accounts on one gateway. The connection adapter is tracked in
 ## Reproduce
 
 Use a disposable Linux systemd host with TUN, network namespaces, IPv4 and IPv6
-forwarding in the test namespaces, and nftables. The fixture also uses Python 3,
+forwarding in the test namespaces, and nftables. The fixture also uses Python 3.10 or later,
 curl, OpenSSL, tcpdump, iproute2, nsenter and Rust 1.93. Run it as root. Reserve the host for
 the test, since the routing stand creates systemd units and local accounts.
 
@@ -97,8 +97,7 @@ downloads and extracted binaries after verifying the path. This fixture does
 not configure a live NetBird account or install a NetBird service on the host.
 
 To reverse the merged code, fetch `origin/main` and create a clean rollback
-worktree. Get the PR number and full merge commit from the merged PR for issue
-#11. Keep a copy of the script from the current `main` so it remains available
+worktree. Get the full merge commit from [PR #31](https://github.com/andrey-krasheninnikov/want-gates/pull/31). Keep a copy of the script from the current `main` so it remains available
 after the revert. The first invocation displays the exact paths in the merge.
 The second creates a local revert commit. Publish it in a separate PR to
 `main` after reviewing the diff.
@@ -107,8 +106,8 @@ The second creates a local revert commit. Publish it in a separate PR to
 git fetch origin main
 git worktree add -b revert/11-netbird-isolation ../want-gates-revert-11 origin/main
 cd ../want-gates-revert-11
-sh tests/netbird_revert.sh "$pr_number" "$merge_sha"
-sh tests/netbird_revert.sh --apply "$pr_number" "$merge_sha"
+sh tests/netbird_revert.sh 31 "$merge_sha"
+sh tests/netbird_revert.sh --apply 31 "$merge_sha"
 git show --stat HEAD
 ```
 
