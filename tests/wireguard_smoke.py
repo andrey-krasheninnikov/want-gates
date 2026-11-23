@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Exercise native WireGuard with real 3x-ui and VLESS on the routing stand."""
+import base64
 import json
 from pathlib import Path
 import sys
@@ -24,6 +25,13 @@ def acceptance(context):
 
     def apply():
         return data('routing', 'apply', data('routing', 'preview')['plan_id'])
+
+    def reject_apply(reason):
+        plan = data('routing', 'preview')['plan_id']
+        refused = control('routing', 'apply', plan, success=False)
+        assert reason in refused.stderr, refused.stderr
+        assert all(secret not in refused.stderr for secret in secrets)
+        data('routing', 'recover', plan)
 
     def key(command, value=None):
         result = stand.checked('wg', command, input=None if value is None else value + '\n')
@@ -52,15 +60,15 @@ def acceptance(context):
         endpoint = '10.213.0.2' if peer == 'a' else '[fd42:214::2]'
         return (
             f'[Interface]\nPrivateKey = {private}\nAddress = {address}/32, {address6}/128\n'
-            f'DNS = 10.220.0.10\nMTU = 1380\n[Peer]\nPublicKey = {key("pubkey", server)}\n'
+            f'DNS = 10.220.0.10\n[Peer]\nPublicKey = {key("pubkey", server)}\n'
             f'PresharedKey = {shared}\nEndpoint = {endpoint}:{port}\nAllowedIPs = 0.0.0.0/0, ::/0\n'
         )
 
-    def tcp(address, marker, source=None):
+    def tcp(address, marker, source=None, padding=0):
         result = stand.run(
             'ip', 'netns', 'exec', context['names']['client'], 'curl', '--noproxy', '',
             '--socks5-hostname', '127.0.0.1:10880', '--max-time', '4', '-fsS',
-            f'http://{address}:18080/{marker}',
+            '--header', 'X-Witness: ' + 'x' * padding, f'http://{address}:18080/{marker}',
         )
         if source is None:
             assert result.returncode != 0, 'blocked TCP reached the resource'
@@ -85,6 +93,7 @@ def acceptance(context):
 
     for name in ('gateway', 'a', 'b'):
         ns(name, 'sysctl', '-q', '-w', 'net.ipv4.ip_forward=1', 'net.ipv6.conf.all.forwarding=1')
+    ns('gateway', 'ip', 'link', 'set', 'w4214a', 'mtu', '1360')
     ns('a', 'ip', 'address', 'add', '10.211.0.3/24', 'dev', 'w4211a')
     ns('a', 'ip', '-6', 'address', 'add', 'fd42:211::3/64', 'dev', 'w4211a', 'nodad')
     profiles = {
@@ -137,7 +146,7 @@ def acceptance(context):
         capabilities = {'tcp_ipv4', 'udp_ipv4', 'tcp_ipv6', 'udp_ipv6'}
         data('group', 'update', a, '--primary', primary, '--fallbacks', reserve,
              '--healthcheck-file', '-', payload=dict(
-                 target='http://health.a.corp.test:18080/health', required_capabilities=sorted(capabilities),
+                 target='http://health.v4.a.corp.test:18080/health', required_capabilities=sorted(capabilities),
                  interval_seconds=1, timeout_seconds=1, failure_threshold=2, recovery_threshold=2,
              ))
         data('group', 'update', a, '--probe-file', '-', payload=probes(220, 'a'))
@@ -153,6 +162,14 @@ def acceptance(context):
         refused = control('routing', 'preview', success=False)
         assert 'WireGuard peer name overlaps a protected domain' in refused.stderr
         data('connection', 'update', primary, '--file', '-', payload=profiles['primary'])
+        private = profiles['other'].split('PrivateKey = ', 1)[1].splitlines()[0]
+        own_public = key('pubkey', private)
+        server_public = profiles['other'].split('PublicKey = ', 1)[1].splitlines()[0]
+        self_peer = profiles['other'].replace(server_public, own_public)
+        data('connection', 'update', other, '--file', '-', payload=self_peer)
+        reject_apply('WireGuard did not install the configured peer')
+        assert not inventory(), 'failed preparation retained native records'
+        data('connection', 'update', other, '--file', '-', payload=profiles['other'])
         applied = apply()
         assert applied['state'] == 'applied', applied
         for connection, dns in ((primary, '10.220.0.10'), (other, '10.221.0.10')):
@@ -166,6 +183,7 @@ def acceptance(context):
         udp(15356, 'wireguard-v6.example.test', '198.18.1.1')
         tcp('v4.a.corp.test', 'wireguard-dns-a', '10.211.0.1')
         tcp('v4.b.corp.test', 'wireguard-dns-b', '10.212.0.1')
+        tcp('[fd42:221::10]', 'wireguard-smaller-mtu', 'fd42:212::1', padding=3500)
         tcp('public.v4.a.corp.test', 'wireguard-shared-destination-a', '10.211.0.1')
         tcp('public.v4.b.corp.test', 'wireguard-shared-destination-b', '10.212.0.1')
         records = inventory()
@@ -216,6 +234,19 @@ def acceptance(context):
         assert 'wireguard-denied-restart' not in context['events'].read_text()
         apply()
         tcp('v4.b.corp.test', 'wireguard-recovered', '10.212.0.1')
+
+        scalar = bytearray(base64.b64decode(private))
+        scalar[0] ^= 1
+        equivalent = base64.b64encode(scalar).decode()
+        secrets.append(equivalent)
+        refreshed = profiles['other'].replace(private, equivalent).replace('[Peer]', 'MTU = 1280\n[Peer]')
+        data('connection', 'update', other, '--file', '-', payload=refreshed)
+        reject_apply('WireGuard peer already has an active connection')
+        tcp('v4.b.corp.test', 'wireguard-original-continues', '10.212.0.1')
+        data('connection', 'logout', other)
+        assert not (Path('/run/netns') / records[other]['namespace']).exists()
+        apply()
+        tcp('v4.b.corp.test', 'wireguard-replaced', '10.212.0.1')
 
         data('connection', 'update', other, '--capabilities', 'tcp_ipv4,udp_ipv4')
         apply()

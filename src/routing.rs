@@ -765,10 +765,13 @@ impl Service {
                 ));
             }
             if working.as_ref().is_none_or(|w| {
-                !w.config
-                    .connections
-                    .iter()
-                    .any(|c| c.id == connection.id && c.profile_ref == connection.profile_ref)
+                !w.config.connections.iter().any(|c| {
+                    c.id == connection.id
+                        && (c.profile_ref == connection.profile_ref
+                            || command == "connection.logout"
+                                && c.protocol == "wireguard"
+                                && connection.protocol == "wireguard")
+                })
             }) {
                 return Err(invalid(
                     "native authentication requires a current routing preview and apply",

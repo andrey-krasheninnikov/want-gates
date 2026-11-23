@@ -876,6 +876,20 @@ impl Runtime {
         if record.paused {
             return Ok(());
         }
+        if record.profile["protocol"] == "wireguard" {
+            let profile = crate::wireguard::decoded_profile(&record.profile)?;
+            for instance in self.instances.values().filter(|instance| {
+                instance.record.namespace_identity.is_some()
+                    && instance.record.profile["protocol"] == "wireguard"
+            }) {
+                let active = crate::wireguard::decoded_profile(&instance.record.profile)?;
+                if profile.same_peer_identity(&active)? {
+                    return Err(invalid(
+                        "WireGuard peer already has an active connection with this client key; log out the running connection before applying",
+                    ));
+                }
+            }
+        }
         let generation = record.prepared.generation.clone();
         let generation = generation.as_str();
         let host = record.host;
@@ -1123,6 +1137,12 @@ impl Runtime {
                 r.interface, e.address, e.protocol, e.port
             );
         }
+        if wg {
+            forward += &format!(
+                "oifname \"{0}\" ct state related icmp type destination-unreachable icmp code 4 accept; oifname \"{0}\" ct state related icmpv6 type packet-too-big accept;",
+                r.interface
+            );
+        }
         let table = format!("wgates_{}", r.prepared.generation);
         let nonce = random_id()?;
         let host_rules = format!(
@@ -1334,15 +1354,15 @@ impl Runtime {
     }
     fn restart(&self, instance: &mut Instance, automatic_forti: bool) -> io::Result<()> {
         instance.stop_for_restart();
-        self.client_version(instance.record.profile["protocol"].as_str().unwrap_or(""))?;
-        if Self::forti_processes_remain(&instance.record)? {
-            return Err(invalid("native Forti namespace still has active processes"));
-        }
         if instance.record.profile["protocol"] == "wireguard"
             && let Err(error) = self.cleanup(&mut instance.record, false)
         {
             instance.auth.fail("native_cleanup_required");
             return Err(error);
+        }
+        self.client_version(instance.record.profile["protocol"].as_str().unwrap_or(""))?;
+        if Self::forti_processes_remain(&instance.record)? {
+            return Err(invalid("native Forti namespace still has active processes"));
         }
         instance.record.paused = false;
         self.save(&instance.record)?;

@@ -2,6 +2,7 @@ use super::{Endpoint, Record, command, executable, namespace_child, ns};
 use crate::invalid;
 use crate::policy::Network;
 use crate::wireguard::{Profile, decoded_profile, endpoint, unicast};
+use serde_json::Value;
 use std::fs::{File, Permissions};
 use std::io::{self, Seek, Write};
 use std::net::{IpAddr, SocketAddr};
@@ -178,7 +179,7 @@ fn setconf(record: &Record, profile: &Profile) -> io::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) if status.success() => break,
             Ok(Some(_)) => return Err(invalid("WireGuard rejected the native configuration")),
             Ok(None) => {}
             Err(error) => {
@@ -194,6 +195,51 @@ fn setconf(record: &Record, profile: &Profile) -> io::Result<()> {
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+    let peer = command(
+        "/usr/sbin/ip",
+        &[
+            "netns",
+            "exec",
+            &record.namespace,
+            path.to_str()
+                .ok_or_else(|| invalid("invalid WireGuard executable path"))?,
+            "show",
+            INTERFACE,
+            "peers",
+        ],
+    )?;
+    if peer.trim() != profile.public_key {
+        return Err(invalid("WireGuard did not install the configured peer"));
+    }
+    Ok(())
+}
+
+fn default_mtu(endpoint: IpAddr, ipv6: bool) -> io::Result<u64> {
+    let family = if endpoint.is_ipv4() { "-4" } else { "-6" };
+    let route: Vec<Value> = serde_json::from_str(&command(
+        "/usr/sbin/ip",
+        &[family, "-j", "route", "get", &endpoint.to_string()],
+    )?)
+    .map_err(|_| invalid("invalid WireGuard endpoint route"))?;
+    let route = route
+        .first()
+        .ok_or_else(|| invalid("WireGuard endpoint route is unavailable"))?;
+    let device = route["dev"]
+        .as_str()
+        .ok_or_else(|| invalid("WireGuard endpoint route has no interface"))?;
+    let links: Vec<Value> = serde_json::from_str(&command(
+        "/usr/sbin/ip",
+        &["-j", "link", "show", "dev", device],
+    )?)
+    .map_err(|_| invalid("invalid WireGuard endpoint interface"))?;
+    let link_mtu = links
+        .first()
+        .and_then(|link| link["mtu"].as_u64())
+        .ok_or_else(|| invalid("cannot read WireGuard endpoint interface MTU"))?;
+    let path_mtu = route["mtu"].as_u64().unwrap_or(link_mtu).min(link_mtu);
+    let minimum = if ipv6 { 1280 } else { 68 };
+    // Budget for IPv6 encapsulation while retaining the inner IP family's minimum MTU.
+    Ok(path_mtu.saturating_sub(80).clamp(minimum, 1420))
 }
 
 pub(super) fn start(record: &Record) -> io::Result<Option<String>> {
@@ -209,12 +255,20 @@ pub(super) fn start(record: &Record) -> io::Result<Option<String>> {
         record,
         &["link", "set", "dev", INTERFACE, "addrgenmode", "none"],
     )?;
-    if let Some(mtu) = profile.mtu {
-        ns(
-            record,
-            &["link", "set", "dev", INTERFACE, "mtu", &mtu.to_string()],
-        )?;
-    }
+    let mtu = match profile.mtu {
+        Some(mtu) => u64::from(mtu),
+        None => default_mtu(
+            record.endpoints[0].address,
+            profile
+                .addresses
+                .iter()
+                .any(|address| address.contains(':')),
+        )?,
+    };
+    ns(
+        record,
+        &["link", "set", "dev", INTERFACE, "mtu", &mtu.to_string()],
+    )?;
     for address in &profile.addresses {
         if address.contains(':') {
             ns(

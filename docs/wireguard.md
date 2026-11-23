@@ -23,13 +23,17 @@ One `[Interface]` and one `[Peer]` are supported. Supply `PrivateKey`,
 addresses and 256 allowed prefixes. IPv4 and IPv6 addresses and prefixes can
 share a profile. `Endpoint` takes an IP or hostname with a port. Bracket an
 IPv6 literal. The helper resolves a hostname with the host resolver during
-preparation and pins one IP for that generation. Reimport the profile with
-`connection update --file` and apply it to resolve the endpoint again.
+preparation and pins one IP for that generation. To resolve the endpoint
+again, log out the running connection, replace its profile with
+`connection update --file`, and preview and apply the change.
 
 `PresharedKey`, `PersistentKeepalive`, `MTU` and one numeric `DNS` address
 are optional. The import rejects other fields, including hooks, custom tables
 and firewall marks. The helper passes keys to `wg setconf` through private
 input and uses its own firewall mark to route encrypted packets to the peer.
+When the profile omits MTU, the helper uses the gateway's endpoint path MTU
+and budgets for WireGuard encapsulation. Set `MTU` for paths with a lower
+known limit.
 The default profile resolver uses UDP port 53 through the tunnel. An explicit
 connection `--dns` overrides it, and `--dns -` restores the profile value.
 
@@ -39,7 +43,16 @@ identify a key mismatch by itself. Configure a target-resource healthcheck to
 select eligible reserves and admit a fresh runtime session automatically.
 Groups without a healthcheck require another explicit preview and apply after
 restart. Use `connection restart` or `connection logout` for the runtime
-session. To rotate keys, update the profile and apply the new plan.
+session. To rotate keys, update the profile and apply the new plan. If the
+updated profile keeps the same client and peer keys, log out the running
+connection before applying the change. This prevents competing tunnels from
+moving the peer's endpoint. If apply already recorded the conflict, use
+`routing recover PLAN_ID` before logging out the connection and applying
+a fresh plan.
+
+Before downgrading to a version that lacks WireGuard support, remove the
+WireGuard connections and apply the removal under the current version so its
+runtime can release their resources.
 
 The isolated Linux stand exercises WireGuard with 3x-ui and VLESS.
 
