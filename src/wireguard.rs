@@ -49,7 +49,7 @@ pub fn endpoint(value: &str) -> io::Result<(String, u16)> {
     Ok((domain_name(host).map_err(|_| error())?, port))
 }
 
-fn key(value: &str) -> io::Result<[u8; 32]> {
+fn key(value: &str) -> io::Result<()> {
     let mut bytes = [0; 32];
     if value.len() != 44
         || STANDARD.decode_slice(value, &mut bytes).ok() != Some(32)
@@ -59,7 +59,7 @@ fn key(value: &str) -> io::Result<[u8; 32]> {
             "invalid WireGuard key; expected a nonzero 32-byte base64 key",
         ));
     }
-    Ok(bytes)
+    Ok(())
 }
 
 fn host_prefix(value: &str) -> io::Result<String> {
@@ -78,19 +78,6 @@ fn host_prefix(value: &str) -> io::Result<String> {
 }
 
 impl Profile {
-    #[cfg(target_os = "linux")]
-    pub fn same_peer_identity(&self, other: &Self) -> io::Result<bool> {
-        fn scalar(value: &str) -> io::Result<[u8; 32]> {
-            let mut bytes = key(value)?;
-            bytes[0] &= 248;
-            bytes[31] = (bytes[31] & 127) | 64;
-            Ok(bytes)
-        }
-
-        Ok(self.public_key == other.public_key
-            && scalar(&self.private_key)? == scalar(&other.private_key)?)
-    }
-
     fn normalize(&mut self) -> io::Result<()> {
         key(&self.private_key)?;
         key(&self.public_key)?;

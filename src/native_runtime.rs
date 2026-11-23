@@ -205,10 +205,14 @@ fn executable(path: &Path) -> io::Result<PathBuf> {
     Ok(path)
 }
 fn command(program: &str, args: &[&str]) -> io::Result<String> {
+    command_input(program, args, Stdio::null())
+}
+fn command_input(program: &str, args: &[&str], stdin: Stdio) -> io::Result<String> {
     let mut child = Command::new(program)
         .args(args)
         .env_clear()
         .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()?;
@@ -838,6 +842,7 @@ impl Runtime {
                 "native generation collides with retained resources; inspect before retrying",
             ));
         }
+        self.ensure_wireguard_peer_available(&record)?;
         self.save(&record)?;
         let result: io::Result<()> = (|| {
             self.create_network(&mut record)?;
@@ -873,18 +878,32 @@ impl Runtime {
         Ok(json!(record.prepared))
     }
     fn ensure_wireguard_peer_available(&self, record: &Record) -> io::Result<()> {
-        if record.profile["protocol"] == "wireguard" {
-            let profile = crate::wireguard::decoded_profile(&record.profile)?;
-            for instance in self.instances.values().filter(|instance| {
-                instance.record.namespace_identity.is_some()
-                    && instance.record.profile["protocol"] == "wireguard"
-            }) {
-                let active = crate::wireguard::decoded_profile(&instance.record.profile)?;
-                if profile.same_peer_identity(&active)? {
-                    return Err(invalid(
-                        "WireGuard peer already has an active connection with this client key; log out the running connection before applying",
-                    ));
+        if record.profile["protocol"] != "wireguard" {
+            return Ok(());
+        }
+        let profile = crate::wireguard::decoded_profile(&record.profile)?;
+        let mut requested_public_key = None;
+        for instance in self.instances.values().filter(|instance| {
+            instance.record.profile["protocol"] == "wireguard"
+                && (!instance.record.paused || instance.record.namespace_identity.is_some())
+        }) {
+            let active = crate::wireguard::decoded_profile(&instance.record.profile)?;
+            if profile.public_key != active.public_key {
+                continue;
+            }
+            let same_identity = if profile.private_key == active.private_key {
+                true
+            } else {
+                if requested_public_key.is_none() {
+                    requested_public_key = Some(wireguard::client_public_key(&profile)?);
                 }
+                requested_public_key.as_deref()
+                    == Some(wireguard::client_public_key(&active)?.as_str())
+            };
+            if same_identity {
+                return Err(invalid(
+                    "WireGuard peer already has an active connection with this client key; log out the running connection before applying",
+                ));
             }
         }
         Ok(())

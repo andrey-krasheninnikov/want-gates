@@ -1,4 +1,4 @@
-use super::{Endpoint, Record, command, executable, namespace_child, ns};
+use super::{Endpoint, Record, command, command_input, executable, namespace_child, ns};
 use crate::invalid;
 use crate::policy::Network;
 use crate::wireguard::{Profile, decoded_profile, endpoint, unicast};
@@ -140,19 +140,37 @@ pub(super) fn transport_route(record: &Record) -> io::Result<()> {
     Ok(())
 }
 
-fn setconf(record: &Record, profile: &Profile) -> io::Result<()> {
-    let path = executable(Path::new(WG))?;
-    let peer = &record.endpoints[0];
-    let endpoint = SocketAddr::new(peer.address, peer.port);
-    // The client reads the config from an anonymous file passed as stdin.
+fn private_input() -> io::Result<File> {
     // SAFETY: the static name is valid and a successful call transfers ownership of the fd.
     let fd = unsafe { libc::memfd_create(c"wgates-wireguard-config".as_ptr(), libc::MFD_CLOEXEC) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: this process owns the newly created fd.
-    let mut config = unsafe { File::from_raw_fd(fd) };
+    let config = unsafe { File::from_raw_fd(fd) };
     config.set_permissions(Permissions::from_mode(0o600))?;
+    Ok(config)
+}
+
+pub(super) fn client_public_key(profile: &Profile) -> io::Result<String> {
+    let path = executable(Path::new(WG))?;
+    let mut input = private_input()?;
+    writeln!(input, "{}", profile.private_key)?;
+    input.rewind()?;
+    let output = command_input(
+        path.to_str()
+            .ok_or_else(|| invalid("invalid WireGuard executable path"))?,
+        &["pubkey"],
+        Stdio::from(input),
+    )?;
+    Ok(output.trim().to_owned())
+}
+
+fn setconf(record: &Record, profile: &Profile) -> io::Result<()> {
+    let path = executable(Path::new(WG))?;
+    let peer = &record.endpoints[0];
+    let endpoint = SocketAddr::new(peer.address, peer.port);
+    let mut config = private_input()?;
     write!(
         config,
         "[Interface]\nPrivateKey = {}\nFwMark = {MARK}\n\n[Peer]\nPublicKey = {}\nEndpoint = {endpoint}\nAllowedIPs = {}\n",
