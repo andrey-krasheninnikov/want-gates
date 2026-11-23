@@ -14,6 +14,7 @@ pub fn parse_for(protocol: &str, input: &str) -> io::Result<Value> {
         "vless" => parse(input),
         "openvpn" => crate::openvpn::parse(input),
         "forti" => crate::forti::parse(input),
+        "wireguard" => crate::wireguard::parse(input),
         _ => Err(invalid("protocol adapter unavailable")),
     }
 }
