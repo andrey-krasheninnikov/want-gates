@@ -22,7 +22,7 @@ invalidate the associated access evidence. Host forwarding is a checked
 prerequisite; the runtime does not change global sysctl or the management route.
 This runtime extends the single-worker design in ADR 0007 with the privileged
 operations required by native clients. Health selection stays in the control
-service. OpenVPN and Forti share this runtime; other native adapters remain unavailable.
+service. OpenVPN, Forti and WireGuard share this runtime.
 
 The private bridge uses VLESS over fixed TCP ports, carrying UDP without exposing
 ephemeral relay ports. Separate identities keep diagnostics apart from admitted

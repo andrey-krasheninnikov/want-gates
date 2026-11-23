@@ -133,7 +133,8 @@ matching successful observation, `unknown` after failure or invalidation, and
 OpenVPN profiles use `--protocol openvpn`; see [profile and authentication limits](openvpn.md).
 Forti profiles use `--protocol forti`; see [Forti operation](forti.md).
 Both native adapters report authentication separately from resource verification.
-WireGuard and NetBird adapters remain unavailable.
+[WireGuard](wireguard.md) uses the same helper with an isolated kernel interface.
+NetBird is planned.
 
 ### Persistent state
 

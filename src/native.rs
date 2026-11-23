@@ -7,7 +7,11 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
 pub fn is_native(protocol: &str) -> bool {
-    matches!(protocol, "openvpn" | "forti")
+    matches!(protocol, "openvpn" | "forti" | "wireguard")
+}
+
+pub fn probe_ready(authentication: &str) -> bool {
+    matches!(authentication, "authenticated" | "configured")
 }
 
 pub const DEFAULT_SOCKET: &str = "/run/wgates-native/control.sock";
@@ -250,7 +254,7 @@ pub fn admit(
         let state = observations
             .get(id)
             .ok_or_else(|| invalid("native observation missing"))?;
-        let admitted = state.authentication == "authenticated"
+        let admitted = probe_ready(&state.authentication)
             && config.groups.iter().any(|g| {
                 g.primary.as_ref() == Some(id)
                     && matrix
@@ -303,7 +307,7 @@ pub fn readiness(
         .get(&connection.id)
         .map(|o| o.authentication.as_str())
     {
-        Some("authenticated") => None,
+        Some(state) if probe_ready(state) => None,
         Some(
             "credentials_required" | "challenge_required" | "browser_required" | "authenticating",
         ) => Some("native_authentication_required"),

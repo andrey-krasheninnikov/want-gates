@@ -253,11 +253,126 @@ fn invalid_profiles_and_unavailable_adapters_do_not_change_saved_state() {
     let refused = rpc(
         &service,
         serde_json::json!({"api_version":1,"command":"connection.import",
-        "group_id":group,"name":"Native","protocol":"wireguard","profile":"secret-value"}),
+        "group_id":group,"name":"Native","protocol":"netbird","profile":"secret-value"}),
     );
     assert!(refused["error"].as_str().unwrap().contains("unavailable"));
     assert_eq!(ok(&service, &["connection", "list"]), serde_json::json!([]));
     assert!(!service.state.join("secrets").exists());
+}
+
+#[test]
+fn wireguard_import_update_and_restart_keep_profile_secrets_private() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut service = Service::start();
+    let group = ok(
+        &service,
+        &["group", "create", "--name", "WireGuard company"],
+    );
+    let group = group["id"].as_str().unwrap();
+    let private = STANDARD.encode([17; 32]);
+    let shared = STANDARD.encode([42; 32]);
+    let public = STANDARD.encode([69; 32]);
+    let profile = format!(
+        "[Interface]\nAddress = 10.250.0.2/24, fd42:250::2/64\nPrivateKey = {private}\nDNS = 10.250.0.53\n\n[Peer]\nPublicKey = {public}\nPresharedKey = {shared}\nEndpoint = vpn.example.test:51820\nAllowedIPs = 0.0.0.0/0, ::/0\n"
+    );
+    let file = service.directory.path().join("office.conf");
+    std::fs::write(&file, &profile).unwrap();
+    let connection = ok(
+        &service,
+        &[
+            "connection",
+            "import",
+            "--group",
+            group,
+            "--name",
+            "Office",
+            "--protocol",
+            "wireguard",
+            "--file",
+            file.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(connection["validation"], "structural");
+    assert_eq!(connection["authentication"], "not_attempted");
+    let id = connection["id"].as_str().unwrap();
+    let updated = rpc(
+        &service,
+        serde_json::json!({
+            "api_version": 1, "command": "connection.update", "id": id,
+            "expected_revision": connection["revision"],
+            "profile": profile.replace("vpn.example.test", "[fd42:251::1]")
+        }),
+    );
+    assert_ne!(updated["data"]["revision"], connection["revision"]);
+    assert_eq!(updated["data"]["protocol"], "wireguard");
+
+    let config = std::fs::read_to_string(service.state.join("config.json")).unwrap();
+    let secrets = service.state.join("secrets");
+    let mut files = std::fs::read_dir(&secrets).unwrap();
+    let saved = files.next().unwrap().unwrap().path();
+    assert!(files.next().is_none());
+    assert_eq!(
+        secrets.metadata().unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        saved.metadata().unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let saved = std::fs::read_to_string(saved).unwrap();
+    for secret in [&private, &shared] {
+        assert!(saved.contains(secret));
+        assert!(!config.contains(secret));
+        assert!(!connection.to_string().contains(secret));
+        assert!(!updated.to_string().contains(secret));
+    }
+
+    for (bad, reason) in [
+        (
+            profile.replace("[Peer]", "PostUp = secret-command\n[Peer]"),
+            "unsupported WireGuard profile field",
+        ),
+        (
+            profile.replace(&private, "secret-key"),
+            "invalid WireGuard key",
+        ),
+        (
+            format!("{profile}\n[Peer]\n"),
+            "duplicate WireGuard section",
+        ),
+        (
+            profile.replace("DNS = 10.250.0.53", "DNS = 10.250.0.53, 10.250.0.54"),
+            "one numeric WireGuard DNS",
+        ),
+    ] {
+        let response = rpc(
+            &service,
+            serde_json::json!({
+                "api_version": 1, "command": "connection.import", "group_id": group,
+                "name": "Invalid", "protocol": "wireguard", "profile": bad
+            }),
+        );
+        assert!(
+            response["error"].as_str().unwrap().contains(reason),
+            "{response}"
+        );
+        assert!(!response.to_string().contains("secret-"));
+        assert!(!response.to_string().contains(&private));
+        assert!(!response.to_string().contains(&shared));
+    }
+    assert_eq!(
+        std::fs::read_to_string(service.state.join("config.json")).unwrap(),
+        config
+    );
+    assert!(service.stop().success());
+    service.start_again();
+    let shown = ok(&service, &["connection", "show", id]);
+    assert_eq!(shown["revision"], updated["data"]["revision"]);
+    assert_eq!(shown["protocol"], "wireguard");
+    assert!(!shown.to_string().contains(&private));
+    assert!(!shown.to_string().contains(&shared));
 }
 
 #[test]
