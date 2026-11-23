@@ -1,5 +1,7 @@
 #[path = "forti_runtime.rs"]
 mod forti;
+#[path = "wireguard_runtime.rs"]
+mod wireguard;
 use crate::native::{Observation, Prepared};
 use crate::openvpn_auth::{Authentication, Credentials};
 use crate::store::{private_read, private_write, random_id};
@@ -92,7 +94,12 @@ impl Record {
                 "retained native state is inconsistent; retain resources for inspection",
             ));
         }
-        profile(&self.profile)?;
+        if self.profile["protocol"] == "wireguard" {
+            let profile = crate::wireguard::decoded_profile(&self.profile)?;
+            wireguard::validate_endpoints(self, &profile)?;
+        } else {
+            profile(&self.profile)?;
+        }
         Ok(())
     }
 }
@@ -712,6 +719,7 @@ impl Runtime {
                 }
                 Ok(("openfortivpn", version.trim().into()))
             }
+            "wireguard" => Ok(("wireguard", wireguard::version()?)),
             _ => Err(invalid("unsupported native preflight protocol")),
         }
     }
@@ -719,7 +727,6 @@ impl Runtime {
         if !valid_id(id) || !valid_generation(generation) {
             return Err(invalid("invalid native connection or generation identity"));
         }
-        let profile = profile(value)?;
         let digest = crate::routing::digest(value)?;
         if let Some(instance) = self.instances.get(generation) {
             if instance.record.prepared.id != id
@@ -735,7 +742,13 @@ impl Runtime {
             .as_str()
             .ok_or_else(|| invalid("native protocol required"))?;
         self.preflight(&[protocol.to_owned()])?;
-        let endpoints = if protocol == "forti" {
+        let wg = (protocol == "wireguard")
+            .then(|| crate::wireguard::decoded_profile(value))
+            .transpose()?;
+        let endpoints = if let Some(profile) = &wg {
+            vec![wireguard::resolve(profile)?]
+        } else if protocol == "forti" {
+            let profile = profile(value)?;
             let host = crate::forti::option(&profile, "host").unwrap();
             let port = crate::forti::option(&profile, "port").unwrap_or("443");
             endpoints(
@@ -751,7 +764,7 @@ impl Runtime {
                 true,
             )?
         } else {
-            endpoints(&profile, false)?
+            endpoints(&profile(value)?, false)?
         };
         if endpoints.iter().any(|e| e.address.is_ipv6())
             && fs::read_to_string("/proc/sys/net/ipv6/conf/all/forwarding")?.trim() != "1"
@@ -815,6 +828,9 @@ impl Runtime {
             firewall_digest: None,
             paused: false,
         };
+        if let Some(profile) = &wg {
+            wireguard::validate_endpoints(&record, profile)?;
+        }
         if self.record_path(generation).exists()
             || Path::new("/run/netns").join(&record.namespace).exists()
         {
@@ -1030,6 +1046,10 @@ impl Runtime {
                 "nodad",
             ],
         )?;
+        if record.profile["protocol"] == "wireguard" {
+            wireguard::transport_route(record)?;
+            return self.firewall(record);
+        }
         let mut routed = std::collections::BTreeSet::new();
         for endpoint in &record.endpoints {
             if !routed.insert(endpoint.address) {
@@ -1070,6 +1090,12 @@ impl Runtime {
         let mut forward = String::new();
         let mut output = String::new();
         let mut nat = String::new();
+        let wg = r.profile["protocol"] == "wireguard";
+        let transport_identity = if wg {
+            format!("meta mark {}", wireguard::MARK)
+        } else {
+            "meta skuid 0".into()
+        };
         for e in &r.endpoints {
             let family = if e.address.is_ipv4() { "ip" } else { "ip6" };
             let source = if e.address.is_ipv4() {
@@ -1089,7 +1115,7 @@ impl Runtime {
                 e.port
             );
             output += &format!(
-                "oifname \"{}\" meta skuid 0 {family} daddr {} {} dport {} accept;",
+                "oifname \"{}\" {transport_identity} {family} daddr {} {} dport {} accept;",
                 r.peer, e.address, e.protocol, e.port
             );
             nat += &format!(
@@ -1115,10 +1141,26 @@ impl Runtime {
                 "native firewall readback differs from the prepared rules",
             ));
         }
+        let forward = if wg {
+            "chain forward { type filter hook forward priority 0; policy drop; };"
+        } else {
+            ""
+        };
+        let loopback = if wg { "" } else { "oifname lo accept;" };
+        let bridge_input = if wg {
+            format!("iifname \"{}\" ", r.peer)
+        } else {
+            String::new()
+        };
+        let tunnel_input = if wg {
+            "ct state established,related "
+        } else {
+            ""
+        };
         nft(
             Some(&r.namespace),
             &format!(
-                "table inet wgates {{ comment \"{}\"; chain input {{ type filter hook input priority 0; policy drop; iifname lo accept; iifname \"wgates-tun\" accept; ip saddr {} tcp dport {{22100,22101}} accept; ct state established,related accept; icmpv6 type {{nd-neighbor-solicit,nd-neighbor-advert}} accept; }}; chain output {{ type filter hook output priority 0; policy drop; oifname lo accept; oifname \"wgates-tun\" accept; {output} oifname \"{}\" ip daddr {} tcp sport {{22100,22101}} ct state established accept; icmpv6 type {{nd-neighbor-solicit,nd-neighbor-advert}} accept; }}; }}",
+                "table inet wgates {{ comment \"{}\"; {forward} chain input {{ type filter hook input priority 0; policy drop; iifname lo accept; iifname \"wgates-tun\" {tunnel_input}accept; {bridge_input}ip saddr {} tcp dport {{22100,22101}} accept; ct state established,related accept; icmpv6 type {{nd-neighbor-solicit,nd-neighbor-advert}} accept; }}; chain output {{ type filter hook output priority 0; policy drop; {loopback} oifname \"wgates-tun\" accept; {output} oifname \"{}\" ip daddr {} tcp sport {{22100,22101}} ct state established accept; icmpv6 type {{nd-neighbor-solicit,nd-neighbor-advert}} accept; }}; }}",
                 r.prepared.generation, r.host, r.peer, r.host
             ),
         )
@@ -1126,6 +1168,20 @@ impl Runtime {
     fn start(&self, record: Record, automatic_forti: bool) -> io::Result<Instance> {
         let dir = self.directory.join(&record.prepared.generation);
         secure_directory(&dir, 0o700, 0o077)?;
+        if record.profile["protocol"] == "wireguard" {
+            let mut instance =
+                Instance::new(record, Authentication::new(Credentials::default(), false)?);
+            if instance.record.paused {
+                instance.auth.state = "stopped".into();
+                instance.auth.reason = "operator_stopped".into();
+            } else {
+                instance.dns = wireguard::start(&instance.record)?;
+                self.proxy(&mut instance, false)?;
+                instance.auth.state = "configured".into();
+                instance.auth.reason = "wireguard_configured".into();
+            }
+            return Ok(instance);
+        }
         let auth_path = self.auth_path(&record);
         let (credentials, remembered) = match private_read(&auth_path, 32768) {
             Ok(bytes) => (
@@ -1282,6 +1338,12 @@ impl Runtime {
         if Self::forti_processes_remain(&instance.record)? {
             return Err(invalid("native Forti namespace still has active processes"));
         }
+        if instance.record.profile["protocol"] == "wireguard"
+            && let Err(error) = self.cleanup(&mut instance.record, false)
+        {
+            instance.auth.fail("native_cleanup_required");
+            return Err(error);
+        }
         instance.record.paused = false;
         self.save(&instance.record)?;
         if instance.record.namespace_identity.is_none()
@@ -1290,8 +1352,20 @@ impl Runtime {
             instance.auth.fail("native_cleanup_required");
             return Err(error);
         }
-        *instance = self.start(instance.record.clone(), automatic_forti)?;
-        Ok(())
+        match self.start(instance.record.clone(), automatic_forti) {
+            Ok(started) => {
+                *instance = started;
+                Ok(())
+            }
+            Err(error) => {
+                if instance.record.profile["protocol"] == "wireguard"
+                    && self.cleanup(&mut instance.record, false).is_err()
+                {
+                    instance.auth.fail("native_cleanup_required");
+                }
+                Err(error)
+            }
+        }
     }
     fn proxy(&self, instance: &mut Instance, gate: bool) -> io::Result<()> {
         if instance.proxy_gate == Some(gate)
@@ -1704,7 +1778,7 @@ impl Runtime {
                 }
             }
         }
-        if i.auth.state == "authenticated" {
+        if crate::native::probe_ready(&i.auth.state) {
             self.proxy(i, i.admitted_session.as_ref() == Some(&i.auth.session))?;
         } else if i.proxy.is_some() {
             stop(&mut i.proxy);
@@ -1743,7 +1817,7 @@ impl Runtime {
                 })
                 .transpose()?
                 .unwrap_or_default();
-            if protocols.len() > 2 {
+            if protocols.len() > 3 {
                 return Err(invalid("native preflight protocol limit exceeded"));
             }
             return self.preflight(&protocols);
@@ -1773,6 +1847,13 @@ impl Runtime {
             .instances
             .remove(generation)
             .ok_or_else(|| invalid("native generation is not prepared"))?;
+        if i.record.profile["protocol"] == "wireguard" && matches!(command, "login" | "forget-auth")
+        {
+            self.instances.insert(generation.into(), i);
+            return Err(invalid(
+                "WireGuard keys are managed through connection update and apply",
+            ));
+        }
         let result = (|| match command {
             "state" => {
                 Ok(json!({"prepared":i.record.prepared,"observation":Self::observation(&i)}))
@@ -1829,19 +1910,18 @@ impl Runtime {
                     .ok_or_else(|| invalid("native admission boolean required"))?;
                 if admitted
                     && (request["session"].as_str() != Some(&i.auth.session)
-                        || i.auth.state != "authenticated")
+                        || !crate::native::probe_ready(&i.auth.state))
                 {
                     return Err(invalid(
                         "native session changed; repeat resource verification",
                     ));
                 }
-                i.admitted_session = if admitted {
-                    Some(i.auth.session.clone())
-                } else {
-                    None
-                };
-                if i.auth.state == "authenticated" {
+                i.admitted_session = None;
+                if crate::native::probe_ready(&i.auth.state) {
                     self.proxy(&mut i, admitted)?;
+                }
+                if admitted {
+                    i.admitted_session = Some(i.auth.session.clone());
                 }
                 Ok(json!(Self::observation(&i)))
             }

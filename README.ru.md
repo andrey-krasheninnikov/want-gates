@@ -45,7 +45,8 @@ Bootstrap, пакет skill и UI панели остаются в планах.
 - Исходящий VLESS через Xray.
 - Изолированный OpenVPN с сертификатами, паролем и поддерживаемыми штатными MFA/SSO-сценариями.
 - Изолированный Forti через openfortivpn: пароль, сертификаты, OTP/push, cookie SSO и native SAML.
-- В планах: WireGuard и NetBird.
+- [WireGuard](docs/wireguard.md) через изолированный runtime Linux.
+- В планах: NetBird.
 - Импорт профилей и штатный вход, включая поддерживаемые MFA/SSO-сценарии.
 - TCP, HTTP и HTTPS healthcheck, переключение на резерв и стабильный возврат внутри группы.
 

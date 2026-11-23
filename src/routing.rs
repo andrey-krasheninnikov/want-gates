@@ -754,7 +754,14 @@ impl Service {
                 .ok_or_else(|| invalid("connection not found"))?;
             if !crate::native::is_native(&connection.protocol) {
                 return Err(invalid(
-                    "native authentication is available only for OpenVPN and Forti",
+                    "native session operations require OpenVPN, Forti or WireGuard",
+                ));
+            }
+            if connection.protocol == "wireguard"
+                && matches!(command, "connection.login" | "connection.forget-auth")
+            {
+                return Err(invalid(
+                    "WireGuard keys are managed through connection update and apply",
                 ));
             }
             if working.as_ref().is_none_or(|w| {
@@ -1298,7 +1305,7 @@ fn execute(
                             .is_some_and(|(old, current)| {
                                 old.session == current.session
                                     && old.dns == current.dns
-                                    && current.authentication == "authenticated"
+                                    && crate::native::probe_ready(&current.authentication)
                             }))
                     && let Some(old) = previous.health.get(&connection.id)
                 {
@@ -1964,7 +1971,7 @@ impl Service {
                                 });
                             if !observation.admitted
                                 || !current
-                                || observation.authentication != "authenticated"
+                                || !crate::native::probe_ready(&observation.authentication)
                             {
                                 object.insert("capabilities".into(), json!([]));
                                 object.insert("runtime".into(), json!("unavailable"));
@@ -2200,7 +2207,7 @@ fn health_cycle(
             .native_observations
             .get(id)
             .is_none_or(|old| old.session != state.session || old.dns != state.dns);
-        if (changed || state.authentication != "authenticated")
+        if (changed || !crate::native::probe_ready(&state.authentication))
             && let Some(connection) = working.config.connections.iter().find(|c| c.id == *id)
             && let Some(group) = working.config.groups.iter().find(|g| {
                 g.id == connection.group_id

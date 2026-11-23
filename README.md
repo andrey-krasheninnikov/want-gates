@@ -45,7 +45,8 @@ capabilities. Ambiguous rules of equal specificity are rejected.
 - Outgoing VLESS through Xray.
 - Isolated OpenVPN with certificate, password and supported native MFA/SSO authentication.
 - Isolated Forti through openfortivpn with password, certificates, OTP/push, cookie SSO and native SAML.
-- Planned: WireGuard and NetBird.
+- [WireGuard](docs/wireguard.md) through the Linux native runtime.
+- Planned: NetBird.
 - Profile import and native authentication, including supported MFA/SSO flows.
 - TCP, HTTP and HTTPS target checks, ordered failover, and stable failback within a group.
 
