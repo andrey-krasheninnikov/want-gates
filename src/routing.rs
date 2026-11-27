@@ -744,7 +744,8 @@ impl Service {
         let command = store::text(&request["command"])?;
         let fields: &[&str] = match command {
             "panel.configure" => &["settings"],
-            "panel.preflight" | "routing.preview" | "routing.status" => &[],
+            "panel.preflight" | "routing.preview" => &[],
+            "routing.status" => &["summary"],
             "routing.apply" | "routing.recover" => &["plan_id"],
             "routing.diagnose" => &["destination", "capability", "probe"],
             "routing.logs" => &["limit"],
@@ -806,6 +807,12 @@ impl Service {
             return self.diagnose(request, store.config(), stream);
         }
         if command == "routing.status" {
+            let busy = self.busy();
+            let summary = request.get("summary").map_or(Ok(false), |value| {
+                value
+                    .as_bool()
+                    .ok_or_else(|| invalid("summary must be a boolean"))
+            })?;
             let mut saved: Value = optional(&self.root.join("status.json"))?
                 .unwrap_or(json!({"state":"unapplied","running_revision":null}));
             if let Some(error) = saved.get_mut("runtime_verification_error")
@@ -825,24 +832,26 @@ impl Service {
                 }
             }
             let working: Option<Working> = optional(&self.root.join("working.json"))?;
-            let selected: BTreeMap<_, _> = working
-                .as_ref()
-                .map(|working| {
-                    let config = working.effective_config();
-                    config
-                        .groups
-                        .iter()
-                        .filter_map(|group| {
-                            let connection = crate::domain::connection(&config, group)?;
-                            crate::capability::ALL.iter()
-                        .any(|capability| allowed(&working.matrix, &group.id, capability))
-                        .then(|| (group.id.clone(), json!({
-                            "id":connection.id,"name":connection.name,"protocol":connection.protocol
-                        })))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            if summary {
+                let observed_digest = working.as_ref().and_then(|working| {
+                    let saved_digest = saved["saved_digest"].as_str()?;
+                    (!busy
+                        && saved["mismatch"] == false
+                        && saved["plan_id"] == working.plan_id
+                        && saved["running_revision"] == working.config.revision
+                        && digest(&working.snapshot).is_ok_and(|current| current == saved_digest))
+                    .then_some(saved_digest)
+                });
+                return Ok(Some(json!({"data":{
+                    "desired_revision":store.config().revision,"busy":busy,
+                    "recovery_required":!busy && optional::<Journal>(&self.root.join("journal.json"))?.as_ref().is_some_and(pending),
+                    "observed_digest":observed_digest,"health_error":working.as_ref().and_then(|w|w.health_error.as_deref()).map(diagnostics::health_problem),
+                    "last_observation":{
+                        "state":saved["state"],"running_revision":saved["running_revision"],
+                        "mismatch":saved["mismatch"],"observed_at":if !busy {saved["observed_at"].clone()}else{Value::Null}
+                    }
+                }})));
+            }
             let retired: Vec<_> = working
                 .as_ref()
                 .map(|w| {
@@ -853,7 +862,7 @@ impl Service {
                 })
                 .unwrap_or_default();
             return Ok(Some(
-                json!({"data":{"native_retained":retired,"desired_revision":store.config().revision,"selected_connections":selected,"busy":self.busy(),"recovery_required":optional::<Journal>(&self.root.join("journal.json"))?.as_ref().is_some_and(pending) && !self.busy(),"last_observation":saved,"health_schedule":self.health_due.iter().map(|(group,due)|json!({"group_id":group,"due_in_seconds":due.saturating_duration_since(std::time::Instant::now()).as_secs(),"overdue_seconds":std::time::Instant::now().saturating_duration_since(*due).as_secs()})).collect::<Vec<_>>(),"health":working.as_ref().map(Working::health_report),"connection_verifications":connection_reports(&self.root,store.config(), &self.native).unwrap_or_else(|_|json!({"state":"unknown","reason":"observation_state_unreadable"}))}}),
+                json!({"data":{"native_retained":retired,"desired_revision":store.config().revision,"busy":self.busy(),"recovery_required":optional::<Journal>(&self.root.join("journal.json"))?.as_ref().is_some_and(pending) && !self.busy(),"last_observation":saved,"health_schedule":self.health_due.iter().map(|(group,due)|json!({"group_id":group,"due_in_seconds":due.saturating_duration_since(std::time::Instant::now()).as_secs(),"overdue_seconds":std::time::Instant::now().saturating_duration_since(*due).as_secs()})).collect::<Vec<_>>(),"health":working.as_ref().map(Working::health_report),"connection_verifications":connection_reports(&self.root,store.config(), &self.native).unwrap_or_else(|_|json!({"state":"unknown","reason":"observation_state_unreadable"}))}}),
             ));
         }
         if self.busy() {
@@ -1936,6 +1945,39 @@ fn recover(
 }
 
 impl Service {
+    pub fn describe_group_observations(
+        &self,
+        response: &mut Value,
+        observed_digest: &Value,
+    ) -> io::Result<()> {
+        let expected = store::text(observed_digest)?;
+        let changed = || invalid("routing observation changed during listing; retry");
+        if self.busy() {
+            return Err(changed());
+        }
+        let working: Working = optional(&self.root.join("working.json"))?.ok_or_else(changed)?;
+        if digest(&working.snapshot)? != expected {
+            return Err(changed());
+        }
+        let config = working.effective_config();
+        for row in response["data"].as_array_mut().into_iter().flatten() {
+            let selected = config
+                .groups
+                .iter()
+                .find(|group| row["id"] == group.id)
+                .filter(|group| {
+                    crate::capability::ALL
+                        .iter()
+                        .any(|c| allowed(&working.matrix, &group.id, c))
+                })
+                .and_then(|group| crate::domain::connection(&config, group));
+            row["last_observed_selection"] = selected.map_or(Value::Null, |connection| {
+                json!({"id":connection.id,"name":connection.name,"protocol":connection.protocol})
+            });
+        }
+        Ok(())
+    }
+
     pub fn describe_connections(&self, response: &mut Value, config: &Config) {
         let inspected = (|| -> io::Result<(bool, Option<Working>)> {
             let pending = optional::<Journal>(&self.root.join("journal.json"))?

@@ -15,6 +15,9 @@ const group = object.extend({
   name: z.string(),
   primary: z.string().nullable(),
   fallbacks: names,
+  last_observed_selection: z
+    .object({ id: z.string(), name: z.string(), protocol: z.string() })
+    .nullable(),
 });
 
 const connection = object.extend({
@@ -35,14 +38,12 @@ const connection = object.extend({
   }),
 });
 
-const selected = z.object({ id: z.string(), name: z.string(), protocol: z.string() });
-
 const snapshot = z.object({
   routing: z.object({
     desired_revision: z.string(),
     busy: z.boolean(),
     recovery_required: z.boolean(),
-    selected_connections: z.record(z.string(), selected).nullable(),
+    health_error: z.string().nullable(),
     last_observation: z.object({
       state: z.string(),
       running_revision: z.string().nullable(),
@@ -66,7 +67,9 @@ export async function loadStatus({ signal }: { signal: AbortSignal }): Promise<W
     return parsed.data.obj;
   } catch (error) {
     if (error instanceof HttpError && error.status === 409) {
-      throw new Error('Configuration changed while loading. Refresh Want Gates status.');
+      throw new Error(
+        'Configuration or routing observation changed while loading. Refresh Want Gates status.',
+      );
     }
     if (error instanceof HttpError && error.status === 503) {
       throw new Error(

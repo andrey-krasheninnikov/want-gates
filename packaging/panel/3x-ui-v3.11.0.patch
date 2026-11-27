@@ -55,3 +55,55 @@
 +.want-gates-page.is-dark.is-ultra .ant-card.ant-card-hoverable:hover,
 @@ -86,0 +93 @@
 +.want-gates-page .ant-card .ant-card-actions,
+--- a/internal/web/translation/ar-EG.json
++++ b/internal/web/translation/ar-EG.json
+@@ -109,0 +110 @@
++    "wantGates": "Want Gates",
+--- a/internal/web/translation/es-ES.json
++++ b/internal/web/translation/es-ES.json
+@@ -109,0 +110 @@
++    "wantGates": "Want Gates",
+--- a/internal/web/translation/fa-IR.json
++++ b/internal/web/translation/fa-IR.json
+@@ -109,0 +110 @@
++    "wantGates": "Want Gates",
+--- a/internal/web/translation/id-ID.json
++++ b/internal/web/translation/id-ID.json
+@@ -109,0 +110 @@
++    "wantGates": "Want Gates",
+--- a/internal/web/translation/ja-JP.json
++++ b/internal/web/translation/ja-JP.json
+@@ -109,0 +110 @@
++    "wantGates": "Want Gates",
+--- a/internal/web/translation/pt-BR.json
++++ b/internal/web/translation/pt-BR.json
+@@ -109,0 +110 @@
++    "wantGates": "Want Gates",
+--- a/internal/web/translation/ru-RU.json
++++ b/internal/web/translation/ru-RU.json
+@@ -109,0 +110 @@
++    "wantGates": "Want Gates",
+--- a/internal/web/translation/sk-SK.json
++++ b/internal/web/translation/sk-SK.json
+@@ -109,0 +110 @@
++    "wantGates": "Want Gates",
+--- a/internal/web/translation/tr-TR.json
++++ b/internal/web/translation/tr-TR.json
+@@ -109,0 +110 @@
++    "wantGates": "Want Gates",
+--- a/internal/web/translation/uk-UA.json
++++ b/internal/web/translation/uk-UA.json
+@@ -109,0 +110 @@
++    "wantGates": "Want Gates",
+--- a/internal/web/translation/vi-VN.json
++++ b/internal/web/translation/vi-VN.json
+@@ -109,0 +110 @@
++    "wantGates": "Want Gates",
+--- a/internal/web/translation/zh-CN.json
++++ b/internal/web/translation/zh-CN.json
+@@ -109,0 +110 @@
++    "wantGates": "Want Gates",
+--- a/internal/web/translation/zh-TW.json
++++ b/internal/web/translation/zh-TW.json
+@@ -109,0 +110 @@
++    "wantGates": "Want Gates",

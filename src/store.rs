@@ -276,7 +276,7 @@ impl Store {
         let command = text(&request["command"])?;
         let fields: &[&str] = match command {
             "group.create" => &["name"],
-            "group.list" => &["offset", "list_revision"],
+            "group.list" => &["offset", "list_revision", "observed_digest"],
             "group.show" | "connection.show" => &["id"],
             "group.update" => &[
                 "id",

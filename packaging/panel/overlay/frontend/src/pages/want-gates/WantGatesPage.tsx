@@ -74,6 +74,14 @@ export function WantGatesStatus({ state }: { state: WantGatesSnapshot }) {
           <Alert type="error" title="Routing recovery required" showIcon />
         )}
         {routing.busy && <Alert type="info" title="Routing operation in progress" showIcon />}
+        {routing.health_error && (
+          <Alert
+            type="warning"
+            title="Health checks paused"
+            description={`Last observed routing may be stale. ${label(routing.health_error)}.`}
+            showIcon
+          />
+        )}
         {(desiredChanged || last.mismatch) && (
           <Alert type="warning" title="Desired and observed routing differ" showIcon />
         )}
@@ -102,7 +110,7 @@ export function WantGatesStatus({ state }: { state: WantGatesSnapshot }) {
               {
                 title: 'Last observed selection',
                 render: (_, row) => {
-                  const selected = routing.selected_connections?.[row.id];
+                  const selected = row.last_observed_selection;
                   return selected ? `${selected.name} (${selected.protocol})` : 'Unavailable';
                 },
               },

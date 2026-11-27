@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 022
 
 fail() { printf '%s\n' "$*" >&2; exit 1; }
 

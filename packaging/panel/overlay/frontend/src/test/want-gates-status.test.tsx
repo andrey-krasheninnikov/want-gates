@@ -10,7 +10,7 @@ function emptyStatus(): WantGatesSnapshot {
       desired_revision: '3',
       busy: false,
       recovery_required: false,
-      selected_connections: null,
+      health_error: null,
       last_observation: {
         state: 'unapplied',
         running_revision: null,
@@ -36,7 +36,14 @@ describe('Want Gates status', () => {
 
   it('labels an observed selection, capability checks, and a pending change with text', () => {
     const state = emptyStatus();
-    state.groups.push({ id: 'g1', revision: '2', name: 'Company', primary: 'c3', fallbacks: [] });
+    state.groups.push({
+      id: 'g1',
+      revision: '2',
+      name: 'Company',
+      primary: 'c3',
+      fallbacks: [],
+      last_observed_selection: { id: 'c2', name: 'Previous VPN', protocol: 'vless' },
+    });
     state.connections.push({
       id: 'c3',
       revision: '3',
@@ -56,14 +63,13 @@ describe('Want Gates status', () => {
         observed_at: null,
       },
     });
-    state.routing.selected_connections = {
-      g1: { id: 'c2', name: 'Previous VPN', protocol: 'vless' },
-    };
     state.routing.last_observation.running_revision = '2';
     state.routing.last_observation.state = 'applied';
+    state.routing.health_error = 'panel_drift';
     render(<WantGatesStatus state={state} />);
     expect(screen.getByText('Desired and observed routing differ')).toBeTruthy();
     expect(screen.getByText('Previous VPN (vless)')).toBeTruthy();
+    expect(screen.getByText('Health checks paused')).toBeTruthy();
     expect(screen.getByText(/Authentication · credentials required/)).toBeTruthy();
     expect(screen.getByText(/TCP IPV4 · verified/)).toBeTruthy();
   });

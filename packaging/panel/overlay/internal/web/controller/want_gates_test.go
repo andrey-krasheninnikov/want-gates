@@ -24,7 +24,7 @@ func TestWantGatesSnapshotKeepsRevisionAndOmitsPrivateFields(t *testing.T) {
 		offset  uint64
 		body    string
 	}{
-		{"routing.status", 0, `{"data":{"desired_revision":18446744073709551614,"last_observation":{"state":"unapplied","unreviewed":"synthetic-profile-secret"}}}`},
+		{"routing.status", 0, `{"data":{"desired_revision":18446744073709551614,"observed_digest":"observed-fixture","health_error":"panel_drift","last_observation":{"state":"unapplied","unreviewed":"synthetic-profile-secret"}}}`},
 		{"group.list", 0, `{"data":[{"id":"g1","revision":1,"name":"Company"}],"list_revision":18446744073709551614,"next_offset":1}`},
 		{"group.list", 1, `{"data":[{"id":"g2","revision":2,"name":"Reserve"}],"list_revision":18446744073709551614}`},
 		{"connection.list", 0, `{"data":[{"id":"c3","revision":18446744073709551614,"group_id":"g1","name":"VLESS path","profile":"synthetic-profile-secret","verification":{"capabilities":{"tcp_ipv4":{"state":"verified","reason":"verified","detail":"synthetic-profile-secret"}}}}],"list_revision":18446744073709551614}`},
@@ -39,14 +39,18 @@ func TestWantGatesSnapshotKeepsRevisionAndOmitsPrivateFields(t *testing.T) {
 				return
 			}
 			var request struct {
-				Version      int     `json:"api_version"`
-				Command      string  `json:"command"`
-				ListRevision *uint64 `json:"list_revision"`
-				Offset       uint64  `json:"offset"`
+				Version        int     `json:"api_version"`
+				Command        string  `json:"command"`
+				ListRevision   *uint64 `json:"list_revision"`
+				Offset         uint64  `json:"offset"`
+				Summary        bool    `json:"summary"`
+				ObservedDigest string  `json:"observed_digest"`
 			}
 			err = json.NewDecoder(conn).Decode(&request)
 			if err == nil && (request.Version != 1 || request.Command != page.command || request.Offset != page.offset ||
-				page.command != "routing.status" && (request.ListRevision == nil || *request.ListRevision != revision)) {
+				page.command != "routing.status" && (request.ListRevision == nil || *request.ListRevision != revision) ||
+				page.command == "routing.status" && !request.Summary ||
+				page.command == "group.list" && request.ObservedDigest != "observed-fixture") {
 				err = errWantGatesReply
 			}
 			if err == nil {
@@ -76,7 +80,7 @@ func TestWantGatesSnapshotKeepsRevisionAndOmitsPrivateFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(body), secret) || !strings.Contains(string(body), `"revision":"18446744073709551614"`) {
+	if strings.Contains(string(body), secret) || strings.Contains(string(body), "observed-fixture") || !strings.Contains(string(body), `"revision":"18446744073709551614"`) {
 		t.Fatal("private status or inaccurate revision in response")
 	}
 }

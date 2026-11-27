@@ -44,9 +44,10 @@ type wantGatesObject struct {
 
 type wantGatesGroup struct {
 	wantGatesObject
-	Name      string   `json:"name"`
-	Primary   *string  `json:"primary"`
-	Fallbacks []string `json:"fallbacks"`
+	Name      string             `json:"name"`
+	Primary   *string            `json:"primary"`
+	Fallbacks []string           `json:"fallbacks"`
+	Selected  *wantGatesSelected `json:"last_observed_selection"`
 }
 
 type wantGatesCheck struct {
@@ -94,10 +95,10 @@ type wantGatesSelected struct {
 }
 
 type wantGatesRouting struct {
-	DesiredRevision wantGatesRevision            `json:"desired_revision"`
-	Busy            bool                         `json:"busy"`
-	Recovery        bool                         `json:"recovery_required"`
-	Selected        map[string]wantGatesSelected `json:"selected_connections"`
+	DesiredRevision wantGatesRevision `json:"desired_revision"`
+	Busy            bool              `json:"busy"`
+	Recovery        bool              `json:"recovery_required"`
+	HealthError     *string           `json:"health_error"`
 	Last            struct {
 		State           string             `json:"state"`
 		RunningRevision *wantGatesRevision `json:"running_revision"`
@@ -145,17 +146,19 @@ func wantGatesExchange(ctx context.Context, socket string, request map[string]an
 	return reply, nil
 }
 
-func wantGatesList[T any](ctx context.Context, socket, command string, revision uint64) ([]T, error) {
+func wantGatesList[T any](ctx context.Context, socket, command string, revision uint64, observedDigest *string) ([]T, error) {
 	items := make([]T, 0)
 	var offset uint64
 	for {
-		reply, err := wantGatesExchange(ctx, socket, map[string]any{
-			"command": command, "list_revision": revision, "offset": offset,
-		})
+		request := map[string]any{"command": command, "list_revision": revision, "offset": offset}
+		if observedDigest != nil {
+			request["observed_digest"] = *observedDigest
+		}
+		reply, err := wantGatesExchange(ctx, socket, request)
 		if err != nil {
 			return nil, err
 		}
-		if reply.Error == "configuration changed during listing; retry" {
+		if reply.Error == "configuration changed during listing; retry" || reply.Error == "routing observation changed during listing; retry" {
 			return nil, errWantGatesChanged
 		}
 		var page []T
@@ -176,23 +179,28 @@ func wantGatesList[T any](ctx context.Context, socket, command string, revision 
 
 func loadWantGatesSnapshot(ctx context.Context, socket string) (wantGatesSnapshot, error) {
 	var result wantGatesSnapshot
-	reply, err := wantGatesExchange(ctx, socket, map[string]any{"command": "routing.status"})
+	reply, err := wantGatesExchange(ctx, socket, map[string]any{"command": "routing.status", "summary": true})
 	if err != nil {
 		return result, err
 	}
-	if reply.Error != "" || json.Unmarshal(reply.Data, &result.Routing) != nil || result.Routing.Last.State == "" {
+	var routing struct {
+		wantGatesRouting
+		ObservedDigest *string `json:"observed_digest"`
+	}
+	if reply.Error != "" || json.Unmarshal(reply.Data, &routing) != nil || routing.Last.State == "" {
 		return result, errWantGatesReply
 	}
-	revision := uint64(result.Routing.DesiredRevision)
-	result.Groups, err = wantGatesList[wantGatesGroup](ctx, socket, "group.list", revision)
+	result.Routing = routing.wantGatesRouting
+	revision := uint64(routing.DesiredRevision)
+	result.Groups, err = wantGatesList[wantGatesGroup](ctx, socket, "group.list", revision, routing.ObservedDigest)
 	if err != nil {
 		return result, err
 	}
-	result.Connections, err = wantGatesList[wantGatesConnection](ctx, socket, "connection.list", revision)
+	result.Connections, err = wantGatesList[wantGatesConnection](ctx, socket, "connection.list", revision, nil)
 	if err != nil {
 		return result, err
 	}
-	result.Rules, err = wantGatesList[wantGatesRule](ctx, socket, "rule.list", revision)
+	result.Rules, err = wantGatesList[wantGatesRule](ctx, socket, "rule.list", revision, nil)
 	return result, err
 }
 
@@ -214,7 +222,7 @@ func wantGatesStatus(c *gin.Context) {
 	}
 	state, err := loadWantGatesSnapshot(ctx, socket)
 	if errors.Is(err, errWantGatesChanged) {
-		c.JSON(http.StatusConflict, gin.H{"success": false, "msg": "Configuration changed while loading. Refresh Want Gates status."})
+		c.JSON(http.StatusConflict, gin.H{"success": false, "msg": "Configuration or routing observation changed while loading. Refresh Want Gates status."})
 		return
 	}
 	if err != nil {

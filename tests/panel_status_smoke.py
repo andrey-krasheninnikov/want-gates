@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -91,6 +92,10 @@ def acceptance(stand):
         payload={"tcp_ipv4": {"url": "http://10.220.0.10:18080/panel-status"}},
     )
     control("rule", "create", "--group", group["id"], "--destination", "10.220.0.0/24")
+    control("group", "update", group["id"], "--healthcheck-file", "-", payload={
+        "target": "http://10.220.0.10:18080/panel-health",
+        "required_capabilities": ["tcp_ipv4"], "interval_seconds": 3, "timeout_seconds": 2,
+    })
     plan = control("routing", "preview")["data"]["plan_id"]
     control("routing", "apply", plan)
     applied = status(stand, auth)
@@ -98,10 +103,27 @@ def acceptance(stand):
     assert applied["connections"][0]["name"] == "Status VLESS"
     assert applied["connections"][0]["verification"]["capabilities"]["tcp_ipv4"]["state"] == "verified"
     assert applied["rules"][0]["destination"] == "10.220.0.0/24"
-    assert applied["routing"]["selected_connections"][group["id"]]["id"] == connection["id"]
+    assert applied["groups"][0]["last_observed_selection"]["id"] == connection["id"]
     assert applied["routing"]["desired_revision"] == applied["routing"]["last_observation"]["running_revision"]
     assert stand["ids"]["a"] not in json.dumps(applied)
     assert stand["panel_token"] not in json.dumps(applied)
+
+    settings = stand["api"]("xray/", {})
+    if isinstance(settings, str):
+        settings = json.loads(settings)
+    settings["xraySetting"]["log"]["loglevel"] = "error"
+    stand["api"]("xray/update", {
+        "xraySetting": json.dumps(settings["xraySetting"]),
+        "outboundTestUrl": settings["outboundTestUrl"],
+    })
+    deadline = time.monotonic() + 12
+    while True:
+        observed = request(stand, route, headers=auth)
+        if observed["status"] == 200 and observed["data"]["obj"]["routing"]["health_error"] == "panel_drift":
+            applied = observed["data"]["obj"]
+            break
+        assert time.monotonic() < deadline, "panel did not expose paused health checks"
+        time.sleep(0.15)
 
     control("group", "update", group["id"], "--name", "Saved only")
     saved = status(stand, auth)
