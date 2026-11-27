@@ -711,23 +711,28 @@ impl Runtime {
             let (name, version) = self.client_version(protocol)?;
             versions.insert(name.into(), json!(version));
         }
-        if !command(
+        let version_output = command(
             self.xray
                 .to_str()
                 .ok_or_else(|| invalid("invalid Xray executable path"))?,
             &["version"],
-        )?
-        .contains("26.9.9")
-        {
-            return Err(invalid("native runtime requires Xray 26.9.9"));
-        }
+        )?;
+        let xray = version_output
+            .split_whitespace()
+            .nth(1)
+            .filter(|version| {
+                crate::panel::SUPPORTED_STACKS
+                    .iter()
+                    .any(|(_, xray)| xray == version)
+            })
+            .ok_or_else(|| invalid("native runtime requires Xray 26.10.21 or 26.9.9"))?;
         if fs::read_to_string("/proc/sys/net/ipv4/ip_forward")?.trim() != "1" {
             return Err(invalid(
                 "IPv4 forwarding disabled; enable net.ipv4.ip_forward manually after checking host routing",
             ));
         }
         Ok(
-            json!({"clients":versions,"xray":"26.9.9","ipv4_forwarding":true,"ipv6_forwarding":fs::read_to_string("/proc/sys/net/ipv6/conf/all/forwarding").ok().is_some_and(|s|s.trim()=="1")}),
+            json!({"clients":versions,"xray":xray,"ipv4_forwarding":true,"ipv6_forwarding":fs::read_to_string("/proc/sys/net/ipv6/conf/all/forwarding").ok().is_some_and(|s|s.trim()=="1")}),
         )
     }
     fn client_version(&self, protocol: &str) -> io::Result<(&'static str, String)> {

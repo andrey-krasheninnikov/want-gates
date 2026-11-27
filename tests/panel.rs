@@ -22,6 +22,10 @@ struct Panel {
 }
 impl Panel {
     fn start() -> Self {
+        Self::with_versions("3.8.5", "26.9.9")
+    }
+
+    fn with_versions(panel_version: &'static str, xray_version: &'static str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}/", listener.local_addr().unwrap());
@@ -92,7 +96,7 @@ impl Panel {
                         } else {
                             "running"
                         };
-                        json!({"panelVersion":"3.8.5","xray":{"state":state,"version":"26.9.9","errorMsg":""}})
+                        json!({"panelVersion":panel_version,"xray":{"state":state,"version":xray_version,"errorMsg":""}})
                     }
                     "/panel/api/xray/" => {
                         json!({"xraySetting":saved.lock().unwrap().clone(),"outboundTestUrl":"https://example.org/check"})
@@ -191,6 +195,31 @@ fn ok(s: &Service, args: &[&str], input: Option<&str>) -> Value {
     assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
     serde_json::from_slice(&r.stdout).unwrap()
 }
+#[test]
+fn panel_preflight_accepts_the_latest_pair_and_rejects_mixed_versions() {
+    let service = Service::start();
+    let panel = Panel::with_versions("v3.11.0", "v26.10.21");
+    ok(
+        &service,
+        &["panel", "configure", "--file", "-"],
+        Some(&json!({"url":panel.url,"token":"private-panel-token"}).to_string()),
+    );
+    let ready = ok(&service, &["panel", "preflight"], None);
+    assert_eq!(ready["data"]["panel_version"], "3.11.0");
+    assert_eq!(ready["data"]["xray_version"], "26.10.21");
+
+    let mixed = Panel::with_versions("3.11.0", "26.9.9");
+    ok(
+        &service,
+        &["panel", "configure", "--file", "-"],
+        Some(&json!({"url":mixed.url,"token":"private-panel-token"}).to_string()),
+    );
+    let result = command(&service, &["panel", "preflight"], None);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("incompatible deployment"));
+    assert_eq!(*mixed.writes.lock().unwrap(), 0);
+}
+
 #[test]
 fn preview_is_private_and_apply_rejects_panel_drift() {
     let s = Service::start();

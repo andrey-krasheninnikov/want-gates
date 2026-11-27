@@ -39,6 +39,8 @@ socket. The packaged systemd service manages its runtime directory.
 
 ## Manual systemd installation
 
+Use [bootstrap](bootstrap.md) for packaged installation on a compatible gateway.
+
 These commands describe a new installation on a Linux host with systemd.
 Inspect existing binary, account, and unit names before installing; do not
 overwrite another deployment.

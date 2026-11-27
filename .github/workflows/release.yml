@@ -1,0 +1,131 @@
+name: Linux release artifacts
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'packaging/**'
+      - 'tests/bootstrap_smoke.sh'
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+            panel_arch: amd64
+            panel_sha: 0ddfa4702f595442e2962acd81addc768fdacaa4ff2672c971a0463dae744916
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+            panel_arch: arm64
+            panel_sha: f50b4c30fd919d018f2f4c3d8db53a4ca027503d581328727770afb116a79d90
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build and package
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          target="$ARCH-unknown-linux-musl"
+          sudo apt-get update -qq
+          sudo apt-get install -qy --no-install-recommends musl-tools
+          rustup target add "$target"
+          CC=musl-gcc RUSTFLAGS='-C linker=musl-gcc' cargo build --release --locked --target "$target"
+          archive=$(packaging/package.sh "target/$target/release/wgates" dist)
+          if [[ $GITHUB_REF_TYPE == tag && $GITHUB_REF_NAME != "$(basename "$archive" "-linux-$ARCH.tar.gz" | cut -c8-)" ]]; then
+            echo 'The release tag must match the package version.' >&2
+            exit 1
+          fi
+      - name: Verify bootstrap on Ubuntu
+        env:
+          PANEL_ARCH: ${{ matrix.panel_arch }}
+          PANEL_SHA: ${{ matrix.panel_sha }}
+        run: |
+          fixture=$(mktemp -d "$RUNNER_TEMP/wgates-panel.XXXXXXXX")
+          trap 'rm -rf -- "$fixture"' EXIT
+          curl --fail --silent --show-error --location --retry 3 \
+            --output "$fixture/panel.tar.gz" \
+            "https://github.com/MHSanaei/3x-ui/releases/download/v3.11.0/x-ui-linux-$PANEL_ARCH.tar.gz"
+          printf '%s  %s\n' "$PANEL_SHA" "$fixture/panel.tar.gz" | sha256sum --check --strict
+          tar -xzf "$fixture/panel.tar.gz" -C "$fixture"
+          sudo bash tests/bootstrap_smoke.sh "$fixture/x-ui" dist/wgates-*.tar.gz
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: wgates-linux-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+
+  distributions:
+    name: Bootstrap on ${{ matrix.distribution }}
+    needs: linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distribution: Fedora 44
+            image: registry.fedoraproject.org/fedora@sha256:d5c6ac6d50556aa47f5b39f08964cdf1a57d182e1d21c172368ba9aed188b0e7
+            setup: dnf -y install systemd dbus-broker tar gzip util-linux shadow-utils gawk
+          - distribution: Arch Linux
+            image: docker.io/library/archlinux@sha256:375a401bb3c6376b37f40b6dfa25067db37ec78d0b7af67ae6315f43a0184a9d
+            setup: pacman -Syu --noconfirm --needed systemd dbus tar gzip
+          - distribution: openSUSE Leap 16.0
+            image: registry.opensuse.org/opensuse/leap@sha256:9c88da273b41600dfd12790849dfb198ddefed3a109eaf42ada944afb4282a9d
+            setup: zypper --non-interactive refresh && zypper --non-interactive install --no-recommends systemd dbus-1 tar gzip util-linux shadow gawk
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: wgates-linux-x86_64
+          path: dist/
+      - name: Install and verify with the distribution package manager
+        env:
+          IMAGE: ${{ matrix.image }}
+          SETUP: ${{ matrix.setup }}
+        run: |
+          fixture=$(mktemp -d "$RUNNER_TEMP/wgates-distribution.XXXXXXXX")
+          container=
+          cleanup() {
+            if [[ -n $container ]]; then docker rm -f -v "$container"; fi
+            rm -rf -- "$fixture"
+          }
+          trap cleanup EXIT
+          curl --fail --silent --show-error --location --retry 3 \
+            --output "$fixture/panel.tar.gz" \
+            https://github.com/MHSanaei/3x-ui/releases/download/v3.11.0/x-ui-linux-amd64.tar.gz
+          printf '0ddfa4702f595442e2962acd81addc768fdacaa4ff2672c971a0463dae744916  %s\n' \
+            "$fixture/panel.tar.gz" | sha256sum --check --strict
+          tar -xzf "$fixture/panel.tar.gz" -C "$fixture"
+          container=$(docker run --detach --privileged --cgroupns=private --tmpfs /run --tmpfs /run/lock \
+            --sysctl net.ipv4.ip_forward=1 \
+            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/src,readonly" \
+            --mount "type=bind,source=$fixture,target=/fixture,readonly" \
+            "$IMAGE" /bin/bash -ec "$SETUP; exec /sbin/init")
+          for _ in {1..120}; do
+            if docker exec "$container" test -d /run/systemd/system 2>/dev/null; then break; fi
+            sleep 1
+          done
+          if ! docker exec "$container" test -d /run/systemd/system; then
+            docker logs "$container"
+            exit 1
+          fi
+          docker exec "$container" bash -ec '
+            ! command -v wg
+            cd /src
+            (cd dist && sha256sum --check --strict wgates-*.sha256)
+            bash tests/bootstrap_smoke.sh /fixture/x-ui dist/wgates-*.tar.gz wireguard
+          '

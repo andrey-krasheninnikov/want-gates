@@ -857,6 +857,20 @@ impl Service {
         }
     }
 }
+fn check_native_xray(
+    native: &crate::native::Client,
+    panel_status: &Value,
+    protocols: Value,
+) -> io::Result<()> {
+    let status = native.call(json!({"command":"preflight","protocols":protocols}))?;
+    if status["xray"] != panel_status["xray_version"] {
+        return Err(invalid(
+            "native runtime and the panel must use the same supported Xray version",
+        ));
+    }
+    Ok(())
+}
+
 fn execute(
     root: &Path,
     command: &str,
@@ -965,7 +979,7 @@ fn execute(
                 "unfinished apply requires routing recover before another preview",
             ));
         }
-        client.running()?;
+        let panel_status = client.running()?;
         let base = client.read()?;
         let working: Option<Working> = optional(&root.join("working.json"))?;
         let ingress = validate(&input, &base, working.as_ref())?;
@@ -1040,7 +1054,7 @@ fn execute(
             native_intents.insert(connection.id.clone(), generation);
         }
         if !native_intents.is_empty() {
-            native.call(json!({"command":"preflight","protocols":protocols}))?;
+            check_native_xray(native, &panel_status, json!(protocols))?;
         }
         let plan = Plan {
             id: random_id()?,
@@ -1116,7 +1130,10 @@ fn execute(
         )?;
         return Ok(observation(&plan.id, &w.config, &w.snapshot, &w.matrix));
     }
-    client.running()?;
+    let panel_status = client.running()?;
+    if !plan.native_intents.is_empty() {
+        check_native_xray(native, &panel_status, json!([]))?;
+    }
     if client.read()? != plan.base {
         return Err(invalid(
             "observed panel drift; preview again; no changes applied",
