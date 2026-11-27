@@ -751,6 +751,8 @@ impl Service {
             "routing.logs" => &["limit"],
             "connection.verify" => &["id"],
             "connection.login" => &["id", "credentials", "remember"],
+            "connection.auth-status" => &["id"],
+            "connection.adapter" => &["protocol"],
             "connection.logout" | "connection.restart" | "connection.forget-auth" => &["id"],
             _ => return Err(invalid("unsupported routing command")),
         };
@@ -763,6 +765,7 @@ impl Service {
         if matches!(
             command,
             "connection.login"
+                | "connection.auth-status"
                 | "connection.logout"
                 | "connection.restart"
                 | "connection.forget-auth"
@@ -966,9 +969,35 @@ fn execute(
     native: &crate::native::Client,
     xray: &Path,
 ) -> io::Result<Value> {
+    if command == "connection.adapter" {
+        let protocol = store::text(&request["protocol"])?;
+        if protocol == "vless" {
+            return Ok(json!({"available":true,"reason":"VLESS is available"}));
+        }
+        if !crate::native::is_native(protocol) {
+            return Ok(
+                json!({"available":false,"reason":"This protocol has no Want Gates adapter"}),
+            );
+        }
+        return Ok(
+            match native.call(json!({"command":"preflight","protocols":[protocol]})) {
+                Ok(_) => json!({"available":true,"reason":"Native prerequisites are available"}),
+                Err(err) if crate::native::unavailable(&err) => {
+                    json!({"available":false,"reason":"The native service is unavailable"})
+                }
+                Err(_) => {
+                    json!({"available":false,"reason":"Native prerequisites are unavailable. Check the adapter and Xray installation"})
+                }
+            },
+        );
+    }
     if matches!(
         command,
-        "connection.login" | "connection.logout" | "connection.restart" | "connection.forget-auth"
+        "connection.login"
+            | "connection.auth-status"
+            | "connection.logout"
+            | "connection.restart"
+            | "connection.forget-auth"
     ) {
         let working: Working = read(&root.join("working.json"))?;
         let prepared = working

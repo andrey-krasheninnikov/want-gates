@@ -10,6 +10,7 @@ function emptyStatus(): WantGatesSnapshot {
       desired_revision: '3',
       busy: false,
       recovery_required: false,
+      recovery_plan_id: null,
       health_error: null,
       last_observation: {
         state: 'unapplied',
@@ -42,6 +43,8 @@ describe('Want Gates status', () => {
       name: 'Company',
       primary: 'c3',
       fallbacks: [],
+      probes: null,
+      healthcheck: null,
       last_observed_selection: { id: 'c2', name: 'Previous VPN', protocol: 'vless' },
     });
     state.connections.push({

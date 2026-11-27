@@ -1961,7 +1961,9 @@ impl Runtime {
             "preflight" => &["protocols"],
             "list" => &[],
             "prepare" => &["id", "generation", "profile"],
-            "state" | "logout" | "restart" | "forget-auth" | "release" => &["generation"],
+            "state" | "auth-status" | "logout" | "restart" | "forget-auth" | "release" => {
+                &["generation"]
+            }
             "login" => &["generation", "credentials", "remember"],
             "admit" => &["generation", "session", "admitted"],
             _ => return Err(invalid("unsupported native command")),
@@ -2025,6 +2027,13 @@ impl Runtime {
             "state" => {
                 Ok(json!({"prepared":i.record.prepared,"observation":Self::observation(&i)}))
             }
+            "auth-status" => Ok(if let Some(session) = &i.netbird {
+                session.action(&i.auth)
+            } else if let Some(driver) = &i.forti {
+                driver.action(&i.auth)
+            } else {
+                i.auth.action()
+            }),
             "login" => {
                 if i.auth.reason == "native_cleanup_required" {
                     self.cleanup(&mut i.record, false)?;

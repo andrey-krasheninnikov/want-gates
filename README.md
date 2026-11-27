@@ -62,12 +62,11 @@ Xray restarts is not guaranteed.
 
 [Install wgates](docs/bootstrap.md) beside an existing 3x-ui 3.11.0 gateway.
 The Linux packages target systemd on x86_64 and aarch64.
-See [Want Gates in 3x-ui](docs/panel.md) for the embedded status page.
+See [Want Gates in 3x-ui](docs/panel.md) for embedded status and management.
 
 ## Planned integrations
 
-Management is planned for the embedded panel. Warp Terminal integration
-will provide Workflows, a Tab Config, and MCP
+Warp Terminal integration will provide Workflows, a Tab Config, and MCP
 tools. Local integrations will call `wgates` on a selected VPS over SSH.
 
 The future skill package will use the existing skills CLI:

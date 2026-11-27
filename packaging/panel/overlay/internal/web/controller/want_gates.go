@@ -43,12 +43,41 @@ type wantGatesObject struct {
 	Revision wantGatesRevision `json:"revision"`
 }
 
+type wantGatesProbe struct {
+	URL            string  `json:"url,omitempty"`
+	ExpectedStatus *uint16 `json:"expected_status,omitempty"`
+	Server         string  `json:"server,omitempty"`
+	QueryName      string  `json:"query_name,omitempty"`
+	QueryType      string  `json:"query_type,omitempty"`
+}
+
+type wantGatesHealthcheck struct {
+	Target               string   `json:"target"`
+	RequiredCapabilities []string `json:"required_capabilities"`
+	Interval             uint64   `json:"interval_seconds"`
+	Timeout              uint64   `json:"timeout_seconds"`
+	FailureThreshold     uint64   `json:"failure_threshold"`
+	RecoveryThreshold    uint64   `json:"recovery_threshold"`
+	ExpectedStatus       *uint16  `json:"expected_status"`
+	CACertificate        *string  `json:"ca_pem"`
+	TCPRequest           *string  `json:"send_hex"`
+	TCPReply             *string  `json:"expect_hex"`
+}
+
 type wantGatesGroup struct {
 	wantGatesObject
 	Name      string             `json:"name"`
 	Primary   *string            `json:"primary"`
 	Fallbacks []string           `json:"fallbacks"`
 	Selected  *wantGatesSelected `json:"last_observed_selection"`
+	Probes    *struct {
+		TCPv4 *wantGatesProbe `json:"tcp_ipv4,omitempty"`
+		UDPv4 *wantGatesProbe `json:"udp_ipv4,omitempty"`
+		TCPv6 *wantGatesProbe `json:"tcp_ipv6,omitempty"`
+		UDPv6 *wantGatesProbe `json:"udp_ipv6,omitempty"`
+		DNS   *wantGatesProbe `json:"dns,omitempty"`
+	} `json:"probes"`
+	Healthcheck *wantGatesHealthcheck `json:"healthcheck"`
 }
 
 type wantGatesCheck struct {
@@ -100,6 +129,7 @@ type wantGatesRouting struct {
 	Busy            bool              `json:"busy"`
 	Recovery        bool              `json:"recovery_required"`
 	HealthError     *string           `json:"health_error"`
+	RecoveryPlanID  *string           `json:"recovery_plan_id"`
 	Last            struct {
 		State           string             `json:"state"`
 		RunningRevision *wantGatesRevision `json:"running_revision"`

@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 
 import { useTheme } from '@/hooks/useTheme';
 import AppSidebar from '@/layouts/AppSidebar';
+import Management from './Management';
 import { loadStatus, statusKey, type WantGatesSnapshot } from './status';
 
 type Connection = WantGatesSnapshot['connections'][number];
@@ -194,7 +195,12 @@ export default function WantGatesPage() {
               </Button>
               {query.isPending && <p role="status">Loading Want Gates status</p>}
               {query.isError && <Alert type="error" title={query.error.message} showIcon />}
-              {!query.isError && query.data && <WantGatesStatus state={query.data} />}
+              {!query.isError && query.data && (
+                <>
+                  <Management state={query.data} refresh={() => void query.refetch()} />
+                  <WantGatesStatus state={query.data} />
+                </>
+              )}
             </Space>
           </Layout.Content>
         </Layout>

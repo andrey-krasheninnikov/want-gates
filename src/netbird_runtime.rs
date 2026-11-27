@@ -570,6 +570,14 @@ impl Session {
         self.state.join("enrolled")
     }
 
+    pub fn action(&self, auth: &Authentication) -> Value {
+        let mut action = auth.action();
+        if auth.state == "browser_required" {
+            action["user_code"] = json!(self.user_code);
+        }
+        action
+    }
+
     pub fn login(
         &mut self,
         auth: &mut Authentication,
@@ -599,9 +607,7 @@ impl Session {
             if input.is_some() {
                 return Err(invalid("NetBird browser login is pending"));
             }
-            let mut action = auth.action();
-            action["user_code"] = json!(self.user_code);
-            return Ok(action);
+            return Ok(self.action(auth));
         }
         if auth.state == "authenticated" || auth.state == "authenticating" {
             if input.is_some() {

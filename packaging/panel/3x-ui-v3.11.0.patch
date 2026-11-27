@@ -1,8 +1,9 @@
 --- a/internal/web/controller/spa.go
 +++ b/internal/web/controller/spa.go
-@@ -46,0 +47,2 @@
+@@ -46,0 +47,3 @@
 +	g.GET("/want-gates", a.panelSPA)
 +	g.GET("/api/want-gates/status", wantGatesStatus)
++	g.POST("/api/want-gates/operations/:operation", wantGatesMutate)
 --- a/frontend/src/routes/panelRoutes.tsx
 +++ b/frontend/src/routes/panelRoutes.tsx
 @@ -25,0 +26 @@
@@ -107,3 +108,11 @@
 +++ b/internal/web/translation/zh-TW.json
 @@ -109,0 +110 @@
 +    "wantGates": "Want Gates",
+--- a/internal/web/web.go
++++ b/internal/web/web.go
+@@ -208 +208,4 @@
+-	engine.Use(gzip.Gzip(gzip.DefaultCompression))
++	// Long authenticated Want Gates operations set a per-response write deadline.
++	engine.Use(gzip.Gzip(gzip.DefaultCompression, gzip.WithExcludedPathsRegexs([]string{
++		`/panel/api/want-gates/operations/[^/]+$`,
++	})))

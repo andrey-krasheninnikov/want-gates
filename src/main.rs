@@ -368,6 +368,8 @@ fn handle(
                 || matches!(
                     command,
                     "connection.login"
+                        | "connection.auth-status"
+                        | "connection.adapter"
                         | "connection.logout"
                         | "connection.restart"
                         | "connection.forget-auth"

@@ -62,11 +62,10 @@ Forti поддерживает отдельно проверенные TCP/UDP �
 
 [Установите wgates](docs/bootstrap.md) рядом с существующим шлюзом 3x-ui 3.11.0.
 Пакеты рассчитаны на Linux с systemd на x86_64 и aarch64.
-См. [раздел статуса Want Gates в 3x-ui](docs/panel.md).
+См. [раздел управления Want Gates в 3x-ui](docs/panel.md).
 
 ## Планируемые интеграции
 
-Управление через встроенный раздел 3x-ui запланировано.
 Интеграция Warp Terminal включает Workflows, Tab Config и MCP.
 Локальные интеграции вызывают `wgates` на выбранном VPS через SSH.
 
