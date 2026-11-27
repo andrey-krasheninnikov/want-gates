@@ -18,5 +18,6 @@ printf '%s %s\n' "$version" "$architecture" > "$stage/support"
 name=wgates-v$version-linux-$architecture.tar.gz
 tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C "$stage" \
     -czf "$output/$name" LICENSE support wgates wgates-native.service wgates.conf wgates.service
-(cd -- "$output" && sha256sum -- "$name" > "$name.sha256")
+install -m 0755 -- "$here/bootstrap.sh" "$output/bootstrap.sh"
+(cd -- "$output" && sha256sum -- "$name" bootstrap.sh > SHA256SUMS)
 printf '%s\n' "$output/$name"

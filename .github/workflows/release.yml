@@ -61,7 +61,7 @@ jobs:
           printf '%s  %s\n' "$PANEL_SHA" "$fixture/panel.tar.gz" | sha256sum --check --strict
           tar -xzf "$fixture/panel.tar.gz" -C "$fixture"
           image=docker.io/library/ubuntu@sha256:562111b88caa79c71391c0c4d3c2114a7d5c35915c20561fd893cb1e07929e6b
-          setup='apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -qy --no-install-recommends systemd systemd-sysv tar gzip util-linux'
+          setup='apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -qy --no-install-recommends systemd systemd-sysv tar gzip util-linux diffutils'
           bash tests/bootstrap_container.sh "$image" "$setup" "$fixture/x-ui" dist/wgates-*.tar.gz
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -80,13 +80,13 @@ jobs:
         include:
           - distribution: Fedora 44
             image: registry.fedoraproject.org/fedora@sha256:d5c6ac6d50556aa47f5b39f08964cdf1a57d182e1d21c172368ba9aed188b0e7
-            setup: dnf -y install systemd dbus-broker tar gzip util-linux shadow-utils gawk
+            setup: dnf -y install systemd dbus-broker tar gzip util-linux shadow-utils gawk diffutils
           - distribution: Arch Linux
             image: docker.io/library/archlinux@sha256:375a401bb3c6376b37f40b6dfa25067db37ec78d0b7af67ae6315f43a0184a9d
-            setup: pacman -Syu --noconfirm --needed systemd dbus tar gzip
+            setup: pacman -Syu --noconfirm --needed systemd dbus tar gzip diffutils
           - distribution: openSUSE Leap 16.0
             image: registry.opensuse.org/opensuse/leap@sha256:9c88da273b41600dfd12790849dfb198ddefed3a109eaf42ada944afb4282a9d
-            setup: zypper --non-interactive refresh && zypper --non-interactive install --no-recommends systemd dbus-1 tar gzip util-linux shadow gawk
+            setup: zypper --non-interactive refresh && zypper --non-interactive install --no-recommends systemd dbus-1 tar gzip util-linux shadow gawk diffutils
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -108,5 +108,5 @@ jobs:
           printf '0ddfa4702f595442e2962acd81addc768fdacaa4ff2672c971a0463dae744916  %s\n' \
             "$fixture/panel.tar.gz" | sha256sum --check --strict
           tar -xzf "$fixture/panel.tar.gz" -C "$fixture"
-          (cd dist && sha256sum --check --strict wgates-*.sha256)
+          (cd dist && sha256sum --check --strict SHA256SUMS)
           bash tests/bootstrap_container.sh "$IMAGE" "$SETUP" "$fixture/x-ui" dist/wgates-*.tar.gz

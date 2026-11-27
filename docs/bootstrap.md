@@ -18,16 +18,19 @@ set -eu
 version=v0.1.0
 architecture=$(uname -m)
 archive="wgates-$version-linux-$architecture.tar.gz"
-grep -F "  $archive" SHA256SUMS | sha256sum --check --strict
-grep -F '  bootstrap.sh' SHA256SUMS | sha256sum --check --strict
-digest=$(sha256sum "$archive" | cut -d ' ' -f 1)
-bash bootstrap.sh preflight --archive "$archive" --sha256 "$digest"
+digest=$(awk -v archive="$archive" '$2 == archive { hash=$1; count++ } END { if (count != 1) exit 1; print hash }' SHA256SUMS)
+printf '%s  %s\n' "$digest" "$archive" | sha256sum --check --strict
+grep -E '^[a-f0-9]{64}  bootstrap[.]sh$' SHA256SUMS | sha256sum --check --strict
+sudo bash bootstrap.sh preflight --archive "$archive" --sha256 "$digest"
 sudo bash bootstrap.sh install --archive "$archive" --sha256 "$digest"
 sudo wgates status
 )
 ```
 
 Preflight inspects the OS, systemd, panel, archive and selected dependencies.
+When run with root privileges it also verifies that the active service uses
+the expected panel and Xray executables. For a custom layout use the manual
+installation instructions.
 Install changes the gateway only after the package passes verification.
 The initial install creates the wgates system account and enables
 wgates.service. Root and members of the wgates group can use its socket.
@@ -43,6 +46,20 @@ IPv4 forwarding and a root-controlled Xray executable. Check the relevant
 devices, kernel support and client versions
 before installation. See [OpenVPN](openvpn.md), [Forti](forti.md),
 [WireGuard](wireguard.md) and [NetBird](netbird.md).
+
+The upstream archive may preserve its build UID. Compare the installed Xray
+binary with the executable from the verified 3x-ui release archive before
+changing ownership. For a standard installation, make these specific paths
+root-owned, with group and other write permission removed. Use
+xray-linux-arm64 on aarch64.
+
+```sh
+sudo chown root:root /usr/local/x-ui /usr/local/x-ui/bin /usr/local/x-ui/bin/xray-linux-amd64
+sudo chmod go-w /usr/local/x-ui /usr/local/x-ui/bin /usr/local/x-ui/bin/xray-linux-amd64
+```
+
+Use the [native runtime manual instructions](openvpn.md#prerequisites-and-manual-installation)
+if the panel's ownership must stay as installed.
 
 | Distribution | Manager | Package names for native clients |
 | --- | --- | --- |

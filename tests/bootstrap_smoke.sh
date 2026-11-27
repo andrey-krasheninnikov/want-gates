@@ -20,8 +20,10 @@ done
 for service in wgates.service wgates-native.service x-ui.service; do
     [[ $(systemctl show -p LoadState --value "$service") == not-found ]]
 done
-! getent passwd wgates
-! getent group wgates
+if getent passwd wgates >/dev/null || getent group wgates >/dev/null; then
+    echo 'The fixture requires an unused wgates account and group.' >&2
+    exit 1
+fi
 tmp=$(mktemp -d /var/tmp/wgates-bootstrap-test.XXXXXXXX)
 chmod 0755 "$tmp"
 
@@ -38,6 +40,7 @@ cleanup() {
     exit "$status"
 }
 trap cleanup EXIT
+trap 'echo "Bootstrap smoke failed at line $LINENO." >&2; if [[ -s $tmp/result ]]; then tail -n 18 "$tmp/result" >&2; fi' ERR
 
 script="$tmp/bootstrap.sh"
 install -m 0755 -- "$repo/packaging/bootstrap.sh" "$script"
@@ -67,7 +70,19 @@ systemctl daemon-reload
 systemctl start x-ui.service
 panel_pid=$(systemctl show -p MainPID --value x-ui.service)
 panel_hash=$(sha256sum /usr/local/x-ui/x-ui)
-"$script" preflight "${protocol[@]}"
+for _ in {1..50}; do
+    if "$script" preflight > "$tmp/result" 2>&1; then break; fi
+    sleep 0.2
+done
+"$script" preflight
+if (( ${#protocol[@]} )); then
+    xray=$(printf '%s\n' /usr/local/x-ui/bin/xray-linux-*)
+    chown 1001:1001 -- "$xray"
+    if "$script" preflight "${protocol[@]}" > "$tmp/result" 2>&1; then exit 1; fi
+    grep -q 'requires a root-controlled Xray executable' "$tmp/result"
+    chown root:root -- "$xray"
+    "$script" preflight "${protocol[@]}"
+fi
 if "$script" install --archive "$archive" --sha256 "$(printf '%064d' 0)" >"$tmp/result" 2>&1; then exit 1; fi
 grep -q 'archive checksum mismatch' "$tmp/result"
 [[ ! -e $binary && ! -e $unit && ! -e /var/lib/wgates-install ]]
@@ -81,7 +96,10 @@ wgates group create --name 'Bootstrap example' >/dev/null
 wgates group list > "$tmp/groups"
 [[ $(stat -c %a /var/lib/wgates) == 700 ]]
 [[ $(stat -c %a /run/wgates/control.sock) == 660 ]]
-! runuser -u nobody -- wgates status >"$tmp/result" 2>&1
+if runuser -u nobody -- wgates status >"$tmp/result" 2>&1; then
+    echo 'An unauthorized caller could read the control socket.' >&2
+    exit 1
+fi
 service_pid=$(systemctl show -p MainPID --value wgates.service)
 "$script" install --archive "$archive" --sha256 "$digest"
 [[ $(systemctl show -p MainPID --value wgates.service) == "$service_pid" ]]
@@ -95,6 +113,17 @@ upgrade=$(sha256sum -- "$tmp/upgrade.tar.gz")
 "$script" install --archive "$tmp/upgrade.tar.gz" --sha256 "${upgrade%% *}"
 cmp -- "$tmp/changed/wgates" "$binary"
 wgates group list | cmp - "$tmp/groups"
+
+if (( ${#protocol[@]} )); then
+    sed -i 's|^ExecStart=.*|ExecStart=/usr/local/bin/wgates unsupported-command|' "$tmp/changed/wgates-native.service"
+    tar -C "$tmp/changed" -czf "$tmp/bad-native.tar.gz" LICENSE support wgates wgates-native.service wgates.conf wgates.service
+    bad_native=$(sha256sum -- "$tmp/bad-native.tar.gz")
+    if "$script" install --archive "$tmp/bad-native.tar.gz" --sha256 "${bad_native%% *}" > "$tmp/result" 2>&1; then exit 1; fi
+    grep -q 'Restored the previous wgates files and service state' "$tmp/result"
+    systemctl is-active --quiet wgates-native.service
+    cmp -- "$repo/packaging/systemd/wgates-native.service" /etc/systemd/system/wgates-native.service
+    cp -- "$repo/packaging/systemd/wgates-native.service" "$tmp/changed/wgates-native.service"
+fi
 
 # A refused service restart must restore the previous install.
 sed -i 's|^ExecStart=.*|ExecStart=/usr/local/bin/wgates unsupported-command|' "$tmp/changed/wgates.service"
@@ -118,8 +147,8 @@ test -d /var/lib/wgates-install/pending
 cmp -s "$unit" "$tmp/changed/wgates.service"
 kill -KILL "$installer"
 wait "$installer" 2>/dev/null || test "$?" = 137
-# A bounded readiness sleep can still hold the installation lock.
-sleep 2
+# Let any in-flight systemd command release the installer's lock.
+flock -w 20 /var/lib/wgates-install/lock true
 "$script" install --archive "$archive" --sha256 "$digest"
 [[ ! -e /var/lib/wgates-install/pending ]]
 wgates group list | cmp - "$tmp/groups"

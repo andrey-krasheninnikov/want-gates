@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 umask 077
-export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export LC_ALL=C
 
 fail() { printf 'wgates bootstrap: %s\n' "$*" >&2; exit 1; }
@@ -58,10 +58,24 @@ xray=$panel/bin/xray-linux-$xray_arch
 [[ -x $panel/x-ui && -x $xray ]] ||
     fail 'expected panel and Xray executables under /usr/local/x-ui; see manual steps'
 version_user=()
-if ((EUID == 0)); then version_user=(runuser -u nobody --); fi
-[[ $("${version_user[@]}" timeout 5s "$panel/x-ui" -v) == 3.11.0 ]] ||
-    fail 'bootstrap requires 3x-ui 3.11.0'
-read -r product version _ < <("${version_user[@]}" timeout 5s "$xray" version) ||
+if ((EUID == 0)); then
+    version_user=(setpriv --reuid 65534 --regid 65534 --clear-groups --no-new-privs)
+    panel_pid=$(systemctl show -p MainPID --value x-ui.service)
+    [[ $panel_pid =~ ^[1-9][0-9]*$ && $panel/x-ui -ef /proc/$panel_pid/exe ]] ||
+        fail 'x-ui.service uses another executable; see manual installation'
+    live_xray=0
+    for child_list in /proc/"$panel_pid"/task/*/children; do
+        [[ -r $child_list ]] || continue
+        read -r -a children < "$child_list" || true
+        for child in "${children[@]}"; do
+            if [[ $xray -ef /proc/$child/exe ]]; then live_xray=1; break 2; fi
+        done
+    done
+    ((live_xray)) || fail 'the panel has not started the expected Xray executable; see manual installation'
+fi
+version_probe() { "${version_user[@]}" timeout 5s "$@"; }
+[[ $(version_probe "$panel/x-ui" -v) == 3.11.0 ]] || fail 'bootstrap requires 3x-ui 3.11.0'
+read -r product version _ < <(version_probe "$xray" version) ||
     fail 'cannot read the Xray version'
 [[ $product == Xray && $version == 26.10.21 ]] || fail 'bootstrap requires Xray 26.10.21'
 
@@ -81,13 +95,14 @@ need() {
 }
 check_version() {
     local value
-    value=$("$1" --version 2>&1) || fail "cannot read $1 version"
+    trusted "$1" || fail "native executable must be controlled by root: $1"
+    value=$(version_probe "$1" --version 2>&1) || fail "cannot read $1 version"
     [[ $value =~ $2 ]] || fail "$1 requires $3; install a supported version manually"
 }
 native=0
 if [[ -v protocols[openvpn] || -v protocols[forti] || -v protocols[wireguard] || -v protocols[netbird] ]]; then
     native=1
-    trusted "$xray" || fail 'native routing requires a root-controlled Xray executable; see docs/openvpn.md'
+    trusted "$xray" || fail 'native routing requires a root-controlled Xray executable; see docs/bootstrap.md#optional-native-protocols'
     [[ $(< /proc/sys/net/ipv4/ip_forward) == 1 ]] ||
         fail 'native connections require IPv4 forwarding; configure it before installing'
     need /usr/sbin/ip "$ip_package"
@@ -120,7 +135,8 @@ if [[ -v protocols[wireguard] ]]; then
 fi
 if [[ -v protocols[netbird] ]]; then
     [[ -x /usr/bin/netbird ]] || fail 'install the verified NetBird 0.83.2 client manually; see docs/netbird.md'
-    [[ $(/usr/bin/netbird version) == 0.83.2 ]] || fail 'NetBird 0.83.2 is required'
+    trusted /usr/bin/netbird || fail 'the NetBird client must be controlled by root'
+    [[ $(version_probe /usr/bin/netbird version) == 0.83.2 ]] || fail 'NetBird 0.83.2 is required'
     need /usr/bin/curl curl
 fi
 printf 'Platform %s/%s, package manager %s, panel 3.11.0 with Xray 26.10.21\n' \
@@ -134,19 +150,35 @@ fi
 workspace=$(mktemp -d /var/tmp/wgates-bootstrap.XXXXXXXX)
 root=/var/lib/wgates-install
 pending=$root/pending
+retired=$root/retired
 files=(wgates wgates.service wgates.conf wgates-native.service)
 destinations=(/usr/local/bin/wgates /etc/systemd/system/wgates.service /usr/lib/sysusers.d/wgates.conf /etc/systemd/system/wgates-native.service)
 units=(wgates.service wgates-native.service)
 owns_transaction=0
 transaction=
 
-same() { [[ -f $1 && ! -L $1 && -f $2 && ! -L $2 ]] && cmp -s -- "$1" "$2"; }
+same() {
+    [[ -f $1 && ! -L $1 && -f $2 && ! -L $2 ]] || return 1
+    local left right
+    left=$(sha256sum -- "$1") && right=$(sha256sum -- "$2") &&
+        [[ ${left%% *} == "${right%% *}" ]]
+}
 absent() { [[ ! -e $1 && ! -L $1 ]]; }
 put() {
     local source=$1 destination=$2
     absent "$destination.wgates-new" || return 1
     cp -p -- "$source" "$destination.wgates-new" &&
         mv -fT -- "$destination.wgates-new" "$destination"
+}
+
+flush_destinations() {
+    local i
+    for i in "${!files[@]}"; do
+        if [[ -f $pending/new/${files[i]} ]]; then
+            sync -f "$(dirname -- "${destinations[i]}")" || return 1
+        fi
+    done
+    sync -f /etc
 }
 
 recover() {
@@ -159,7 +191,7 @@ recover() {
             fi
         done
         if ! absent "$root/receipt.wgates-new"; then
-            same "$root/receipt.wgates-new" "$pending/receipt" || return 1
+            [[ -f $root/receipt.wgates-new && ! -L $root/receipt.wgates-new ]] || return 1
             rm -- "$root/receipt.wgates-new" || return 1
         fi
         put "$pending/receipt" "$root/receipt" || return 1
@@ -183,7 +215,9 @@ recover() {
         done
         for unit in "${units[@]}"; do
             [[ -f $pending/new/$unit ]] || continue
-            if systemctl is-active --quiet "$unit"; then systemctl stop "$unit" || return 1; fi
+            if [[ $(systemctl show -p LoadState --value "$unit") != not-found ]]; then
+                systemctl stop "$unit" || return 1
+            fi
             if [[ ! -f $pending/enabled/$unit ]] && systemctl is-enabled --quiet "$unit"; then
                 systemctl disable "$unit" || return 1
             fi
@@ -199,12 +233,16 @@ recover() {
         done
         systemctl daemon-reload || return 1
         for unit in "${units[@]}"; do
-            if [[ -f $pending/active/$unit ]]; then systemctl start "$unit" || return 1; fi
+            if [[ -f $pending/active/$unit ]]; then
+                systemctl reset-failed "$unit" && systemctl start "$unit" || return 1
+            fi
         done
+        flush_destinations || return 1
         printf 'Restored the previous wgates files and service state. Package dependencies and persistent data remain installed.\n' >&2
     fi
+    mv -T -- "$pending" "$retired" || return 1
     sync -f "$root" || return 1
-    rm -rf -- "$pending"
+    rm -rf -- "$retired"
 }
 
 cleanup() {
@@ -252,16 +290,27 @@ for destination in "${destinations[@]}"; do
 done
 exec 9>"$root/lock"
 flock -n 9 || fail 'another installation is in progress'
+if ! absent "$retired"; then
+    [[ -d $retired && ! -L $retired && $(stat -c '%u:%a' "$retired") == 0:700 ]] ||
+        fail 'unsafe retired installation record'
+    rm -rf -- "$retired"
+fi
 if ! absent "$pending"; then
     [[ -d $pending && ! -L $pending ]] || fail 'invalid pending installation directory'
     recover || fail 'previous installation could not be reconciled'
 fi
 
-if account=$(getent passwd wgates); then
+check_identity() {
+    local account service_gid service_home service_shell
+    account=$(getent passwd wgates) || fail 'missing wgates system account'
     IFS=: read -r _ _ service_uid service_gid _ service_home service_shell <<< "$account"
-    [[ $service_home == /var/lib/wgates && $service_shell == */nologin &&
+    [[ $service_uid =~ ^[1-9][0-9]*$ && $service_gid =~ ^[1-9][0-9]*$ &&
+        $service_home == /var/lib/wgates && $service_shell == */nologin &&
         $(getent group wgates | cut -d: -f3) == "$service_gid" ]] ||
-        fail 'the existing wgates account does not match the service account'
+        fail 'wgates must be an unprivileged system account with its own group'
+}
+if getent passwd wgates >/dev/null; then
+    check_identity
 else
     service_uid=
     absent /var/lib/wgates || fail 'inspect the existing state before creating a service account'
@@ -321,6 +370,7 @@ if [[ -v protocols[netbird] ]]; then [[ -x /usr/bin/curl ]] || fail 'curl is mis
 if ((!native)) && absent "${destinations[3]}"; then
     rm -- "$workspace/new/wgates-native.service"
 fi
+absent "$root/receipt.wgates-new" || fail 'unexpected installation receipt staging file'
 mkdir -- "$workspace/old" "$workspace/active" "$workspace/enabled"
 changed=0
 for i in "${!files[@]}"; do
@@ -376,16 +426,23 @@ for i in "${!files[@]}"; do
     if [[ -f $source ]] && ! same "$destination" "$source"; then put "$source" "$destination"; fi
 done
 systemd-sysusers /usr/lib/sysusers.d/wgates.conf
+check_identity
 systemctl daemon-reload
 if ((native)); then systemctl enable wgates-native.service; fi
 systemctl enable --now wgates.service
 ready=0
 for _ in {1..30}; do
-    if /usr/local/bin/wgates status >/dev/null 2>&1; then ready=1; break; fi
+    if systemctl is-active --quiet wgates.service && /usr/local/bin/wgates status >/dev/null 2>&1; then
+        ready=1
+        break
+    fi
     sleep 1
 done
 ((ready)) || fail 'wgates did not reach control-service readiness'
-if ((native)); then systemctl is-active --quiet wgates-native.service || fail 'native runtime did not start'; fi
+if ((native)) || [[ -f $pending/active/wgates-native.service ]]; then
+    systemctl is-active --quiet wgates-native.service || fail 'native runtime did not start'
+fi
+flush_destinations
 touch "$pending/verified"
 sync -f "$root"
 recover || fail 'installation succeeded but the receipt needs reconciliation'

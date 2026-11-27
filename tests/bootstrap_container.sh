@@ -37,6 +37,9 @@ if ! docker exec "$container" test -d /run/systemd/system; then
     exit 1
 fi
 docker exec "$container" bash -ec '
-  ! command -v wg
+  if command -v wg >/dev/null; then
+    echo "WireGuard tools are already installed in the dependency fixture." >&2
+    exit 1
+  fi
   bash /src/tests/bootstrap_smoke.sh /fixture/panel /fixture/release.tar.gz wireguard
 '
