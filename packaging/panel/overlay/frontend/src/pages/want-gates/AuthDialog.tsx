@@ -28,7 +28,9 @@ export function challengeFields(
 ): Credential[] {
   if (auth?.authentication === 'browser_required') return [];
   if (protocol === 'netbird') {
-    return auth?.authentication === 'credentials_required' ? ['setup_key'] : [];
+    return ['credentials_required', 'failed', 'expired'].includes(auth?.authentication ?? '')
+      ? ['setup_key']
+      : [];
   }
   if (!auth?.challenge_id) return [];
   if (protocol === 'forti') {

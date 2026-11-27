@@ -34,6 +34,18 @@ describe('Want Gates native challenges', () => {
     expect(
       challengeFields('netbird', { ...pending, authentication: 'credentials_required' }),
     ).toEqual(['setup_key']);
+    for (const authentication of ['failed', 'expired']) {
+      expect(
+        challengeFields('netbird', { authentication, expires_at: null, remembered: false }),
+      ).toEqual(['setup_key']);
+    }
+    expect(
+      challengeFields('netbird', {
+        authentication: 'authenticating',
+        expires_at: null,
+        remembered: false,
+      }),
+    ).toEqual([]);
     expect(challengeFields('wireguard')).toEqual([]);
   });
 

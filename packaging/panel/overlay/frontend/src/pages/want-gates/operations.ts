@@ -12,6 +12,7 @@ const change = z.object({
   id: nonempty,
   before: z.array(z.string()).nullable(),
   after: z.array(z.string()).nullable(),
+  notes: z.array(z.string()),
 });
 
 export const previewSchema = z.object({

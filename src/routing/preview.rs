@@ -9,6 +9,7 @@ struct Change<'a> {
     id: &'a str,
     before: Option<Vec<String>>,
     after: Option<Vec<String>>,
+    notes: Vec<&'static str>,
 }
 
 fn changes<'a, T>(
@@ -17,6 +18,7 @@ fn changes<'a, T>(
     after: &'a [T],
     key: impl Fn(&T) -> (&str, u64),
     describe: impl Fn(&T) -> Vec<String>,
+    notes: impl Fn(&T, &T) -> Vec<&'static str>,
 ) -> Vec<Change<'a>> {
     let before: BTreeMap<_, _> = before.iter().map(|item| (key(item).0, item)).collect();
     let after: BTreeMap<_, _> = after.iter().map(|item| (key(item).0, item)).collect();
@@ -36,6 +38,9 @@ fn changes<'a, T>(
                 id,
                 before: previous.map(&describe),
                 after: proposed.map(&describe),
+                notes: previous
+                    .zip(proposed)
+                    .map_or_else(Vec::new, |(old, new)| notes(old, new)),
             })
         })
         .collect()
@@ -55,6 +60,7 @@ pub(super) fn summary(plan: &Plan, working: Option<&Working>) -> Value {
                 format!("Company group {}", rule.group_id),
             ]
         },
+        |_, _| Vec::new(),
     );
     changeset.extend(changes(
         "group",
@@ -85,10 +91,45 @@ pub(super) fn summary(plan: &Plan, working: Option<&Working>) -> Value {
                     check.recovery_threshold,
                     check.required_capabilities.join(", "),
                 ));
+                if url::Url::parse(&check.target)
+                    .is_ok_and(|target| matches!(target.scheme(), "http" | "https"))
+                {
+                    details.push(format!(
+                        "Expected HTTP status: {}",
+                        check.expected_status.unwrap_or(200)
+                    ));
+                }
             } else {
                 details.push("No automatic healthcheck".to_owned());
             }
             details
+        },
+        |old, new| {
+            let old_check = old.healthcheck.as_ref();
+            let new_check = new.healthcheck.as_ref();
+            [
+                (
+                    old.probes != new.probes,
+                    "Transport or DNS verification probes changed",
+                ),
+                (
+                    old_check.and_then(|check| check.ca_pem.as_ref())
+                        != new_check.and_then(|check| check.ca_pem.as_ref()),
+                    "Healthcheck trust certificate changed",
+                ),
+                (
+                    old_check.map(|check| (&check.send_hex, &check.expect_hex))
+                        != new_check.map(|check| (&check.send_hex, &check.expect_hex))
+                        && old_check
+                            .into_iter()
+                            .chain(new_check)
+                            .any(|check| check.expect_hex.is_some()),
+                    "Healthcheck TCP exchange changed",
+                ),
+            ]
+            .into_iter()
+            .filter_map(|(changed, label)| changed.then_some(label))
+            .collect()
         },
     ));
     changeset.extend(changes(
@@ -107,6 +148,13 @@ pub(super) fn summary(plan: &Plan, working: Option<&Working>) -> Value {
                     connection.allowed_capabilities.join(", ")
                 ),
             ]
+        },
+        |old, new| {
+            if old.profile_ref != new.profile_ref {
+                vec!["Connection profile replaced"]
+            } else {
+                Vec::new()
+            }
         },
     ));
     json!({

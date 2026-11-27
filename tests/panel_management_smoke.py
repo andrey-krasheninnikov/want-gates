@@ -86,6 +86,11 @@ def acceptance(stand):
     operation("group.delete", {"id": group["id"], "expected_revision": group["revision"]}, 409)
     operation("group.update", {
         "id": group["id"], "expected_revision": group["revision"], "name": "Edited group",
+        "healthcheck": {
+            "target": "http://10.220.0.10:18080/panel-managed",
+            "required_capabilities": ["tcp_ipv4"], "expected_status": 204,
+        },
+        "probes": {"tcp_ipv4": {"url": "http://10.220.0.10:18080/updated-probe"}},
     })
     operation("group.update", {
         "id": group["id"], "expected_revision": group["revision"], "name": "Stale edit",
@@ -96,6 +101,7 @@ def acceptance(stand):
     operation("connection.update", {
         "id": connection["id"], "expected_revision": live["connections"][0]["revision"],
         "name": "Edited connection", "dns": "udp://10.220.0.53:53",
+        "profile": json.dumps(stand["outbound"]("10.214.0.2", 19002, stand["ids"]["b"])),
     })
     edited = status(stand, csrf)
     assert edited["connections"][0]["name"] == "Edited connection"
@@ -121,6 +127,11 @@ def acceptance(stand):
     changed_group = next(change for change in preview["changes"] if change["id"] == group["id"])
     assert changed_group["before"][0] == "Browser managed"
     assert changed_group["after"][0] == "Edited group"
+    assert "Expected HTTP status: 204" in changed_group["after"]
+    assert "Transport or DNS verification probes changed" in changed_group["notes"]
+    changed_connection = next(change for change in preview["changes"] if change["id"] == connection["id"])
+    assert changed_connection["notes"] == ["Connection profile replaced"]
+    assert stand["ids"]["b"] not in json.dumps(preview)
     assert peer() == "10.211.0.1"
 
     settings = stand["api"]("xray/", {})

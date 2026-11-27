@@ -53,6 +53,7 @@ type wantGatesChange struct {
 	ID     string   `json:"id"`
 	Before []string `json:"before"`
 	After  []string `json:"after"`
+	Notes  []string `json:"notes"`
 }
 
 type wantGatesPreview struct {
@@ -73,7 +74,7 @@ type wantGatesApply struct {
 	PlanID                string             `json:"plan_id"`
 	State                 string             `json:"state"`
 	RunningRevision       *wantGatesRevision `json:"running_revision"`
-	Mismatch              bool               `json:"mismatch"`
+	Mismatch              *bool              `json:"mismatch"`
 	NativeCleanupRequired bool               `json:"native_cleanup_required"`
 }
 
@@ -149,6 +150,15 @@ func wantGatesOperationRequest(c *gin.Context, command string, fields string) (m
 	return request, nil
 }
 
+func wantGatesNativeMutation(command string) bool {
+	switch command {
+	case "connection.login", "connection.logout", "connection.restart", "connection.forget-auth":
+		return true
+	default:
+		return false
+	}
+}
+
 func publicWantGatesError(command, detail string) (int, string) {
 	switch {
 	case strings.HasPrefix(detail, "configuration saved; unused profile cleanup failed"):
@@ -159,6 +169,11 @@ func publicWantGatesError(command, detail string) (int, string) {
 		return http.StatusConflict, "This object changed. Refresh status and reopen it before submitting again."
 	case strings.Contains(detail, "routing operation in progress"):
 		return http.StatusConflict, "A routing operation is in progress. Refresh routing status when it finishes."
+	case command == "routing.recover" && (strings.Contains(detail, "intervening panel edits") ||
+		strings.Contains(detail, "panel changed before restoration") ||
+		strings.Contains(detail, "panel changed before native cleanup") ||
+		strings.Contains(detail, "manual recovery")):
+		return http.StatusConflict, "Automatic restoration stopped. Reconcile the current 3x-ui settings manually before retrying recovery."
 	case strings.Contains(detail, "drift"), strings.Contains(detail, "changed since preview"), strings.Contains(detail, "create a new preview"), strings.Contains(detail, "preview again"):
 		return http.StatusConflict, "The applied context changed. Inspect status and create a new preview."
 	case strings.Contains(detail, "recovery"), strings.Contains(detail, "recover before"):
@@ -179,6 +194,8 @@ func publicWantGatesError(command, detail string) (int, string) {
 		return http.StatusServiceUnavailable, "The native service reply could not be confirmed. Check sign-in before retrying."
 	case strings.Contains(detail, "runtime unavailable"):
 		return http.StatusServiceUnavailable, "The native service is unavailable."
+	case wantGatesNativeMutation(command):
+		return http.StatusConflict, "The native operation did not report completion. Check sign-in and the required fields before retrying."
 	case strings.HasPrefix(command, "routing."):
 		return http.StatusBadRequest, "The routing operation did not complete. Inspect routing status and the required probes."
 	default:
@@ -202,7 +219,8 @@ func wantGatesOperationData(command string, data json.RawMessage) (any, error) {
 		if err := json.Unmarshal(data, &view); err != nil {
 			return nil, err
 		}
-		if view.PlanID == "" || view.State == "" {
+		if view.PlanID == "" || view.State == "" || view.Mismatch == nil ||
+			(view.State == "applied" && view.RunningRevision == nil) {
 			return nil, errWantGatesReply
 		}
 		return view, nil
@@ -271,7 +289,7 @@ func wantGatesMutate(c *gin.Context) {
 	}
 	if reply.Error != "" {
 		status, message := publicWantGatesError(command, reply.Error)
-		c.JSON(status, gin.H{"success": false, "msg": message, "readback_required": strings.HasPrefix(reply.Error, "configuration saved")})
+		c.JSON(status, gin.H{"success": false, "msg": message, "readback_required": wantGatesNativeMutation(command) || strings.HasPrefix(reply.Error, "configuration saved")})
 		return
 	}
 	data, err := wantGatesOperationData(command, reply.Data)

@@ -46,14 +46,22 @@ func TestWantGatesMapsUnconfirmedResults(t *testing.T) {
 		{"connection.login", "native runtime transport unavailable", http.StatusServiceUnavailable, "could not be confirmed"},
 		{"connection.update", "configuration saved but durability is uncertain", http.StatusServiceUnavailable, "may be saved"},
 		{"connection.update", "configuration saved; unused profile cleanup failed", http.StatusConflict, "was saved"},
+		{"connection.login", "could not persist credential record", http.StatusConflict, "Check sign-in"},
+		{"routing.recover", "intervening panel edits prevent restoration; retain state and reconcile manually", http.StatusConflict, "manually"},
 	} {
 		status, message := publicWantGatesError(example.command, example.detail)
 		if status != example.status || !strings.Contains(message, example.message) {
 			t.Fatalf("incorrect result status or message for %s", example.command)
 		}
 	}
-	if _, err := wantGatesOperationData("routing.apply", json.RawMessage(`{"plan_id":"test"}`)); err == nil {
-		t.Fatal("accepted an apply result without its state")
+	for _, data := range []string{
+		`{"plan_id":"test"}`,
+		`{"plan_id":"test","state":"applied","running_revision":3}`,
+		`{"plan_id":"test","state":"applied","mismatch":false}`,
+	} {
+		if _, err := wantGatesOperationData("routing.apply", json.RawMessage(data)); err == nil {
+			t.Fatal("accepted an incomplete apply result")
+		}
 	}
 }
 

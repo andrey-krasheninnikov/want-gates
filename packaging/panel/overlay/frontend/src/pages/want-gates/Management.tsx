@@ -282,8 +282,18 @@ export default function Management({
               columns={[
                 {
                   title: 'Change',
-                  render: (_, row) =>
-                    `${row.before === null ? 'Add' : row.after === null ? 'Remove' : 'Update'} ${row.kind} ${row.id}`,
+                  render: (_, row) => (
+                    <>
+                      <p>{`${row.before === null ? 'Add' : row.after === null ? 'Remove' : 'Update'} ${row.kind} ${row.id}`}</p>
+                      {row.notes.length > 0 && (
+                        <ul>
+                          {row.notes.map((note) => (
+                            <li key={note}>{note}</li>
+                          ))}
+                        </ul>
+                      )}
+                    </>
+                  ),
                 },
                 {
                   title: 'Last working settings',

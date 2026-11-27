@@ -11,7 +11,7 @@ import {
   Space,
 } from 'antd';
 import { useQuery } from '@tanstack/react-query';
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 
 import { adapterSchema, capabilities, operation, protocols } from './operations';
 import type { WantGatesSnapshot } from './status';
@@ -115,6 +115,9 @@ export default function ConfigEditor({
   const editingDisabled = locked || outdated;
   const [form] = Form.useForm<Values>();
   const [error, setError] = useState('');
+  const [fileRead, setFileRead] = useState<'ready' | 'reading' | 'failed'>('ready');
+  const fileSelection = useRef(0);
+  const saveDisabled = editingDisabled || fileRead !== 'ready';
   const selectedProtocol = Form.useWatch('protocol', form) ?? connection?.protocol ?? 'vless';
   const healthEnabled = Form.useWatch('health_enabled', form) ?? Boolean(group?.healthcheck);
   const guide = adapterGuides[selectedProtocol as keyof typeof adapterGuides];
@@ -154,7 +157,7 @@ export default function ConfigEditor({
   };
 
   async function finish(values: Values) {
-    if (editingDisabled) return;
+    if (saveDisabled) return;
     setError('');
     if (kind === 'group') {
       if (!group) {
@@ -244,7 +247,7 @@ export default function ConfigEditor({
           <Button
             type="primary"
             loading={pending}
-            disabled={editingDisabled}
+            disabled={saveDisabled}
             onClick={() => form.submit()}
           >
             Save desired configuration
@@ -327,7 +330,17 @@ export default function ConfigEditor({
                 </>
               }
             >
-              <Input.TextArea autoComplete="off" autoSize={{ minRows: 3, maxRows: 8 }} />
+              <Input.TextArea
+                autoComplete="off"
+                autoSize={{ minRows: 3, maxRows: 8 }}
+                disabled={editingDisabled || fileRead === 'reading'}
+                onChange={() => {
+                  if (fileRead === 'failed') {
+                    setFileRead('ready');
+                    setError('');
+                  }
+                }}
+              />
             </Form.Item>
             <input
               type="file"
@@ -337,18 +350,29 @@ export default function ConfigEditor({
                 const file = event.currentTarget.files?.[0];
                 event.currentTarget.value = '';
                 if (!file) return;
+                const selection = ++fileSelection.current;
                 if (file.size > 1024 * 1024) {
-                  setError('The profile exceeds 1 MiB.');
+                  setFileRead('failed');
+                  setError('The profile exceeds 1 MiB. Choose another file or edit the profile.');
                   return;
                 }
+                setFileRead('reading');
+                setError('');
                 try {
-                  form.setFieldValue('profile', await file.text());
-                  setError('');
+                  const profile = await file.text();
+                  if (selection !== fileSelection.current) return;
+                  form.setFieldValue('profile', profile);
+                  setFileRead('ready');
                 } catch {
-                  setError('The profile file could not be read.');
+                  if (selection !== fileSelection.current) return;
+                  setFileRead('failed');
+                  setError(
+                    'The profile file could not be read. Choose another file or edit the profile.',
+                  );
                 }
               }}
             />
+            {fileRead === 'reading' && <p role="status">Reading selected profile</p>}
             <Form.Item label="Connection DNS" name="dns" extra="Use a UDP or TCP resolver URI.">
               <Input placeholder="udp://192.0.2.53:53" autoComplete="off" />
             </Form.Item>
