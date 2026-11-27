@@ -6,6 +6,7 @@ on:
       - '.github/workflows/release.yml'
       - 'packaging/**'
       - 'tests/bootstrap_smoke.sh'
+      - 'tests/bootstrap_container.sh'
   push:
     tags: ['v*.*.*']
   workflow_dispatch:
@@ -59,7 +60,9 @@ jobs:
             "https://github.com/MHSanaei/3x-ui/releases/download/v3.11.0/x-ui-linux-$PANEL_ARCH.tar.gz"
           printf '%s  %s\n' "$PANEL_SHA" "$fixture/panel.tar.gz" | sha256sum --check --strict
           tar -xzf "$fixture/panel.tar.gz" -C "$fixture"
-          sudo bash tests/bootstrap_smoke.sh "$fixture/x-ui" dist/wgates-*.tar.gz
+          image=docker.io/library/ubuntu@sha256:562111b88caa79c71391c0c4d3c2114a7d5c35915c20561fd893cb1e07929e6b
+          setup='apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -qy --no-install-recommends systemd systemd-sysv tar gzip util-linux'
+          bash tests/bootstrap_container.sh "$image" "$setup" "$fixture/x-ui" dist/wgates-*.tar.gz
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: wgates-linux-${{ matrix.arch }}
@@ -98,34 +101,12 @@ jobs:
           SETUP: ${{ matrix.setup }}
         run: |
           fixture=$(mktemp -d "$RUNNER_TEMP/wgates-distribution.XXXXXXXX")
-          container=
-          cleanup() {
-            if [[ -n $container ]]; then docker rm -f -v "$container"; fi
-            rm -rf -- "$fixture"
-          }
-          trap cleanup EXIT
+          trap 'rm -rf -- "$fixture"' EXIT
           curl --fail --silent --show-error --location --retry 3 \
             --output "$fixture/panel.tar.gz" \
             https://github.com/MHSanaei/3x-ui/releases/download/v3.11.0/x-ui-linux-amd64.tar.gz
           printf '0ddfa4702f595442e2962acd81addc768fdacaa4ff2672c971a0463dae744916  %s\n' \
             "$fixture/panel.tar.gz" | sha256sum --check --strict
           tar -xzf "$fixture/panel.tar.gz" -C "$fixture"
-          container=$(docker run --detach --privileged --cgroupns=private --tmpfs /run --tmpfs /run/lock \
-            --sysctl net.ipv4.ip_forward=1 \
-            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/src,readonly" \
-            --mount "type=bind,source=$fixture,target=/fixture,readonly" \
-            "$IMAGE" /bin/bash -ec "$SETUP; exec /sbin/init")
-          for _ in {1..120}; do
-            if docker exec "$container" test -d /run/systemd/system 2>/dev/null; then break; fi
-            sleep 1
-          done
-          if ! docker exec "$container" test -d /run/systemd/system; then
-            docker logs "$container"
-            exit 1
-          fi
-          docker exec "$container" bash -ec '
-            ! command -v wg
-            cd /src
-            (cd dist && sha256sum --check --strict wgates-*.sha256)
-            bash tests/bootstrap_smoke.sh /fixture/x-ui dist/wgates-*.tar.gz wireguard
-          '
+          (cd dist && sha256sum --check --strict wgates-*.sha256)
+          bash tests/bootstrap_container.sh "$IMAGE" "$SETUP" "$fixture/x-ui" dist/wgates-*.tar.gz
