@@ -389,11 +389,22 @@ fn handle(
                     &json!({"api_version":API_VERSION,"error":"routing operation in progress; configuration writes are locked"}),
                 );
             }
-            match store.dispatch(&request) {
+            match store.dispatch(&request).and_then(|mut response| {
+                if command.starts_with("connection.") {
+                    routing.describe_connections(
+                        &mut response,
+                        store.config(),
+                        request.get("observed_digest"),
+                    )?;
+                }
+                if command == "group.list"
+                    && let Some(digest) = request.get("observed_digest")
+                {
+                    routing.describe_group_observations(&mut response, digest)?;
+                }
+                Ok(response)
+            }) {
                 Ok(mut response) => {
-                    if command.starts_with("connection.") {
-                        routing.describe_connections(&mut response, store.config());
-                    }
                     response["api_version"] = json!(API_VERSION);
                     response
                 }

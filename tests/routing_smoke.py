@@ -262,7 +262,7 @@ def checked(*args, **kwargs):
     return result
 
 
-def main(binary, panel_root, native_acceptance=None, extra_udp_targets=(), extra_udp_witnesses=()):
+def main(binary, panel_root, native_acceptance=None, extra_udp_targets=(), extra_udp_witnesses=(), panel_acceptance=None):
     if sys.platform != 'linux' or os.geteuid() != 0:
         raise SystemExit('Run only as root on a disposable Linux systemd host.')
     repo = Path(__file__).resolve().parent.parent
@@ -357,7 +357,9 @@ def main(binary, panel_root, native_acceptance=None, extra_udp_targets=(), extra
         for name, index, port in [('a', 213, 19001), ('b', 214, 19002)]:
             exits[name] = start_xray(name, dict(log=dict(loglevel='info'), inbounds=[dict(tag='vpn', listen=f'10.{index}.0.2', port=port, protocol='vless', settings=dict(clients=[dict(id=ids[name])], decryption='none'))], outbounds=[dict(protocol='freedom',settings=dict(finalRules=[dict(action='allow',ip=['10.220.0.0/24','10.221.0.0/24','fd42:220::/64','fd42:221::/64'])]))]))
         env = dict(os.environ, XUI_DB_FOLDER=str(work / 'panel-db'), XUI_LOG_FOLDER=str(work / 'panel-log'), XUI_BIN_FOLDER=str(panel_root / 'bin'), XUI_ENABLE_FAIL2BAN='false')
-        checked(str(panel_root / 'x-ui'), 'setting', '-port', '20530', '-listenIP', '127.0.0.1', '-webBasePath', '/', '-username', 'stand-operator', '-password', secrets.token_hex(24), env=env, cwd=panel_root)
+        panel_login = dict(username='stand-operator', password=secrets.token_hex(24))
+        env['WGATES_CONTROL_SOCKET'] = str(runtime / 'control.sock')
+        checked(str(panel_root / 'x-ui'), 'setting', '-port', '20530', '-listenIP', '127.0.0.1', '-webBasePath', '/', '-username', panel_login['username'], '-password', panel_login['password'], env=env, cwd=panel_root)
         result = checked(str(panel_root / 'x-ui'), 'setting', '-getApiToken', '-tokenName', prefix, env=env, cwd=panel_root)
         token = re.search(r'^apiToken:\s*(\S+)\s*$', result.stdout, re.M).group(1)
         panel = spawn('gateway', [panel_root / 'x-ui', 'run'], 'panel', env=env, cwd=panel_root)
@@ -456,8 +458,13 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
             time.sleep(0.1)
         control('panel','configure','--file','-',payload=dict(url='http://127.0.0.1:20531/',token=token))
         control('panel','preflight')
-        if native_acceptance is not None:
-            native_acceptance(dict(ns=ns, spawn=spawn, control=control, api=api, work=work, installed=installed, xray=xray, prefix=prefix, events=events, names=names, ids=ids, outbound=outbound))
+        acceptance = panel_acceptance or native_acceptance
+        if acceptance is not None:
+            acceptance(dict(
+                ns=ns, spawn=spawn, control=control, api=api, work=work, installed=installed,
+                xray=xray, prefix=prefix, events=events, names=names, ids=ids, outbound=outbound,
+                panel_login=panel_login, panel_token=token, unit=unit,
+            ))
             return
         groups,connections,rules={},{},{}
         for name,index,address,port in [('a',220,'10.213.0.2',19001),('b',221,'10.214.0.2',19002)]:

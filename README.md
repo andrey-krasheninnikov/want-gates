@@ -24,7 +24,7 @@ Both `vless://` and complete outbound JSON imports are supported. Import checks
 structure; apply checks the panel and actual traffic. The isolated local
 Linux/arm64 stand exercises two groups and the complete VLESS ingress path.
 OpenVPN and Forti use an optional privileged helper for isolated native authentication and
-routing. See [OpenVPN operation](docs/openvpn.md) and [Forti operation](docs/forti.md). The skill package and panel UI remain planned.
+routing. See [OpenVPN operation](docs/openvpn.md) and [Forti operation](docs/forti.md).
 
 ## Routing model
 
@@ -62,11 +62,12 @@ Xray restarts is not guaranteed.
 
 [Install wgates](docs/bootstrap.md) beside an existing 3x-ui 3.11.0 gateway.
 The Linux packages target systemd on x86_64 and aarch64.
+See [Want Gates in 3x-ui](docs/panel.md) for the embedded status page.
 
 ## Planned integrations
 
-A version-specific patch and panel build will add status and management to
-3x-ui. Warp Terminal integration will provide Workflows, a Tab Config, and MCP
+Management is planned for the embedded panel. Warp Terminal integration
+will provide Workflows, a Tab Config, and MCP
 tools. Local integrations will call `wgates` on a selected VPS over SSH.
 
 The future skill package will use the existing skills CLI:

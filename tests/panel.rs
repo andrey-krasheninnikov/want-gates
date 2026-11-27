@@ -942,3 +942,42 @@ fn exhausted_health_budget_records_a_failure_without_stopping_automation() {
         "probe_timed_out"
     );
 }
+
+#[test]
+fn compact_status_exposes_pending_recovery_without_a_selection_token() {
+    use std::os::unix::net::UnixStream;
+    let service = Service::start();
+    let panel = Panel::start();
+    configured_rule(&service, &panel);
+    let preview = ok(&service, &["routing", "preview"], None);
+    ok(
+        &service,
+        &[
+            "routing",
+            "apply",
+            preview["data"]["plan_id"].as_str().unwrap(),
+        ],
+        None,
+    );
+    let path = service.state.join("routing/journal.json");
+    let mut journal: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let interrupted = "00000000000000000000000000000015";
+    journal["phase"] = json!("applying");
+    journal["plan"]["id"] = json!(interrupted);
+    std::fs::write(&path, journal.to_string()).unwrap();
+
+    let mut stream = UnixStream::connect(&service.socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream
+        .write_all(b"{\"api_version\":1,\"command\":\"routing.status\",\"summary\":true}\n")
+        .unwrap();
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).unwrap();
+    let reply: Value = serde_json::from_str(&reply).unwrap();
+    let summary = &reply["data"];
+    assert_eq!(summary["recovery_required"], true);
+    assert!(summary["observed_digest"].is_null());
+    assert_eq!(summary["recovery_plan_id"], interrupted);
+}
