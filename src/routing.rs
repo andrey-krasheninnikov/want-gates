@@ -754,7 +754,7 @@ impl Service {
                 .ok_or_else(|| invalid("connection not found"))?;
             if !crate::native::is_native(&connection.protocol) {
                 return Err(invalid(
-                    "native session operations require OpenVPN, Forti or WireGuard",
+                    "native session operations require OpenVPN, Forti, WireGuard or NetBird",
                 ));
             }
             if connection.protocol == "wireguard"

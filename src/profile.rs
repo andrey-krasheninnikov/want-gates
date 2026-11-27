@@ -15,6 +15,7 @@ pub fn parse_for(protocol: &str, input: &str) -> io::Result<Value> {
         "openvpn" => crate::openvpn::parse(input),
         "forti" => crate::forti::parse(input),
         "wireguard" => crate::wireguard::parse(input),
+        "netbird" => crate::netbird::parse(input),
         _ => Err(invalid("protocol adapter unavailable")),
     }
 }

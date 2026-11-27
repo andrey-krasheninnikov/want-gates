@@ -134,7 +134,7 @@ OpenVPN profiles use `--protocol openvpn`; see [profile and authentication limit
 Forti profiles use `--protocol forti`; see [Forti operation](forti.md).
 Both native adapters report authentication separately from resource verification.
 [WireGuard](wireguard.md) uses the same helper with an isolated kernel interface.
-NetBird is planned.
+[NetBird](netbird.md) runs one isolated daemon per prepared connection.
 
 ### Persistent state
 

@@ -41,6 +41,7 @@ fn record(slot: u8, server: SocketAddr) -> io::Result<Record> {
                 protocol: protocol.into(),
             })
             .collect(),
+        netbird_hosts: BTreeMap::new(),
         namespace_identity: None,
         namespace_file: None,
         firewall_digest: None,
@@ -74,6 +75,7 @@ fn bridges() -> io::Result<()> {
         uid,
         gid,
         xray: executable(&xray)?,
+        netbird: PathBuf::new(),
         openfortivpn: PathBuf::new(),
         instances: BTreeMap::new(),
         reaping: Vec::new(),

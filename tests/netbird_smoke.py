@@ -201,7 +201,7 @@ class Company:
         self.name = company
         self.client = client
         self.gateway = context['names']['gateway']
-        self.bridge = bridge['namespace']
+        self.bridge = bridge['namespace'] if bridge else None
         self.router = context['names'][company]
         self.work = context['work'] / company
         self.work.mkdir(mode=0o700)
@@ -219,8 +219,10 @@ class Company:
             return self.api('/instance', pending=True)
 
         wait_for(f'{company} control plane', ready)
-        self.token = self.api('/setup', dict(email=f'owner@{company}.test', name='Stand owner',
-                                            password=secrets.token_urlsafe(32), create_pat=True)
+        self.email = f'owner@{company}.test'
+        self.password = secrets.token_urlsafe(32)
+        self.token = self.api('/setup', dict(email=self.email, name='Stand owner',
+                                            password=self.password, create_pat=True)
                               )['personal_access_token']
         self.lan = f'{context["prefix"]}-lan-{company}'
         stand.checked('ip', 'netns', 'add', self.lan)
@@ -253,11 +255,13 @@ class Company:
         self.gateway_port = 51820 + slot
         self.start(self.router, 'router', cleanup)
         self.enroll(self.router, 'router', self.router_port, 'nb-router')
-        self.start(self.bridge, 'gateway', cleanup)
-        self.enroll(self.bridge, 'gateway', self.gateway_port, 'wgates-tun')
+        if self.bridge:
+            self.start(self.bridge, 'gateway', cleanup)
+            self.enroll(self.bridge, 'gateway', self.gateway_port, 'wgates-tun')
         peers = {peer['name']: peer['id'] for peer in self.api('/peers')}
-        assert set(peers) == {'gateway', 'router'}, 'control plane peer inventory differs'
-        self.peer = peers['gateway']
+        expected_peers = {'gateway', 'router'} if self.bridge else {'router'}
+        assert set(peers) == expected_peers, 'control plane peer inventory differs'
+        self.peer = peers.get('gateway')
         group = next(group['id'] for group in self.api('/groups') if group['name'] == 'All')
         resource_group = self.api('/groups', dict(name='Private LAN', peers=[]))['id']
         network = self.api('/networks', dict(name='private', description='Company LAN'))['id']
@@ -326,9 +330,12 @@ class Company:
             raise RuntimeError(f'{self.name} NetBird {role} {command[0]} failed')
         return result.stdout
 
+    def setup_key(self, name):
+        return self.api('/setup-keys', dict(name=name, type='one-off', expires_in=86400,
+                                            auto_groups=[], usage_limit=1))['key']
+
     def enroll(self, namespace, role, port, interface):
-        key = self.api('/setup-keys', dict(name=role, type='one-off', expires_in=86400,
-                                           auto_groups=[], usage_limit=1))['key']
+        key = self.setup_key(role)
         path = self.work / 'setup-key'
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         try:

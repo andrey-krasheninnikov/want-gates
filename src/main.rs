@@ -6,6 +6,7 @@ mod management;
 mod native;
 #[cfg(target_os = "linux")]
 mod native_runtime;
+mod netbird;
 mod openvpn;
 #[cfg(target_os = "linux")]
 mod openvpn_auth;
@@ -43,7 +44,7 @@ Usage:
   wgates group create --name NAME [--socket PATH]
   wgates group list|show ID|delete ID [--socket PATH]
   wgates group update ID [--name NAME] [--primary CONNECTION_ID|-] [--probe-file PATH|-] [--fallbacks ID,...|-] [--healthcheck-file PATH|-]
-  wgates connection import --group ID --name NAME --protocol vless|openvpn|forti|wireguard --file PATH|- [--dns URI] [--capabilities LIST|all|none]
+  wgates connection import --group ID --name NAME --protocol vless|openvpn|forti|wireguard|netbird --file PATH|- [--dns URI] [--capabilities LIST|all|none]
   wgates connection verify ID
   wgates connection login ID [--file PATH|-] [--remember]
   wgates connection logout ID|restart ID|forget-auth ID

@@ -14,12 +14,18 @@ fi
 [ "$#" -eq 2 ] || usage
 pr=$1
 merge=$2
-[ "$pr" = 31 ] || usage
+case "$pr" in ''|*[!0-9]*) usage ;; esac
 case "$merge" in ''|*[!0-9a-f]*) usage ;; esac
 [ "$(printf '%s' "$merge" | wc -c | tr -d ' ')" -eq 40 ] || usage
 
 repo=andrey-krasheninnikov/want-gates
-branch=feat/11-netbird-isolation
+if [ "$pr" = 31 ]; then
+    task=11
+    branch=feat/11-netbird-isolation
+else
+    task=12
+    branch=feat/12-netbird-routing
+fi
 case "$(git remote get-url origin)" in
     "https://github.com/$repo.git"|"git@github.com:$repo.git") ;;
     *) echo 'Unexpected origin' >&2; exit 1 ;;
@@ -28,9 +34,14 @@ live=$(gh pr view "$pr" --repo "$repo" --json state,baseRefName,headRefName,head
     --jq '[.state, .baseRefName, .headRefName, .headRefOid, .mergeCommit.oid, (.isCrossRepository|tostring), .headRepositoryOwner.login] | join(" ")')
 head=$(git rev-parse "$merge^2")
 [ "$live" = "MERGED main $branch $head $merge false andrey-krasheninnikov" ] || {
-    echo 'PR, merge SHA, or source revision does not match issue #11' >&2
+    echo "PR, merge SHA, or source revision does not match issue #$task" >&2
     exit 1
 }
+if [ "$task" = 12 ]; then
+    linked=$(gh pr view "$pr" --repo "$repo" --json closingIssuesReferences \
+        --jq '[.closingIssuesReferences[] | select(.number == 12 and .repository.name == "want-gates" and .repository.owner.login == "andrey-krasheninnikov")] | length')
+    [ "$linked" = 1 ] || { echo 'Adapter PR must close issue #12' >&2; exit 1; }
+fi
 if git rev-parse --verify -q "$merge^3" >/dev/null; then
     echo 'Expected a merge with two parents' >&2
     exit 1
@@ -42,9 +53,10 @@ remote=$(git ls-remote --exit-code origin refs/heads/main | cut -f1)
 }
 git diff --name-status "$merge^1" "$merge"
 if "$apply"; then
-    [ "$(git branch --show-current)" = revert/11-netbird-isolation ] && \
+    rollback="revert/${branch#feat/}"
+    [ "$(git branch --show-current)" = "$rollback" ] && \
         [ -z "$(git status --porcelain)" ] || {
-        echo 'Use a clean revert/11-netbird-isolation worktree' >&2
+        echo "Use a clean $rollback worktree" >&2
         exit 1
     }
     git revert --no-edit -m 1 "$merge"

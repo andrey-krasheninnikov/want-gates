@@ -7,7 +7,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
 pub fn is_native(protocol: &str) -> bool {
-    matches!(protocol, "openvpn" | "forti" | "wireguard")
+    matches!(protocol, "openvpn" | "forti" | "wireguard" | "netbird")
 }
 
 pub fn probe_ready(authentication: &str) -> bool {
