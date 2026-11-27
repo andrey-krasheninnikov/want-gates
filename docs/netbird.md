@@ -90,16 +90,26 @@ reconnects the saved peer and requires fresh traffic checks. A changed profile
 creates a new generation that requires enrollment. After a disconnected or
 expired session, repeat the appropriate login or restart the connection.
 
+Log out to pause the connection and remove its network resources.
+
 ```sh
 wgates connection logout CONNECTION_ID
+```
+
+Restart to clear the pause and reconnect with the saved peer identity.
+
+```sh
 wgates connection restart CONNECTION_ID
+```
+
+To remove the saved identity, log out before running `forget-auth`.
+
+```sh
+wgates connection logout CONNECTION_ID
 wgates connection forget-auth CONNECTION_ID
 ```
 
-Logout pauses the connection and removes its network resources. Restart uses
-the saved peer identity and clears the pause. To forget a local identity, first
-log out, then run `forget-auth`. Delete a retired peer in its NetBird control
-plane if it also needs remote revocation.
+Delete the retired peer in its NetBird control plane for remote revocation.
 
 ## Validate and roll back
 
