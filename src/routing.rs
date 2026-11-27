@@ -857,6 +857,20 @@ impl Service {
         }
     }
 }
+fn check_native_xray(
+    native: &crate::native::Client,
+    panel_status: &Value,
+    protocols: Value,
+) -> io::Result<()> {
+    let status = native.call(json!({"command":"preflight","protocols":protocols}))?;
+    if status["xray"] != panel_status["xray_version"] {
+        return Err(invalid(
+            "native runtime and the panel must use the same supported Xray version",
+        ));
+    }
+    Ok(())
+}
+
 fn execute(
     root: &Path,
     command: &str,
@@ -965,7 +979,7 @@ fn execute(
                 "unfinished apply requires routing recover before another preview",
             ));
         }
-        client.running()?;
+        let panel_status = client.running()?;
         let base = client.read()?;
         let working: Option<Working> = optional(&root.join("working.json"))?;
         let ingress = validate(&input, &base, working.as_ref())?;
@@ -1040,7 +1054,7 @@ fn execute(
             native_intents.insert(connection.id.clone(), generation);
         }
         if !native_intents.is_empty() {
-            native.call(json!({"command":"preflight","protocols":protocols}))?;
+            check_native_xray(native, &panel_status, json!(protocols))?;
         }
         let plan = Plan {
             id: random_id()?,
@@ -1116,7 +1130,10 @@ fn execute(
         )?;
         return Ok(observation(&plan.id, &w.config, &w.snapshot, &w.matrix));
     }
-    client.running()?;
+    let panel_status = client.running()?;
+    if !plan.native_intents.is_empty() {
+        check_native_xray(native, &panel_status, json!([]))?;
+    }
     if client.read()? != plan.base {
         return Err(invalid(
             "observed panel drift; preview again; no changes applied",
@@ -1349,6 +1366,7 @@ fn execute(
             &native_observations,
             &effective,
             &matrix,
+            || check_native_xray(native, &client.wait_running()?, json!([])),
         )?;
         verify(
             &client,
@@ -1359,6 +1377,12 @@ fn execute(
             &journal.plan.ingress,
             Some(&health),
         )?;
+        if native_observations
+            .iter()
+            .any(|(id, state)| crate::native::should_admit(id, state, &effective, &matrix))
+        {
+            check_native_xray(native, &client.wait_running()?, json!([]))?;
+        }
         let mut working = Working {
             plan_id: journal.plan.id.clone(),
             config: input.config.clone(),
@@ -1761,18 +1785,41 @@ fn recover(
     }
     let runtime_error = if let Some(previous) = &journal.previous {
         (|| -> io::Result<()> {
-        let observations = crate::native::observe(native, &previous.native)?;
-        if observations.iter().any(|(id,state)|previous.native_observations.get(id).is_none_or(|old|old.session!=state.session || old.dns!=state.dns)) { return Err(invalid("previous native session changed; resource verification requires a fresh preview and apply")); }
-        crate::native::admit(native, &previous.native, &observations, &previous.effective_config(), &previous.matrix)?;
-        verify(
-            client,
-            &journal.plan.base,
-            &previous.effective_config(),
-            &previous.proxy,
-            &previous.matrix,
-            &journal.plan.ingress,
-            None,
-        )
+            let observations = crate::native::observe(native, &previous.native)?;
+            if observations.iter().any(|(id, state)| {
+                previous
+                    .native_observations
+                    .get(id)
+                    .is_none_or(|old| old.session != state.session || old.dns != state.dns)
+            }) {
+                return Err(invalid(
+                    "Previous native session changed. Preview and apply again to verify resources.",
+                ));
+            }
+            let effective = previous.effective_config();
+            crate::native::admit(
+                native,
+                &previous.native,
+                &observations,
+                &effective,
+                &previous.matrix,
+                || check_native_xray(native, &client.wait_running()?, json!([])),
+            )?;
+            verify(
+                client,
+                &journal.plan.base,
+                &effective,
+                &previous.proxy,
+                &previous.matrix,
+                &journal.plan.ingress,
+                None,
+            )?;
+            if observations.iter().any(|(id, state)| {
+                crate::native::should_admit(id, state, &effective, &previous.matrix)
+            }) {
+                check_native_xray(native, &client.wait_running()?, json!([]))?;
+            }
+            Ok(())
         })()
         .err()
         .map(|error| error.to_string())
@@ -2356,6 +2403,7 @@ fn health_cycle(
             &working.native_observations,
             &effective,
             &matrix,
+            || check_native_xray(native, &client.wait_running()?, json!([])),
         )
         .and_then(|()| {
             verify(

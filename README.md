@@ -13,7 +13,8 @@ Optional target-resource checks switch data and DNS together within a group.
 
 The Rust binary manages groups, VLESS/OpenVPN/Forti profiles, domain/IP rules and connection
 DNS through a Unix
-socket. A preview and explicit apply configure 3x-ui 3.8.5 with Xray 26.9.9.
+socket. A preview and explicit apply configure 3x-ui 3.11.0 with Xray 26.10.21.
+The existing 3x-ui 3.8.5 and Xray 26.9.9 pair also works with the CLI.
 TCP/UDP over IPv4/IPv6 are verified separately; unavailable combinations are
 blocked. Operators can limit each connection and verify a prepared connection
 without changing primary. See [service operation](docs/service.md) and
@@ -23,8 +24,7 @@ Both `vless://` and complete outbound JSON imports are supported. Import checks
 structure; apply checks the panel and actual traffic. The isolated local
 Linux/arm64 stand exercises two groups and the complete VLESS ingress path.
 OpenVPN and Forti use an optional privileged helper for isolated native authentication and
-routing. See [OpenVPN operation](docs/openvpn.md) and [Forti operation](docs/forti.md). Bootstrap, the skill package
-and panel UI remain planned. No binary release is published.
+routing. See [OpenVPN operation](docs/openvpn.md) and [Forti operation](docs/forti.md). The skill package and panel UI remain planned.
 
 ## Routing model
 
@@ -58,19 +58,10 @@ group.
 Forti supports separately verified TCP/UDP over IPv4; IPv6 stays blocked. Session continuity during path changes or
 Xray restarts is not guaranteed.
 
-## Planned operation and installation
+## Installation
 
-The Rust binary provides a CLI and local systemd service connected through
-a Unix socket. Routing changes require a preview and an explicit apply.
-
-Bootstrap will install Want Gates beside an existing compatible 3x-ui, starting
-with MHSanaei/3x-ui 3.8.5. It will preserve unrelated panel settings and check
-the result of configuration changes.
-
-The target is Linux with systemd on `x86_64` and `aarch64`. Dependency
-installation is planned for `apt`, `dnf`, `pacman`, and `zypper`;
-other systems receive preflight results and manual instructions. Compatibility
-must be demonstrated for each supported environment.
+[Install wgates](docs/bootstrap.md) beside an existing 3x-ui 3.11.0 gateway.
+The Linux packages target systemd on x86_64 and aarch64.
 
 ## Planned integrations
 

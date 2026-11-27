@@ -257,25 +257,42 @@ pub fn effective(
     }
     config
 }
+pub fn should_admit(
+    id: &str,
+    state: &Observation,
+    config: &crate::store::Config,
+    matrix: &crate::routing::Matrix,
+) -> bool {
+    probe_ready(&state.authentication)
+        && config.groups.iter().any(|g| {
+            g.primary.as_deref() == Some(id)
+                && matrix
+                    .get(&g.id)
+                    .is_some_and(|m| m.values().any(|s| s == "verified"))
+        })
+}
+
 pub fn admit(
     client: &Client,
     prepared: &Generations,
     observations: &BTreeMap<String, Observation>,
     config: &crate::store::Config,
     matrix: &crate::routing::Matrix,
+    before_open: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
-    for (id, generation) in prepared {
-        let state = observations
-            .get(id)
-            .ok_or_else(|| invalid("native observation missing"))?;
-        let admitted = probe_ready(&state.authentication)
-            && config.groups.iter().any(|g| {
-                g.primary.as_ref() == Some(id)
-                    && matrix
-                        .get(&g.id)
-                        .is_some_and(|m| m.values().any(|s| s == "verified"))
-            });
-        if admitted != state.admitted {
+    let mut before_open = Some(before_open);
+    // A failed prerequisite for opening a gate must not keep unselected gates open.
+    for admitted in [false, true] {
+        for (id, generation) in prepared {
+            let state = observations
+                .get(id)
+                .ok_or_else(|| invalid("native observation missing"))?;
+            if state.admitted == admitted || should_admit(id, state, config, matrix) != admitted {
+                continue;
+            }
+            if admitted && let Some(check) = before_open.take() {
+                check()?;
+            }
             client.call(json!({"command":"admit","generation":generation.generation,"session":state.session,"admitted":admitted}))?;
         }
     }

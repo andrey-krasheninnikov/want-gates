@@ -8,7 +8,7 @@ and probes; its application path stays closed until resource checks pass.
 ## Prerequisites and manual installation
 
 Install the control service using [service operation](service.md). Native routing
-requires Linux with systemd, Xray 26.9.9, iproute2, nftables, `getent` and
+requires Linux with systemd, the Xray version for the [supported panel pair](routing.md), iproute2, nftables, `getent` and
 `sysctl`. OpenVPN connections also require OpenVPN 2.6.x and `/dev/net/tun`.
 Executables and their parent directories must be controlled by root and unwritable
 by other users. The default Xray path is `/usr/local/x-ui/bin/xray-linux-arm64`

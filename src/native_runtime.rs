@@ -164,6 +164,7 @@ struct Runtime {
     uid: u32,
     gid: u32,
     xray: PathBuf,
+    xray_metadata: Option<fs::Metadata>,
     openfortivpn: PathBuf,
     netbird: PathBuf,
     instances: BTreeMap<String, Instance>,
@@ -696,6 +697,24 @@ impl Runtime {
             record.prepared.id, record.prepared.profile_digest
         ))
     }
+    fn check_xray_metadata(&self) -> io::Result<()> {
+        if self.xray_metadata.is_none() {
+            return Ok(());
+        }
+        let current_xray = fs::metadata(&self.xray)?;
+        if self.xray_metadata.as_ref().is_some_and(|loaded| {
+            loaded.dev() != current_xray.dev()
+                || loaded.ino() != current_xray.ino()
+                || loaded.len() != current_xray.len()
+                || loaded.mtime() != current_xray.mtime()
+                || loaded.mtime_nsec() != current_xray.mtime_nsec()
+        }) {
+            return Err(invalid(
+                "Native Xray changed. Restart wgates-native.service",
+            ));
+        }
+        Ok(())
+    }
     fn preflight(&self, protocols: &[String]) -> io::Result<Value> {
         for path in [
             "/usr/sbin/ip",
@@ -711,23 +730,29 @@ impl Runtime {
             let (name, version) = self.client_version(protocol)?;
             versions.insert(name.into(), json!(version));
         }
-        if !command(
+        self.check_xray_metadata()?;
+        let version_output = command(
             self.xray
                 .to_str()
                 .ok_or_else(|| invalid("invalid Xray executable path"))?,
             &["version"],
-        )?
-        .contains("26.9.9")
-        {
-            return Err(invalid("native runtime requires Xray 26.9.9"));
-        }
+        )?;
+        let xray = version_output
+            .split_whitespace()
+            .nth(1)
+            .filter(|version| {
+                crate::panel::SUPPORTED_STACKS
+                    .iter()
+                    .any(|(_, xray)| xray == version)
+            })
+            .ok_or_else(|| invalid("native runtime requires Xray 26.10.21 or 26.9.9"))?;
         if fs::read_to_string("/proc/sys/net/ipv4/ip_forward")?.trim() != "1" {
             return Err(invalid(
                 "IPv4 forwarding disabled; enable net.ipv4.ip_forward manually after checking host routing",
             ));
         }
         Ok(
-            json!({"clients":versions,"xray":"26.9.9","ipv4_forwarding":true,"ipv6_forwarding":fs::read_to_string("/proc/sys/net/ipv6/conf/all/forwarding").ok().is_some_and(|s|s.trim()=="1")}),
+            json!({"clients":versions,"xray":xray,"ipv4_forwarding":true,"ipv6_forwarding":fs::read_to_string("/proc/sys/net/ipv6/conf/all/forwarding").ok().is_some_and(|s|s.trim()=="1")}),
         )
     }
     fn client_version(&self, protocol: &str) -> io::Result<(&'static str, String)> {
@@ -1471,6 +1496,9 @@ impl Runtime {
             return Ok(());
         }
         stop(&mut instance.proxy);
+        if gate {
+            self.check_xray_metadata()?;
+        }
         let p = &instance.record.prepared;
         let inbounds = [("data", p.data_port, false), ("diagnostic", p.probe_port, true)].into_iter().map(|(tag, port, diagnostic)| json!({"tag":tag,"listen":p.address.to_string(),"port":port,"protocol":"vless","settings":{"clients":[{"id":p.bridge_id(diagnostic)}],"decryption":"none"},"streamSettings":{"network":"raw","security":"none"}})).collect::<Vec<_>>();
         let value = json!({"log":{"loglevel":"none"},"inbounds":inbounds,"outbounds":[{"tag":"tunnel","protocol":"freedom","settings":{"finalRules":[{"action":"allow","ip":["0.0.0.0/0","::/0"]}]}},{"tag":"block","protocol":"blackhole"}],"routing":{"domainStrategy":"AsIs","rules":[{"type":"field","domain":["regexp:.+"],"outboundTag":"block"},{"type":"field","inboundTag":["data"],"outboundTag":if gate{"tunnel"}else{"block"}}]}});
@@ -2060,6 +2088,9 @@ impl Runtime {
                         "native session changed; repeat resource verification",
                     ));
                 }
+                if admitted {
+                    self.check_xray_metadata()?;
+                }
                 i.admitted_session = None;
                 if authenticated
                     && i.netbird
@@ -2353,6 +2384,11 @@ pub fn run(mut args: impl Iterator<Item = OsString>, cleanup_only: bool) -> io::
         directory,
         uid,
         gid,
+        xray_metadata: if cleanup_only {
+            None
+        } else {
+            Some(fs::metadata(&xray)?)
+        },
         xray,
         openfortivpn,
         netbird,

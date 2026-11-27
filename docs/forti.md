@@ -10,7 +10,8 @@ resolver writes are disabled; Want Gates installs the private PPP route.
 
 Install the control service and optional helper using [OpenVPN operation](openvpn.md).
 Forti requires Linux with systemd, IPv4 forwarding already enabled, `/dev/ppp`,
-pppd 2.4.9, openfortivpn 1.21.x through 1.24.x, Xray 26.9.9, iproute2, nftables
+pppd 2.4.9, openfortivpn 1.21.x through 1.24.x, the Xray version for the
+[supported panel pair](routing.md), iproute2, nftables
 and the common native helper tools. Executables and their parents must be
 controlled by root. OpenVPN itself is required only for OpenVPN connections.
 
@@ -20,7 +21,7 @@ or newer. To use a separately installed client, replace both `ExecStart` and
 `ExecStopPost` in a helper drop-in with the packaged commands plus
 `--openfortivpn-bin /absolute/path/to/openfortivpn`. Install and validate that
 client outside the private mount targets, including root's home, `/run` and
-`/etc/ppp`. Bootstrap installation remains planned.
+`/etc/ppp`. See [bootstrap](bootstrap.md#optional-native-protocols).
 
 ## Profiles and routing
 

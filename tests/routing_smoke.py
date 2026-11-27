@@ -267,7 +267,8 @@ def main(binary, panel_root, native_acceptance=None, extra_udp_targets=(), extra
     repo = Path(__file__).resolve().parent.parent
     binary, panel_root = Path(binary).resolve(strict=True), Path(panel_root).resolve(strict=True)
     xray = next((panel_root / 'bin').glob('xray-linux-*'))
-    assert '26.9.9' in checked(str(xray), 'version').stdout
+    xray_version = checked(str(xray), 'version').stdout.split()[1]
+    panel_version = {'26.9.9': '3.8.5', '26.10.21': '3.11.0'}[xray_version]
     prefix = f'wgates-routing-{os.getpid()}'
     names = {key: f'{prefix}-{key}' for key in ['client', 'gateway', 'a', 'b', 'resource']}
     unit = Path('/run/systemd/system') / f'{prefix}.service'
@@ -379,7 +380,10 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
             assert panel.poll() is None, 'panel stopped during startup'
             try:
                 status=api('server/status')
-                if status['xray']['state']=='running' and status['xray']['version']=='26.9.9':break
+                if (status['xray']['state']=='running'
+                        and status['xray']['version'].lstrip('v')==xray_version):
+                    assert status['panelVersion'].lstrip('v')==panel_version
+                    break
             except (RuntimeError,KeyError,TypeError): pass
             assert time.monotonic()<deadline,'panel did not become ready'
             time.sleep(0.2)

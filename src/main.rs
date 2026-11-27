@@ -60,7 +60,8 @@ Usage:
   wgates --version
 
 All management commands accept --socket PATH. Saving changes desired state only.
-Routing requires 3x-ui 3.8.5 and Xray 26.9.9; apply explicitly names a reviewed plan.
+Routing supports 3x-ui 3.11.0 with Xray 26.10.21 and 3.8.5 with 26.9.9.
+Apply explicitly names a reviewed plan.
 
 Defaults:
   --socket     /run/wgates/control.sock

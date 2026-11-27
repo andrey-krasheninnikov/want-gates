@@ -4,7 +4,8 @@ Status: accepted design; deployment is planned.
 
 ## Context
 
-The baseline is MHSanaei/3x-ui 3.8.5. Its Xray API reads and replaces the saved
+The baseline is MHSanaei/3x-ui 3.11.0 with Xray 26.10.21.
+The control service also accepts existing 3x-ui 3.8.5 and Xray 26.9.9 deployments. Its Xray API reads and replaces the saved
 template. Updating the template can apply changes live or restart Xray.
 A failed application can leave saved and running state different.
 
@@ -44,7 +45,7 @@ version is not supported merely because its API looks similar.
 
 References:
 
-- [3x-ui 3.8.5](https://github.com/MHSanaei/3x-ui/releases/tag/v3.8.5)
-- [Xray controller](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/controller/xray_setting.go)
-- [Runtime application](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/internal/web/service/xray.go)
-- [Adding a panel page](https://github.com/MHSanaei/3x-ui/blob/v3.8.5/CONTRIBUTING.md)
+- [3x-ui 3.11.0](https://github.com/MHSanaei/3x-ui/releases/tag/v3.11.0)
+- [Xray controller](https://github.com/MHSanaei/3x-ui/blob/v3.11.0/internal/web/controller/xray_setting.go)
+- [Runtime application](https://github.com/MHSanaei/3x-ui/blob/v3.11.0/internal/web/service/xray.go)
+- [Adding a panel page](https://github.com/MHSanaei/3x-ui/blob/v3.11.0/CONTRIBUTING.md)

@@ -253,7 +253,7 @@ fn endpoint_mtu(record: &Record) -> Option<u64> {
                 "iif",
                 &record.interface,
                 "ipproto",
-                "udp",
+                "17", // UDP works without the system's protocol name database.
                 "dport",
                 &endpoint.port.to_string(),
             ],

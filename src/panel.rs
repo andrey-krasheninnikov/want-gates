@@ -9,6 +9,8 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 pub const MAX_PANEL: usize = 16 * 1024 * 1024;
+pub(crate) const SUPPORTED_STACKS: [(&str, &str); 2] =
+    [("3.8.5", "26.9.9"), ("3.11.0", "26.10.21")];
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -166,21 +168,18 @@ impl Client {
     }
     pub fn status(&self) -> io::Result<Value> {
         let value = self.request("server/status", None)?;
-        if value["panelVersion"]
-            .as_str()
-            .map(|s| s.trim_start_matches('v'))
-            != Some("3.8.5")
-            || value["xray"]["version"]
-                .as_str()
-                .map(|s| s.trim_start_matches('v'))
-                != Some("26.9.9")
-        {
-            return Err(invalid(
-                "incompatible deployment; require 3x-ui 3.8.5 and Xray 26.9.9",
-            ));
-        }
+        let (panel, xray) = SUPPORTED_STACKS
+            .into_iter()
+            .find(|&(panel, xray)| {
+                value["panelVersion"].as_str().map(|s| s.trim_start_matches('v')) == Some(panel)
+                    && value["xray"]["version"].as_str().map(|s| s.trim_start_matches('v'))
+                        == Some(xray)
+            })
+            .ok_or_else(|| invalid(
+                "incompatible deployment; require 3x-ui 3.11.0 with Xray 26.10.21 or 3.8.5 with Xray 26.9.9",
+            ))?;
         Ok(
-            json!({"panel_version":"3.8.5","xray_version":"26.9.9","running":value["xray"]["state"]=="running",
+            json!({"panel_version":panel,"xray_version":xray,"running":value["xray"]["state"]=="running",
             "runtime_error": value["xray"]["errorMsg"].as_str().is_none_or(|s|!s.is_empty())}),
         )
     }
@@ -192,6 +191,19 @@ impl Client {
             ));
         }
         Ok(status)
+    }
+    pub fn wait_running(&self) -> io::Result<Value> {
+        let client = self.until(Instant::now() + Duration::from_secs(5));
+        let interval = Duration::from_millis(100);
+        let mut result = client.running();
+        while result.is_err()
+            && !client.cancelled()
+            && client.deadline.saturating_duration_since(Instant::now()) > interval
+        {
+            std::thread::sleep(interval);
+            result = client.running();
+        }
+        result
     }
     pub fn read(&self) -> io::Result<Snapshot> {
         let value = self.request("xray/", Some(&[]))?;

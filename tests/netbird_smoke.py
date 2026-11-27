@@ -311,12 +311,23 @@ class Company:
     def state(self, role):
         return self.work / role
 
+    def isolated_client_args(self, state, arguments):
+        # Fixture peers also need private iproute2 metadata.
+        if not Path('/etc/iproute2').is_dir():
+            return arguments
+        routing = state / 'iproute2'
+        routing.mkdir(mode=0o700, exist_ok=True)
+        (routing / 'rt_tables').touch(exist_ok=True)
+        return ['unshare', '--mount', '--propagation', 'private', '/bin/sh', '-ec',
+                'mount --bind "$1" /etc/iproute2; shift; exec "$@"',
+                'netbird-fixture', str(routing), *map(str, arguments)]
+
     def start(self, namespace, role, cleanup):
         state = self.state(role)
         state.mkdir(mode=0o700, exist_ok=True)
         args = [self.client, '--daemon-addr', f'unix://{state}/control.sock',
                 '--config', state / 'config.json', '--log-file', 'console', 'service', 'run']
-        process = self.spawn(namespace, args, role, cleanup,
+        process = self.spawn(namespace, self.isolated_client_args(state, args), role, cleanup,
                              dict(self.env, NB_STATE_DIR=str(state), NB_DISABLE_SSH_CONFIG='true'))
         def ready():
             if process.poll() is not None:
@@ -329,9 +340,10 @@ class Company:
 
     def cli(self, namespace, role, *command):
         state = self.state(role)
-        result = stand.run('ip', 'netns', 'exec', namespace, str(self.client),
-                           '--daemon-addr', f'unix://{state}/control.sock',
-                           '--log-file', 'console', *map(str, command),
+        args = [self.client, '--daemon-addr', f'unix://{state}/control.sock',
+                '--log-file', 'console', *command]
+        result = stand.run('ip', 'netns', 'exec', namespace,
+                           *self.isolated_client_args(state, args),
                            env=dict(self.env, NB_STATE_DIR=str(state)), timeout=50)
         if result.returncode:
             raise RuntimeError(f'{self.name} NetBird {role} {command[0]} failed')
