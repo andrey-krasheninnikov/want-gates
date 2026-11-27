@@ -272,7 +272,8 @@ recover() {
         systemctl daemon-reload || return 1
         for unit in "${units[@]}"; do
             if [[ -f $pending/active/$unit ]]; then
-                systemctl reset-failed "$unit" && systemctl start "$unit" || return 1
+                if systemctl is-failed --quiet "$unit"; then systemctl reset-failed "$unit" || return 1; fi
+                systemctl start "$unit" || return 1
             fi
         done
         if [[ -f $pending/active/wgates.service ]]; then wait_ready || return 1; fi
