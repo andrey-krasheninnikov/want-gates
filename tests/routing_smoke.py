@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run real VLESS traffic only on a disposable local Linux systemd host."""
 import argparse
+import copy
 import grp
 import ipaddress
 import json
@@ -416,6 +417,7 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
         uid=pwd.getpwnam(prefix).pw_uid
         text=(repo/'packaging/systemd/wgates.service').read_text().replace('wgates',prefix)
         text=text.replace('[Service]','[Service]\nNetworkNamespacePath=/run/netns/'+names['gateway'])
+        text=text.replace(' serve --socket ', f' serve --xray {xray} --socket ')
         if native_acceptance is not None:
             text=text.replace(' serve --socket ', f' serve --native-socket /run/{prefix}-native/control.sock --socket ')
         with unit.open('x') as file:
@@ -492,6 +494,22 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
         finally:
             probe_fault.unlink()
         assert api('xray/',{})==before_diagnose
+        observed=json.loads(before_diagnose) if isinstance(before_diagnose,str) else before_diagnose
+        drifted=copy.deepcopy(observed['xraySetting'])
+        alternate=outbound('10.214.0.2',19002,ids['b'])
+        target_tag='wgates-out-'+connections['a']
+        for index,item in enumerate(drifted['outbounds']):
+            if item['tag']==target_tag:
+                drifted['outbounds'][index]=dict(alternate,tag=target_tag)
+                break
+        else:
+            raise AssertionError('missing selected outbound')
+        api('xray/update',dict(xraySetting=json.dumps(drifted),outboundTestUrl=observed['outboundTestUrl']))
+        try:
+            mismatch=control('routing','diagnose','10.220.0.10','--capability','tcp_ipv4','--probe')['data']
+            assert mismatch['probe']['state']=='skipped' and mismatch['probe']['reason']=='panel_drift',mismatch
+        finally:
+            api('xray/update',dict(xraySetting=json.dumps(observed['xraySetting']),outboundTestUrl=observed['outboundTestUrl']))
 
         def tcp(address,expected,positive=True):
             marker='/'+secrets.token_hex(12)

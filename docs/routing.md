@@ -58,6 +58,8 @@ Diagnose uses the same domain and CIDR precedence as routing. Specify one of
 the requested family. The response shows the desired decision and the last
 observed decision, with the matching rule, ordered connection candidates,
 capability limits, authentication state, DNS behavior, and health results.
+Each list contains up to 64 candidates plus the selected connection if it lies
+later in the list. The count includes all candidates.
 A decision is unmatched, assigned to a group, or blocked. The observed
 revision and `runtime` field show whether the saved policy changed or the
 service is busy, unapplied, unverified, or awaiting recovery.
@@ -67,8 +69,11 @@ a configured resource through the last observed selected connection. It uses
 the group's applicable healthcheck or the connection probes already configured
 for that group. The probe result is separate from the routing decision and
 uses the configured targets. It is skipped if the applied revision or
-selection is unavailable. Diagnosis and probing leave the saved configuration
-and observations in place.
+selection is unavailable. On Linux, the service compares the selected outbound
+with the running Xray handler before and after the probe. Drift and unavailable
+handler inspection prevent a confirmed result. The service uses the installed
+Xray executable. Set `wgates serve --xray PATH` for a custom installation.
+Diagnosis and probing leave the saved configuration and observations in place.
 
 Logs return recent operations and outcomes with timestamps. The service
 retains the latest 128 events in memory and returns 20 by default. Restarting

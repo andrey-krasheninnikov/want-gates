@@ -674,9 +674,15 @@ pub struct Service {
     reload_health: bool,
     native: crate::native::Client,
     events: diagnostics::Events,
+    xray: PathBuf,
 }
 impl Service {
-    pub fn new(state: &Path, stopping: Arc<AtomicBool>, native_socket: &Path) -> io::Result<Self> {
+    pub fn new(
+        state: &Path,
+        stopping: Arc<AtomicBool>,
+        native_socket: &Path,
+        xray: &Path,
+    ) -> io::Result<Self> {
         let root = state.join("routing");
         match std::fs::symlink_metadata(&root) {
             Ok(_) => secure_directory(&root, 0o700, 0o077)?,
@@ -712,6 +718,7 @@ impl Service {
             reload_health: true,
             native: crate::native::Client::new(native_socket),
             events: diagnostics::Events::default(),
+            xray: xray.to_owned(),
         })
     }
     pub fn busy(&self) -> bool {

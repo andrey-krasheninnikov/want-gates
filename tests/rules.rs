@@ -436,3 +436,35 @@ fn routing_logs_report_failed_operations_without_profile_contents() {
             .success()
     );
 }
+
+#[test]
+fn routing_status_redacts_saved_internal_errors() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let service = Service::start();
+    let sentinel = "synthetic-private-auth-value";
+    let observation = serde_json::json!({
+        "state": "restored_runtime_unverified",
+        "running_revision": null,
+        "runtime_verification_error": format!("native process reported {sentinel}"),
+        "capabilities": {"g1":{"tcp_ipv4":format!("probe_failed: {sentinel}")}}
+    });
+    let directory = service.state.join("routing");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&directory)
+        .unwrap();
+    let path = directory.join("status.json");
+    std::fs::write(&path, observation.to_string()).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let status = ok(&service, &["routing", "status"], None);
+    let saved = &status["data"]["last_observation"];
+    assert_eq!(
+        saved["runtime_verification_error"],
+        "runtime_verification_failed"
+    );
+    assert_eq!(saved["capabilities"]["g1"]["tcp_ipv4"], "probe_failed");
+    assert!(!status.to_string().contains(sentinel));
+    assert!(std::fs::read_to_string(path).unwrap().contains(sentinel));
+}

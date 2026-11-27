@@ -9,6 +9,7 @@ use std::{
     collections::VecDeque,
     io,
     net::IpAddr,
+    path::Path,
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -103,7 +104,7 @@ impl Destination {
         let hostname = matches!(self, Self::Host(_));
         let Some(rule) = self.rule(config) else {
             return json!({"decision":"unmatched","reason":"no_rule","rule_id":null,"group_id":null,
-                "connection":null,"candidates":[],"dns":{"mode":if hostname{"panel_default"}else{"not_required"}}});
+                "connection":null,"candidates":[],"candidate_count":0,"dns":{"mode":if hostname{"panel_default"}else{"not_required"}}});
         };
         let group = config.groups.iter().find(|g| g.id == rule.group_id);
         let connection = group.and_then(|g| crate::domain::connection(config, g));
@@ -127,11 +128,12 @@ impl Destination {
             capability_reason
         };
         let selected = connection.map(|c| c.id.as_str());
-        let candidates = candidates(
+        let (candidates, candidate_count) = candidates(
             working.map_or(config, |w| &w.config),
             &rule.group_id,
             selected,
             capability,
+            hostname,
             reason,
             working,
         );
@@ -143,7 +145,7 @@ impl Destination {
             "reason":reason,"rule_id":rule.id,"rule":rule.destination,
             "group_id":rule.group_id,"group_name":group.map(|g|&g.name),
             "connection":connection.map(|c|json!({"id":c.id,"name":c.name,"protocol":c.protocol})),
-            "capability_reason":capability_reason,"candidates":candidates,
+            "capability_reason":capability_reason,"candidates":candidates,"candidate_count":candidate_count,
             "dns":if hostname {
                 json!({"mode":if dns_allowed{"connection"}else{"blocked"},"reason":dns_reason,
                     "resolver_capability":resolver.map(|r|r.capability())})
@@ -157,17 +159,20 @@ fn candidates(
     group_id: &str,
     selected: Option<&str>,
     capability: &str,
+    hostname: bool,
     selected_reason: &str,
     working: Option<&Working>,
-) -> Vec<Value> {
+) -> (Vec<Value>, usize) {
+    const LIMIT: usize = 64;
     let Some(group) = config.groups.iter().find(|group| group.id == group_id) else {
-        return Vec::new();
+        return (Vec::new(), 0);
     };
-    group
-        .primary
-        .iter()
-        .chain(&group.fallbacks)
-        .filter_map(|id| config.connections.iter().find(|c| &c.id == id))
+    let ordered = group.primary.iter().chain(&group.fallbacks);
+    let count = ordered.clone().count();
+    let candidates = ordered
+        .enumerate()
+        .filter(|(index, id)| *index < LIMIT || Some(id.as_str()) == selected)
+        .filter_map(|(_, id)| config.connections.iter().find(|c| &c.id == id))
         .map(|connection| {
             let selected = selected == Some(connection.id.as_str());
             let history = working.and_then(|w| w.health.get(&connection.id));
@@ -184,6 +189,26 @@ fn candidates(
                             "awaiting_probe"
                         } else if !record.available {
                             "unhealthy"
+                        } else if record
+                            .admitted
+                            .get(capability)
+                            .is_none_or(|v| v != "verified")
+                        {
+                            record
+                                .results
+                                .get(capability)
+                                .map_or("not_checked", |reason| {
+                                    crate::capability::public_reason(reason)
+                                })
+                        } else if hostname
+                            && record.admitted.get("dns").is_none_or(|v| v != "verified")
+                        {
+                            record
+                                .results
+                                .get("dns")
+                                .map_or("dns_transport_unverified", |reason| {
+                                    crate::capability::public_reason(reason)
+                                })
                         } else {
                             "lower_priority"
                         }
@@ -210,7 +235,8 @@ fn candidates(
                 "allowed_capabilities":connection.allowed_capabilities,
                 "health":history.map(|record|record.describe())})
         })
-        .collect()
+        .collect();
+    (candidates, count)
 }
 
 impl Service {
@@ -232,12 +258,13 @@ impl Service {
                 .as_bool()
                 .ok_or_else(|| invalid("probe must be a boolean"))
         })?;
+        let busy = self.busy();
         let working: Option<Working> = optional(&self.root.join("working.json"))?;
         let status: Value = optional(&self.root.join("status.json"))?.unwrap_or(Value::Null);
         let pending_recovery = optional::<Journal>(&self.root.join("journal.json"))?
             .as_ref()
             .is_some_and(pending);
-        let runtime = if self.busy() {
+        let runtime = if busy {
             "busy"
         } else if pending_recovery {
             "recovery_required"
@@ -287,11 +314,19 @@ impl Service {
             let root = self.root.clone();
             let stopping = self.stopping.clone();
             let native = self.native.clone();
+            let xray = self.xray.clone();
             let capability = capability.to_owned();
             return self.launch(stream, "routing.diagnose".into(), move || {
-                data["probe"] =
-                    run_probe(&root, &working, &connection, &capability, stopping, &native)
-                        .unwrap_or_else(|reason| json!({"state":"failed","reason":reason}));
+                data["probe"] = run_probe(
+                    &root,
+                    &working,
+                    &connection,
+                    &capability,
+                    stopping,
+                    &native,
+                    &xray,
+                )
+                .unwrap_or_else(|reason| json!({"state":"skipped","reason":reason}));
                 Ok(data)
             });
         }
@@ -308,12 +343,13 @@ impl Service {
 }
 
 fn run_probe(
-    root: &std::path::Path,
+    root: &Path,
     working: &Working,
     id: &str,
     capability: &str,
     stopping: Arc<std::sync::atomic::AtomicBool>,
     native: &crate::native::Client,
+    xray: &Path,
 ) -> Result<Value, &'static str> {
     let config = working.effective_config();
     let connection = config
@@ -344,11 +380,19 @@ fn run_probe(
     let client = crate::panel::Client::new(settings, stopping)
         .map_err(|_| "panel_configuration_unavailable")?;
     let status = client.running().map_err(|_| "panel_unavailable")?;
+    let outbound = LiveOutbound::new(xray, &working.snapshot.template, connection)?;
+    outbound.verify()?;
     if crate::native::is_native(&connection.protocol) {
         let observations =
             crate::native::observe(native, &working.native).map_err(|_| "native_unavailable")?;
         if let Some(reason) = crate::native::readiness(connection, &observations) {
             return Err(reason);
+        }
+        if observations
+            .get(id)
+            .is_some_and(|now| now.reason == crate::native::NETBIRD_CONFIRMING_ROUTES)
+        {
+            return Err(crate::native::NETBIRD_CONFIRMING_ROUTES);
         }
         if !working
             .native_observations
@@ -375,7 +419,11 @@ fn run_probe(
             crate::probe::connection(&client, &config, connection, &working.proxy),
         )
     };
-    let result = result.map_err(|_| "probe_failed")?;
+    outbound.verify()?;
+    client.running().map_err(|_| "panel_unavailable")?;
+    let Ok(result) = result else {
+        return Ok(json!({"state":"failed","reason":"probe_failed"}));
+    };
     let key = if use_health { "health" } else { capability };
     let reason = result.get(key).map_or("not_checked", |reason| {
         crate::capability::public_reason(reason)
@@ -388,4 +436,117 @@ fn run_probe(
         json!({"state":if reason=="verified"{"passed"}else{"failed"},
         "reason":reason,"source":source,"connection_id":id,"results":results}),
     )
+}
+
+struct LiveOutbound {
+    #[cfg(target_os = "linux")]
+    binary: std::path::PathBuf,
+    #[cfg(target_os = "linux")]
+    address: String,
+    #[cfg(target_os = "linux")]
+    expected: Value,
+}
+
+impl LiveOutbound {
+    fn new(
+        binary: &Path,
+        template: &Value,
+        connection: &crate::store::Connection,
+    ) -> Result<Self, &'static str> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (binary, template, connection);
+            Err("probe_context_unavailable")
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::{fd::OwnedFd, unix::net::UnixStream};
+            use std::process::Stdio;
+            use std::time::Duration;
+
+            let unavailable = "probe_context_unavailable";
+            let binary = crate::native_runtime::executable(binary).map_err(|_| unavailable)?;
+            let program = binary.to_str().ok_or(unavailable)?;
+            let port = template["inbounds"]
+                .as_array()
+                .and_then(|inbounds| inbounds.iter().find(|inbound| inbound["tag"] == "api"))
+                .and_then(|inbound| inbound["port"].as_u64())
+                .and_then(|port| u16::try_from(port).ok())
+                .filter(|port| *port != 0)
+                .ok_or(unavailable)?;
+            let tag = crate::native::diagnostic_tag(connection);
+            let outbound = template["outbounds"]
+                .as_array()
+                .and_then(|outbounds| outbounds.iter().find(|outbound| outbound["tag"] == tag))
+                .ok_or(unavailable)?;
+            // Keep the private outbound out of files and process arguments.
+            let payload = json!({"outbounds":[outbound]});
+            let (input, writer) = UnixStream::pair().map_err(|_| unavailable)?;
+            writer
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .map_err(|_| unavailable)?;
+            let output = std::thread::scope(|scope| {
+                let write = scope.spawn(move || serde_json::to_writer(writer, &payload));
+                let output = crate::native_runtime::command_input(
+                    program,
+                    &["convert", "pb", "-d", "-t", "stdin:"],
+                    Stdio::from(OwnedFd::from(input)),
+                );
+                write
+                    .join()
+                    .map_err(|_| unavailable)?
+                    .map_err(|_| unavailable)?;
+                output.map_err(|_| unavailable)
+            })?;
+            let expected = Self::json(&output)?["outbound"]
+                .as_array()
+                .and_then(|outbounds| outbounds.first())
+                .filter(|outbound| outbound["tag"] == tag)
+                .cloned()
+                .ok_or(unavailable)?;
+            Ok(Self {
+                binary,
+                address: format!("127.0.0.1:{port}"),
+                expected,
+            })
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn json(output: &str) -> Result<Value, &'static str> {
+        // Xray can print a config-loading message before its JSON document.
+        let start = if output.starts_with('{') {
+            0
+        } else {
+            output.find("\n{").ok_or("probe_context_unavailable")? + 1
+        };
+        serde_json::from_str(&output[start..]).map_err(|_| "probe_context_unavailable")
+    }
+
+    fn verify(&self) -> Result<(), &'static str> {
+        #[cfg(not(target_os = "linux"))]
+        return Err("probe_context_unavailable");
+
+        #[cfg(target_os = "linux")]
+        {
+            let unavailable = "probe_context_unavailable";
+            let output = crate::native_runtime::command_input(
+                self.binary.to_str().ok_or(unavailable)?,
+                &["api", "lso", "-s", &self.address, "-t", "3"],
+                std::process::Stdio::null(),
+            )
+            .map_err(|_| unavailable)?;
+            let actual = Self::json(&output)?;
+            let matches = actual["outbounds"]
+                .as_array()
+                .ok_or(unavailable)?
+                .iter()
+                .filter(|outbound| outbound["tag"] == self.expected["tag"]);
+            if matches.eq(std::iter::once(&self.expected)) {
+                Ok(())
+            } else {
+                Err("panel_drift")
+            }
+        }
+    }
 }
