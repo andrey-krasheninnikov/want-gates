@@ -219,6 +219,14 @@ fn executable(path: &Path) -> io::Result<PathBuf> {
 fn command(program: &str, args: &[&str]) -> io::Result<String> {
     command_input(program, args, Stdio::null())
 }
+fn bootstrap_addresses(host: &str) -> io::Result<Vec<IpAddr>> {
+    let output = command("/usr/bin/getent", &["-s", "files", "ahosts", host])
+        .or_else(|_| command("/usr/bin/getent", &["ahosts", &format!("{host}.")]))?;
+    Ok(output
+        .lines()
+        .filter_map(|line| line.split_whitespace().next()?.parse().ok())
+        .collect())
+}
 fn command_input(program: &str, args: &[&str], stdin: Stdio) -> io::Result<String> {
     let mut child = Command::new(program)
         .args(args)

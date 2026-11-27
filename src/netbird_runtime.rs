@@ -1,6 +1,7 @@
 use super::{
-    Authentication, Child, Command, Credentials, Endpoint, Instant, Record, Stdio, command,
-    executable, namespace_child, ns, private_text, random_id, secure_directory,
+    Authentication, Child, Command, Credentials, Endpoint, Instant, Record, Stdio,
+    bootstrap_addresses, command, executable, namespace_child, ns, private_text, random_id,
+    secure_directory,
 };
 use crate::netbird::{Mode, Profile, decoded_profile, https_url, network_id};
 use crate::{invalid, openvpn_auth::now, policy::Network, wireguard::unicast};
@@ -75,20 +76,10 @@ pub(super) fn resolve(profile: &Profile) -> io::Result<(Vec<Endpoint>, Hosts)> {
         let ips = if let Ok(ip) = endpoint.host.parse() {
             BTreeSet::from([ip])
         } else {
-            command(
-                "/usr/bin/getent",
-                &["-s", "files", "ahosts", &endpoint.host],
-            )
-            .or_else(|_| {
-                command(
-                    "/usr/bin/getent",
-                    &["ahosts", &format!("{}.", endpoint.host)],
-                )
-            })
-            .map_err(|_| invalid("NetBird control endpoint resolution failed"))?
-            .lines()
-            .filter_map(|line| line.split_whitespace().next()?.parse().ok())
-            .collect()
+            bootstrap_addresses(&endpoint.host)
+                .map_err(|_| invalid("NetBird control endpoint resolution failed"))?
+                .into_iter()
+                .collect()
         };
         hosts.insert(endpoint.host, ips);
     }
