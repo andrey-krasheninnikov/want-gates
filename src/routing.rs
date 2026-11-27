@@ -1366,7 +1366,7 @@ fn execute(
             &native_observations,
             &effective,
             &matrix,
-            || check_native_xray(native, &client.status()?, json!([])),
+            || check_native_xray(native, &client.wait_running()?, json!([])),
         )?;
         verify(
             &client,
@@ -1381,7 +1381,7 @@ fn execute(
             .iter()
             .any(|(id, state)| crate::native::should_admit(id, state, &effective, &matrix))
         {
-            check_native_xray(native, &client.status()?, json!([]))?;
+            check_native_xray(native, &client.wait_running()?, json!([]))?;
         }
         let mut working = Working {
             plan_id: journal.plan.id.clone(),
@@ -1803,7 +1803,7 @@ fn recover(
                 &observations,
                 &effective,
                 &previous.matrix,
-                || check_native_xray(native, &client.status()?, json!([])),
+                || check_native_xray(native, &client.wait_running()?, json!([])),
             )?;
             verify(
                 client,
@@ -1817,7 +1817,7 @@ fn recover(
             if observations.iter().any(|(id, state)| {
                 crate::native::should_admit(id, state, &effective, &previous.matrix)
             }) {
-                check_native_xray(native, &client.status()?, json!([]))?;
+                check_native_xray(native, &client.wait_running()?, json!([]))?;
             }
             Ok(())
         })()
@@ -2364,15 +2364,6 @@ fn health_cycle(
         return Ok(());
     }
     let effective = effective_config(&config, &selected);
-    let opening_native = working.native_observations.iter().any(|(id, state)| {
-        !state.admitted && crate::native::should_admit(id, state, &effective, &matrix)
-    });
-    if opening_native && let Err(error) = check_native_xray(native, &client.running()?, json!([])) {
-        if crate::native::unavailable(&error) {
-            return Ok(());
-        }
-        return Err(error);
-    }
     let input = Input {
         config: effective.clone(),
         profiles: working.profiles.clone(),
@@ -2412,7 +2403,7 @@ fn health_cycle(
             &working.native_observations,
             &effective,
             &matrix,
-            || check_native_xray(native, &client.status()?, json!([])),
+            || check_native_xray(native, &client.wait_running()?, json!([])),
         )
         .and_then(|()| {
             verify(

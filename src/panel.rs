@@ -192,6 +192,19 @@ impl Client {
         }
         Ok(status)
     }
+    pub fn wait_running(&self) -> io::Result<Value> {
+        let client = self.until(Instant::now() + Duration::from_secs(5));
+        let interval = Duration::from_millis(100);
+        let mut result = client.running();
+        while result.is_err()
+            && !client.cancelled()
+            && client.deadline.saturating_duration_since(Instant::now()) > interval
+        {
+            std::thread::sleep(interval);
+            result = client.running();
+        }
+        result
+    }
     pub fn read(&self) -> io::Result<Snapshot> {
         let value = self.request("xray/", Some(&[]))?;
         let value = if let Some(s) = value.as_str() {
