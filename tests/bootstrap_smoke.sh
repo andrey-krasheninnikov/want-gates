@@ -13,7 +13,8 @@ digest=$(awk -v archive="$(basename -- "$archive")" '$2 == archive { hash=$1; co
 binary=/usr/local/bin/wgates
 unit=/etc/systemd/system/wgates.service
 fixture_unit=/run/systemd/system/x-ui.service
-for owned in /usr/local/x-ui "$fixture_unit" "$binary" "$unit" \
+custom_unit=/run/systemd/system/wgates.service
+for owned in /usr/local/x-ui "$fixture_unit" "$custom_unit" "$binary" "$unit" \
     /etc/systemd/system/wgates-native.service /usr/lib/sysusers.d/wgates.conf \
     /var/lib/wgates /var/lib/wgates-install /var/lib/wgates-native; do
     [[ ! -e $owned && ! -L $owned ]] || { echo "Fixture path already exists: $owned"; exit 1; }
@@ -32,7 +33,7 @@ cleanup() {
     status=$?
     systemctl disable --now wgates-native.service wgates.service >/dev/null 2>&1 || true
     systemctl stop x-ui.service || true
-    rm -f -- "$unit" /etc/systemd/system/wgates-native.service "$fixture_unit" "$binary" /usr/lib/sysusers.d/wgates.conf
+    rm -f -- "$unit" /etc/systemd/system/wgates-native.service "$fixture_unit" "$custom_unit" "$binary" /usr/lib/sysusers.d/wgates.conf
     systemctl daemon-reload
     rm -rf -- /usr/local/x-ui /var/lib/wgates /var/lib/wgates-install /var/lib/wgates-native "$tmp"
     if getent passwd wgates >/dev/null; then userdel wgates; fi
@@ -86,12 +87,35 @@ if (( ${#protocol[@]} )); then
 fi
 if "$script" install --archive "$archive" --sha256 "$(printf '%064d' 0)" >"$tmp/result" 2>&1; then exit 1; fi
 grep -q 'archive checksum mismatch' "$tmp/result"
-[[ ! -e $binary && ! -e $unit && ! -e /var/lib/wgates-install ]]
+[[ ! -e $binary && ! -e $unit && ! -e /var/lib/wgates-install/staging && ! -e /var/lib/wgates-install/receipt ]]
+printf '[Service]\nExecStart=/usr/bin/true\n' > "$custom_unit"
+systemctl daemon-reload
+if "$script" install --archive "$archive" --sha256 "$digest" > "$tmp/result" 2>&1; then exit 1; fi
+grep -q 'unmanaged unit wgates.service' "$tmp/result"
+[[ -f $custom_unit && ! -e $unit && ! -e $binary ]]
+rm -- "$custom_unit"
+systemctl daemon-reload
+mkdir -m 0700 /var/lib/wgates-install/staging
+touch /var/lib/wgates-install/staging/interrupted-copy
 "$script" install --archive "$archive" --sha256 "$digest" "${protocol[@]}"
+[[ ! -e /var/lib/wgates-install/staging ]]
 wgates status
 if (( ${#protocol[@]} )); then
     command -v wg >/dev/null
     systemctl is-active --quiet wgates-native.service
+    wg_owner=$(stat -c '%u:%g' /usr/bin/wg)
+    chown 1001:1001 /usr/bin/wg
+    result=0
+    "$script" preflight "${protocol[@]}" > "$tmp/result" 2>&1 || result=$?
+    chown "$wg_owner" /usr/bin/wg
+    [[ $result != 0 ]]
+    grep -q 'native executable must be controlled by root: /usr/bin/wg' "$tmp/result"
+    systemctl stop wgates-native.service
+    if "$script" install --archive "$archive" --sha256 "$digest" > "$tmp/result" 2>&1; then exit 1; fi
+    grep -q 'native service is enabled but inactive' "$tmp/result"
+    systemctl is-active --quiet wgates.service
+    ! systemctl is-active --quiet wgates-native.service
+    systemctl start wgates-native.service
 fi
 wgates group create --name 'Bootstrap example' >/dev/null
 wgates group list > "$tmp/groups"

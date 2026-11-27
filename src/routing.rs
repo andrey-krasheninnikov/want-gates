@@ -2217,7 +2217,7 @@ fn health_cycle(
         ));
     }
     let client = Client::new(settings, stopping)?;
-    client.running()?;
+    let panel_status = client.running()?;
     if client.read()? != working.snapshot {
         return Err(invalid("observed panel drift; automatic writes stopped"));
     }
@@ -2332,6 +2332,9 @@ fn health_cycle(
             }
         }
         return Ok(());
+    }
+    if !working.native.is_empty() {
+        check_native_xray(native, &panel_status, json!([]))?;
     }
     let effective = effective_config(&config, &selected);
     let input = Input {

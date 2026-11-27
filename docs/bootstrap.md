@@ -31,7 +31,9 @@ Preflight inspects the OS, systemd, panel, archive and selected dependencies.
 When run with root privileges it also verifies that the active service uses
 the expected panel and Xray executables. For a custom layout use the manual
 installation instructions.
-Install changes the gateway only after the package passes verification.
+The installer verifies the package before changing service files or
+installing dependencies. It uses /var/lib/wgates-install for staging and
+reconciles any interrupted installation there first.
 The initial install creates the wgates system account and enables
 wgates.service. Root and members of the wgates group can use its socket.
 Follow [panel configuration](routing.md#configure-and-preview) to add the
@@ -86,9 +88,10 @@ aarch64), Fedora 44, Arch Linux and openSUSE Leap 16.0 (x86_64).
 Repeat the same install command to verify an existing installation. Upgrades
 can restart wgates and the native runtime, which can interrupt sessions. Back
 up the service state before upgrading. The installer records hashes of its
-files under /var/lib/wgates-install. If an existing file differs from both the
-release and the installer receipt, inspect it and reconcile the installation
-with the manual instructions.
+files under /var/lib/wgates-install. Use the manual steps for custom systemd
+units or overrides. If the native unit is enabled and inactive, reconcile
+its state before upgrading. If an existing file differs from both the release
+and the installer receipt, inspect and reconcile it with the manual instructions.
 
 On a failed startup, bootstrap restores its previous files and service state
 when it recognizes them. It keeps package dependencies and persistent data.

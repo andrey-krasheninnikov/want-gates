@@ -41,22 +41,33 @@ if [[ $mode == install ]]; then
     [[ -n $archive ]] || fail 'provide the release archive and its published SHA-256'
 fi
 trusted() {
-    local resolved name owner permissions
-    resolved=$(realpath -e -- "$1") || return 1
-    for name in "$1" "$resolved"; do
-        while [[ $name != / ]]; do
-            read -r owner permissions < <(stat -c '%u %a' -- "$name")
-            [[ $owner == 0 && $permissions =~ ^[0-7]{3,4}$ ]] || return 1
-            [[ -L $name ]] || (((8#$permissions & 022) == 0)) || return 1
-            name=$(dirname -- "$name")
-        done
+    local name=$1 owner permissions
+    while true; do
+        [[ ! -L $name ]] || return 1
+        read -r owner permissions < <(stat -c '%u %a' -- "$name") || return 1
+        [[ $owner == 0 && $permissions =~ ^[0-7]{3,4}$ ]] || return 1
+        (((8#$permissions & 022) == 0)) || return 1
+        [[ $name != / ]] || return 0
+        name=$(dirname -- "$name")
     done
+}
+checked_executable() {
+    local binary
+    binary=$(realpath -e -- "$1") || return 1
+    if [[ $1 != "$binary" ]]; then
+        # Distributions with a merged sbin directory use the same binary in bin.
+        [[ $1 == /usr/sbin/* && $binary == "/usr/bin/${1##*/}" ]] || return 1
+    fi
+    [[ -f $binary && -x $binary ]] && trusted "$binary" || return 1
+    printf '%s\n' "$binary"
+}
+require_executable() {
+    checked_executable "$1" >/dev/null || fail "native executable must be controlled by root: $1"
 }
 bounded_version() { timeout --kill-after=1s 5s "$@" </dev/null; }
 version_probe() {
     local binary
-    if trusted "$1"; then
-        binary=$(realpath -e -- "$1") || return 1
+    if binary=$(checked_executable "$1"); then
         shift
         bounded_version "$binary" "$@"
     else
@@ -66,15 +77,18 @@ version_probe() {
 
 missing_paths=()
 need() {
-    if [[ ! -x $1 ]]; then
+    if [[ -x $1 ]]; then
+        require_executable "$1"
+    else
         packages[$2]=1
         missing_paths+=("$1")
     fi
 }
+
 check_version() {
-    local value
-    trusted "$1" || fail "native executable must be controlled by root: $1"
-    value=$(version_probe "$1" --version 2>&1) || fail "cannot read $1 version"
+    local binary value
+    binary=$(checked_executable "$1") || fail "native executable must be controlled by root: $1"
+    value=$(bounded_version "$binary" --version 2>&1) || fail "cannot read $1 version"
     [[ $value =~ $2 ]] || fail "$1 requires $3; install a supported version manually"
 }
 
@@ -122,7 +136,7 @@ preflight() {
     native=0
     if [[ -v protocols[openvpn] || -v protocols[forti] || -v protocols[wireguard] || -v protocols[netbird] ]]; then
         native=1
-        trusted "$xray" || fail 'native routing requires a root-controlled Xray executable; see docs/bootstrap.md#optional-native-protocols'
+        checked_executable "$xray" >/dev/null || fail 'native routing requires a root-controlled Xray executable; see docs/bootstrap.md#optional-native-protocols'
         [[ $(< /proc/sys/net/ipv4/ip_forward) == 1 ]] ||
             fail 'native connections require IPv4 forwarding; configure it before installing'
         need /usr/sbin/ip "$ip_package"
@@ -152,11 +166,12 @@ preflight() {
     fi
     if [[ -v protocols[wireguard] ]]; then
         need /usr/bin/wg wireguard-tools
+        if [[ -x /usr/bin/wg ]]; then check_version /usr/bin/wg '^wireguard-tools v' 'wireguard-tools'; fi
     fi
     if [[ -v protocols[netbird] ]]; then
         [[ -x /usr/bin/netbird ]] || fail 'install the verified NetBird 0.83.2 client manually; see docs/netbird.md'
-        trusted /usr/bin/netbird || fail 'the NetBird client must be controlled by root'
-        netbird_version=$(version_probe /usr/bin/netbird version) || fail 'cannot read the NetBird version'
+        netbird_binary=$(checked_executable /usr/bin/netbird) || fail 'the NetBird client must be controlled by root'
+        netbird_version=$(bounded_version "$netbird_binary" version) || fail 'cannot read the NetBird version'
         [[ $netbird_version == 0.83.2 ]] || fail 'NetBird 0.83.2 is required'
         need /usr/bin/curl curl
     fi
@@ -173,7 +188,7 @@ preflight() {
     fi
 }
 
-workspace=$(mktemp -d /var/tmp/wgates-bootstrap.XXXXXXXX)
+workspace=
 root=/var/lib/wgates-install
 pending=$root/pending
 retired=$root/retired
@@ -181,7 +196,6 @@ files=(wgates wgates.service wgates.conf wgates-native.service)
 destinations=(/usr/local/bin/wgates /etc/systemd/system/wgates.service /usr/lib/sysusers.d/wgates.conf /etc/systemd/system/wgates-native.service)
 units=(wgates.service wgates-native.service)
 owns_transaction=0
-transaction=
 
 same() {
     [[ -f $1 && ! -L $1 && -f $2 && ! -L $2 ]] || return 1
@@ -272,7 +286,8 @@ recover() {
         systemctl daemon-reload || return 1
         for unit in "${units[@]}"; do
             if [[ -f $pending/active/$unit ]]; then
-                if systemctl is-failed --quiet "$unit"; then systemctl reset-failed "$unit" || return 1; fi
+                # A stopped unit can retain its start counter or be unloaded.
+                systemctl reset-failed "$unit" 2>/dev/null || true
                 systemctl start "$unit" || return 1
             fi
         done
@@ -291,8 +306,7 @@ cleanup() {
     if ((owns_transaction)) && [[ -d $pending ]]; then
         recover || { printf 'Reconciliation required at %s before retrying.\n' "$pending" >&2; result=1; }
     fi
-    if [[ -n $transaction ]]; then rm -rf -- "$transaction"; fi
-    rm -rf -- "$workspace"
+    if [[ -n $workspace ]]; then rm -rf -- "$workspace"; fi
     exit "$result"
 }
 trap cleanup EXIT
@@ -324,8 +338,35 @@ locked=0
 if [[ $mode == install ]] && ! absent "$root"; then lock_installation; fi
 preflight
 
+check_units() {
+    local unit fragment dropins
+    for unit in "${units[@]}"; do
+        fragment=$(systemctl show -p FragmentPath --value "$unit")
+        [[ -z $fragment || $fragment == "/etc/systemd/system/$unit" ]] ||
+            fail "unmanaged unit $unit; see manual installation"
+        dropins=$(systemctl show -p DropInPaths --value "$unit")
+        case $dropins in
+            */"$unit".d/*|*/wgates-.service.d/*) fail "inspect the overrides for $unit before installing" ;;
+        esac
+    done
+}
+
 if [[ -n $archive || -n $digest ]]; then
     [[ -f $archive && $digest =~ ^[a-f0-9]{64}$ ]] || fail 'provide a regular archive and a 64-digit SHA-256'
+    if [[ $mode == install ]]; then
+        if ((!locked)); then lock_installation; fi
+        check_units
+        staging=$root/staging
+        if ! absent "$staging"; then
+            [[ -d $staging && ! -L $staging && $(stat -c '%u:%a' "$staging") == 0:700 ]] ||
+                fail 'unsafe previous staging directory'
+            rm -rf -- "$staging"
+        fi
+        mkdir -- "$staging"
+        workspace=$staging
+    else
+        workspace=$(mktemp -d /var/tmp/wgates-bootstrap.XXXXXXXX)
+    fi
     cp -- "$archive" "$workspace/release.tar.gz"
     printf '%s  %s\n' "$digest" "$workspace/release.tar.gz" | sha256sum --check --status ||
         fail 'archive checksum mismatch'
@@ -346,7 +387,10 @@ if [[ -n $archive || -n $digest ]]; then
 fi
 [[ $mode == install ]] || exit 0
 
-if ((!locked)); then lock_installation; fi
+if systemctl is-enabled --quiet wgates-native.service &&
+    ! systemctl is-active --quiet wgates-native.service; then
+    fail 'native service is enabled but inactive; reconcile its state before installing'
+fi
 
 check_identity() {
     local account service_gid service_home service_shell
@@ -403,8 +447,8 @@ if (( ${#packages[@]} )); then
     esac
 fi
 if ((native)); then
-    for executable in /usr/sbin/ip /usr/sbin/nft /usr/sbin/sysctl /usr/bin/getent; do
-        [[ -x $executable ]] || fail "required executable is absent: $executable"
+    for executable in /usr/sbin/ip /usr/sbin/nft /usr/sbin/sysctl /usr/bin/getent /usr/bin/true; do
+        require_executable "$executable"
     done
 fi
 if [[ -v protocols[openvpn] ]]; then check_version /usr/sbin/openvpn '^OpenVPN 2\.6\.' 'OpenVPN 2.6.x'; fi
@@ -412,8 +456,8 @@ if [[ -v protocols[forti] ]]; then
     check_version /usr/sbin/pppd '(^| )2\.4\.9($|[[:space:]])' 'pppd 2.4.9'
     check_version /usr/bin/openfortivpn '^1\.(21|22|23|24)(\.|$)' 'openfortivpn 1.21–1.24'
 fi
-if [[ -v protocols[wireguard] ]]; then [[ -x /usr/bin/wg ]] || fail 'wireguard-tools did not supply wg'; fi
-if [[ -v protocols[netbird] ]]; then [[ -x /usr/bin/curl ]] || fail 'curl is missing'; fi
+if [[ -v protocols[wireguard] ]]; then check_version /usr/bin/wg '^wireguard-tools v' 'wireguard-tools'; fi
+if [[ -v protocols[netbird] ]]; then require_executable /usr/bin/curl; fi
 
 if ((!native)) && absent "${destinations[3]}"; then
     rm -- "$workspace/new/wgates-native.service"
@@ -450,19 +494,8 @@ for unit in "${units[@]}"; do
     esac
 done
 rm -- "$workspace/release.tar.gz" "$workspace/new/support"
-# Keep the rollback copy on the same filesystem as its final transaction path.
-staging=$root/staging
-if ! absent "$staging"; then
-    [[ -d $staging && ! -L $staging && $(stat -c '%u:%a' "$staging") == 0:700 ]] ||
-        fail 'unsafe previous staging directory'
-    rm -rf -- "$staging"
-fi
-mkdir -- "$staging"
-transaction=$staging
-cp -a -- "$workspace/." "$transaction"
-rm -rf -- "$workspace"
-mv -T -- "$transaction" "$pending"
-transaction=
+mv -T -- "$workspace" "$pending"
+workspace=
 owns_transaction=1
 sync -f "$root"
 if ((changed)) && [[ -f $pending/active/wgates.service ]]; then
@@ -476,6 +509,7 @@ done
 systemd-sysusers /usr/lib/sysusers.d/wgates.conf
 check_identity
 systemctl daemon-reload
+check_units
 if ((native)); then systemctl enable wgates-native.service; fi
 systemctl enable --now wgates.service
 if ((!native)) && [[ -f $pending/active/wgates-native.service ]]; then
