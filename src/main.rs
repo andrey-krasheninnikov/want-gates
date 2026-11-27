@@ -391,7 +391,11 @@ fn handle(
             }
             match store.dispatch(&request).and_then(|mut response| {
                 if command.starts_with("connection.") {
-                    routing.describe_connections(&mut response, store.config());
+                    routing.describe_connections(
+                        &mut response,
+                        store.config(),
+                        request.get("observed_digest"),
+                    )?;
                 }
                 if command == "group.list"
                     && let Some(digest) = request.get("observed_digest")

@@ -52,6 +52,7 @@ cp -R -- "$recipe/overlay/." "$scratch/source/"
 
 archive() {
     tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner \
+        --mode='u+rwX,go+rX,go-w' \
         -C "$1" -cf - -- "$2" | gzip -n > "$3"
 }
 

@@ -61,7 +61,7 @@ const response = z.object({ success: z.literal(true), obj: snapshot });
 
 export async function loadStatus({ signal }: { signal: AbortSignal }): Promise<WantGatesSnapshot> {
   try {
-    const result = await httpRequest('GET', statusPath, undefined, { signal, timeout: 12_000 });
+    const result = await httpRequest('GET', statusPath, undefined, { signal, timeout: 32_000 });
     const parsed = response.safeParse(result.data);
     if (!parsed.success) throw new Error('Want Gates returned an invalid status response.');
     return parsed.data.obj;

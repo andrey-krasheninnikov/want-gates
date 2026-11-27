@@ -50,7 +50,7 @@ func TestWantGatesSnapshotKeepsRevisionAndOmitsPrivateFields(t *testing.T) {
 			if err == nil && (request.Version != 1 || request.Command != page.command || request.Offset != page.offset ||
 				page.command != "routing.status" && (request.ListRevision == nil || *request.ListRevision != revision) ||
 				page.command == "routing.status" && !request.Summary ||
-				page.command == "group.list" && request.ObservedDigest != "observed-fixture") {
+				(page.command == "group.list" || page.command == "connection.list") && request.ObservedDigest != "observed-fixture") {
 				err = errWantGatesReply
 			}
 			if err == nil {

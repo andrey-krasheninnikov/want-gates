@@ -196,7 +196,7 @@ func loadWantGatesSnapshot(ctx context.Context, socket string) (wantGatesSnapsho
 	if err != nil {
 		return result, err
 	}
-	result.Connections, err = wantGatesList[wantGatesConnection](ctx, socket, "connection.list", revision, nil)
+	result.Connections, err = wantGatesList[wantGatesConnection](ctx, socket, "connection.list", revision, routing.ObservedDigest)
 	if err != nil {
 		return result, err
 	}
@@ -213,7 +213,7 @@ func wantGatesSocketPath() string {
 
 func wantGatesStatus(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
 	socket := wantGatesSocketPath()
 	if !filepath.IsAbs(socket) {

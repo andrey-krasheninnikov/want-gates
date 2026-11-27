@@ -2,6 +2,7 @@ use crate::policy::{Probes, Resolver, Rule, destination};
 use crate::{invalid, secure_directory};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
@@ -293,7 +294,13 @@ impl Store {
             "rule.update" => &["id", "expected_revision", "group_id", "destination"],
             "rule.delete" => &["id", "expected_revision"],
             "group.delete" | "connection.delete" => &["id", "expected_revision"],
-            "connection.list" => &["group_id", "sort", "offset", "list_revision"],
+            "connection.list" => &[
+                "group_id",
+                "sort",
+                "offset",
+                "list_revision",
+                "observed_digest",
+            ],
             "connection.import" => &[
                 "name",
                 "group_id",
@@ -319,6 +326,69 @@ impl Store {
         }) {
             return Err(invalid("unexpected local API request field"));
         }
+        match command {
+            "group.list" => {
+                let mut groups: Vec<_> = self.config.groups.iter().collect();
+                groups.sort_by(|a, b| (&a.name, &a.id).cmp(&(&b.name, &b.id)));
+                return self.page(request, groups.into_iter());
+            }
+            "rule.list" => {
+                let filter = request.get("group_id").map(text).transpose()?;
+                if filter.is_some_and(|id| !self.config.groups.iter().any(|g| g.id == id)) {
+                    return Err(invalid("group not found"));
+                }
+                let mut rules: Vec<_> = self
+                    .config
+                    .rules
+                    .iter()
+                    .filter(|r| filter.is_none_or(|id| id == r.group_id))
+                    .collect();
+                rules.sort_by(|a, b| (&a.destination, &a.id).cmp(&(&b.destination, &b.id)));
+                return self.page(request, rules.into_iter());
+            }
+            "connection.list" => {
+                let filter = request.get("group_id").map(text).transpose()?;
+                if let Some(id) = filter
+                    && !self.config.groups.iter().any(|g| g.id == id)
+                {
+                    return Err(invalid("group not found"));
+                }
+                let sort = request
+                    .get("sort")
+                    .map(text)
+                    .transpose()?
+                    .unwrap_or("group");
+                if sort != "group" && sort != "name" {
+                    return Err(invalid("sort must be group or name"));
+                }
+                let mut connections: Vec<_> = self
+                    .config
+                    .connections
+                    .iter()
+                    .filter(|c| filter.is_none_or(|id| c.group_id == id))
+                    .collect();
+                let group_names: HashMap<_, _> = self
+                    .config
+                    .groups
+                    .iter()
+                    .map(|group| (group.id.as_str(), group.name.as_str()))
+                    .collect();
+                let group_name = |id: &str| group_names[id];
+                connections.sort_by(|a, b| {
+                    if sort == "name" {
+                        (&a.name, &a.id).cmp(&(&b.name, &b.id))
+                    } else {
+                        (group_name(&a.group_id), &a.name, &a.id).cmp(&(
+                            group_name(&b.group_id),
+                            &b.name,
+                            &b.id,
+                        ))
+                    }
+                });
+                return self.page(request, connections.into_iter().map(summary));
+            }
+            _ => {}
+        }
         let mut config = self.config.clone();
         let revision = config
             .revision
@@ -326,11 +396,6 @@ impl Store {
             .ok_or_else(|| invalid("configuration revision exhausted"))?;
         let mut new_profile = None;
         let result = match command {
-            "group.list" => {
-                let mut groups = config.groups;
-                groups.sort_by(|a, b| (&a.name, &a.id).cmp(&(&b.name, &b.id)));
-                return self.page(request, groups.iter().map(|g| json!(g)).collect());
-            }
             "group.create" => {
                 let name = name(&request["name"])?;
                 if config.groups.iter().any(|g| g.name == name) {
@@ -418,19 +483,6 @@ impl Store {
                     json!(config.groups[index])
                 }
             }
-            "rule.list" => {
-                let filter = request.get("group_id").map(text).transpose()?;
-                if filter.is_some_and(|id| !config.groups.iter().any(|g| g.id == id)) {
-                    return Err(invalid("group not found"));
-                }
-                let mut rules: Vec<_> = config
-                    .rules
-                    .iter()
-                    .filter(|r| filter.is_none_or(|id| id == r.group_id))
-                    .collect();
-                rules.sort_by(|a, b| (&a.destination, &a.id).cmp(&(&b.destination, &b.id)));
-                return self.page(request, rules.iter().map(|r| json!(r)).collect());
-            }
             "rule.create" | "rule.show" | "rule.update" | "rule.delete" => {
                 let index = if command == "rule.create" {
                     None
@@ -500,48 +552,6 @@ impl Store {
                     }
                     json!(rule)
                 }
-            }
-            "connection.list" => {
-                let filter = request.get("group_id").map(text).transpose()?;
-                if let Some(id) = filter
-                    && !config.groups.iter().any(|g| g.id == id)
-                {
-                    return Err(invalid("group not found"));
-                }
-                let sort = request
-                    .get("sort")
-                    .map(text)
-                    .transpose()?
-                    .unwrap_or("group");
-                if sort != "group" && sort != "name" {
-                    return Err(invalid("sort must be group or name"));
-                }
-                let mut connections: Vec<_> = config
-                    .connections
-                    .iter()
-                    .filter(|c| filter.is_none_or(|id| c.group_id == id))
-                    .collect();
-                let group_name = |id: &str| {
-                    config
-                        .groups
-                        .iter()
-                        .find(|g| g.id == id)
-                        .unwrap()
-                        .name
-                        .as_str()
-                };
-                connections.sort_by(|a, b| {
-                    if sort == "name" {
-                        (&a.name, &a.id).cmp(&(&b.name, &b.id))
-                    } else {
-                        (group_name(&a.group_id), &a.name, &a.id).cmp(&(
-                            group_name(&b.group_id),
-                            &b.name,
-                            &b.id,
-                        ))
-                    }
-                });
-                return self.page(request, connections.iter().map(|c| summary(c)).collect());
             }
             "connection.import" => {
                 protocol(&request["protocol"])?;
@@ -712,7 +722,11 @@ impl Store {
         File::open(directory)?.sync_all()
     }
 
-    fn page(&self, request: &Value, items: Vec<Value>) -> io::Result<Value> {
+    fn page<T: Serialize>(
+        &self,
+        request: &Value,
+        items: impl ExactSizeIterator<Item = T>,
+    ) -> io::Result<Value> {
         if request.get("list_revision").is_some()
             && request["list_revision"].as_u64() != Some(self.config.revision)
         {
@@ -726,24 +740,24 @@ impl Store {
         if offset > items.len() {
             return Err(invalid("invalid list offset"));
         }
-        let limit = offset.saturating_add(PAGE_SIZE).min(items.len());
-        let mut end = offset;
+        let total = items.len();
+        let mut data = Vec::new();
         let mut bytes = 128;
-        while end < limit {
-            let size = serde_json::to_vec(&items[end])?.len() + 1;
+        for item in items.skip(offset).take(PAGE_SIZE) {
+            let item = serde_json::to_value(item)?;
+            let size = serde_json::to_vec(&item)?.len() + 1;
             if bytes + size > crate::MAX_MESSAGE / 2 {
                 break;
             }
             bytes += size;
-            end += 1;
+            data.push(item);
         }
-        if end == offset && end < items.len() {
+        let end = offset + data.len();
+        if end == offset && end < total {
             return Err(invalid("list item exceeds response budget"));
         }
-        Ok(
-            json!({"data":items[offset..end], "list_revision":self.config.revision,
-            "next_offset":if end < items.len() {Some(end)} else {None}}),
-        )
+        Ok(json!({"data":data,"list_revision":self.config.revision,
+            "next_offset":if end < total {Some(end)}else{None}}))
     }
 }
 

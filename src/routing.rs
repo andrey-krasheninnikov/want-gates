@@ -5,7 +5,7 @@ use crate::{API_VERSION, invalid, secure_directory, write_message};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io;
 use std::net::TcpListener;
 use std::os::unix::net::UnixStream;
@@ -1978,13 +1978,27 @@ impl Service {
         Ok(())
     }
 
-    pub fn describe_connections(&self, response: &mut Value, config: &Config) {
+    pub fn describe_connections(
+        &self,
+        response: &mut Value,
+        config: &Config,
+        observed_digest: Option<&Value>,
+    ) -> io::Result<()> {
+        let busy = self.busy();
         let inspected = (|| -> io::Result<(bool, Option<Working>)> {
             let pending = optional::<Journal>(&self.root.join("journal.json"))?
                 .as_ref()
                 .is_some_and(pending);
             Ok((pending, optional(&self.root.join("working.json"))?))
         })();
+        if let Some(requested) = observed_digest {
+            let expected = store::text(requested)?;
+            let matches = matches!(&inspected, Ok((false, Some(working)))
+                if digest(&working.snapshot).is_ok_and(|current| current == expected));
+            if busy || !matches {
+                return Err(invalid("routing observation changed during listing; retry"));
+            }
+        }
         let native_live = inspected
             .as_ref()
             .ok()
@@ -1992,7 +2006,13 @@ impl Service {
             .map(|w| crate::native::observe(&self.native, &w.native));
         let records: io::Result<Option<ConnectionObservations>> =
             optional(&self.root.join("connections.json"));
+        let by_id: HashMap<_, _> = config
+            .connections
+            .iter()
+            .map(|c| (c.id.as_str(), c))
+            .collect();
         let describe = |value: &mut Value| {
+            let connection = value["id"].as_str().and_then(|id| by_id.get(id).copied());
             let fields = match &inspected {
                 Err(_) => {
                     json!({"runtime":"unknown","runtime_reason":"routing_state_unreadable","capabilities":[]})
@@ -2007,24 +2027,20 @@ impl Service {
                     json!({"runtime":"pending_apply","runtime_reason":"desired_state_changed","capabilities":[],"running_revision":w.config.revision})
                 }
                 Ok((false, Some(w))) => {
-                    let selected = config
-                        .connections
-                        .iter()
-                        .find(|c| value["id"] == c.id)
-                        .filter(|c| {
-                            w.config
-                                .connections
-                                .iter()
-                                .any(|old| old.id == c.id && old.profile_ref == c.profile_ref)
-                                && w.config.groups.iter().any(|g| {
-                                    g.id == c.group_id
-                                        && w.selected
-                                            .get(&g.id)
-                                            .map(|v| v.as_deref())
-                                            .unwrap_or(g.primary.as_deref())
-                                            == Some(&c.id)
-                                })
-                        });
+                    let selected = connection.filter(|c| {
+                        w.config
+                            .connections
+                            .iter()
+                            .any(|old| old.id == c.id && old.profile_ref == c.profile_ref)
+                            && w.config.groups.iter().any(|g| {
+                                g.id == c.group_id
+                                    && w.selected
+                                        .get(&g.id)
+                                        .map(|v| v.as_deref())
+                                        .unwrap_or(g.primary.as_deref())
+                                        == Some(&c.id)
+                            })
+                    });
                     let capabilities: Vec<_> = selected
                         .and_then(|c| w.matrix.get(&c.group_id))
                         .map(|m| {
@@ -2045,11 +2061,7 @@ impl Service {
                 {
                     object.insert("health".into(), record.describe());
                 }
-                if let Some(connection) = config
-                    .connections
-                    .iter()
-                    .find(|c| object.get("id").is_some_and(|v| v == &c.id))
-                {
+                if let Some(connection) = connection {
                     match &records {
                         Ok(records) => {
                             let record = records.as_ref().and_then(|r| r.get(&connection.id));
@@ -2152,10 +2164,7 @@ impl Service {
                             object.insert(
                                 "effective_dns".into(),
                                 json!(
-                                    config
-                                        .connections
-                                        .iter()
-                                        .find(|c| c.id == id)
+                                    connection
                                         .and_then(|c| c.dns.clone())
                                         .or_else(|| observation.dns.clone())
                                 ),
@@ -2181,6 +2190,7 @@ impl Service {
         } else {
             describe(&mut response["data"]);
         }
+        Ok(())
     }
 }
 
