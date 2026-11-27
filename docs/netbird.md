@@ -26,9 +26,9 @@ Create a NetBird profile:
 Use `"mode": "private"` and omit `exit_network_id` for private networks. Exit
 mode selects one advertised NetBird network ID and keeps its private routes.
 Publish exit routes to these peers with Auto Apply disabled. Use IP/CIDR
-resources for protected destinations. Resolve company names through the
-connection's explicit `--dns` resolver, which must be reachable through its
-tunnel.
+resources for protected destinations. Want Gates deselects advertised domain
+resources. Resolve company names through the connection's explicit `--dns`
+resolver, which must be reachable through its tunnel.
 
 The HTTPS management endpoint is included automatically. List any separate
 signal, relay, and device authorization or token endpoints, with their exact
@@ -68,7 +68,10 @@ Run `wgates connection login CONNECTION_ID` without a file to start native
 Device Authorization. Repeat it to read the pending HTTPS URL, code and expiry.
 Complete the sign-in in a browser you control. Use a provider configured for
 device login. The explicit login response is sensitive. Ordinary status
-reports the state and expiry without the URL or code.
+reports the state and deadline without the URL or code. During device login,
+the deadline is the local five-minute wait limit. The provider can expire the
+code sooner. After login, the deadline reflects the session expiry NetBird
+reports when one is available.
 
 Setup keys and device codes are transient. NetBird keeps its enrolled peer
 identity under the root-owned native state directory. A service restart

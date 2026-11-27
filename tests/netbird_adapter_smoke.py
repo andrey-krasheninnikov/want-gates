@@ -262,6 +262,25 @@ def acceptance(context, client, server, geodata):
     with ExitStack() as cleanup:
         companies = [fixture.Company(context, name, None, client, server, geodata, cleanup)
                      for name in fixture.COMPANIES]
+        for company in companies:
+            company.api(f'/networks/{company.private_network}/resources', dict(
+                name='Domain resource', address=f'unused.{company.name}.invalid',
+                enabled=True, groups=[company.resource_group]))
+        legacy_profiles = {}
+        for name in ('netbird/config.json', 'wiretrustee/config.json', 'ssh/ssh_config.d/99-netbird.conf'):
+            config = Path('/etc') / name
+            directory = config.parent
+            for parent in reversed([p for p in directory.parents if not p.exists()]):
+                parent.mkdir(mode=0o700)
+                cleanup.callback(parent.rmdir)
+            if not directory.exists():
+                directory.mkdir(mode=0o700)
+                cleanup.callback(directory.rmdir)
+            marker = f'# {name} host configuration must stay isolated'.encode()
+            with config.open('xb') as file:
+                file.write(marker)
+            cleanup.callback(config.unlink)
+            legacy_profiles[config] = marker
         # Trust the two disposable lab certificates for the duration of this test.
         cleanup.callback(stand.checked, 'update-ca-certificates', '--fresh')
         for company in companies:
@@ -334,8 +353,13 @@ def acceptance(context, client, server, geodata):
 
         apply()
         for company in companies:
-            for mode, connection in company.connections.items():
-                enrollment(company, connection, device=company.name == 'b' and mode == 'exit')
+            private = company.connections['private']
+            enrollment(company, private)
+            selected(company, private)
+            previous_session = observations(private)['session']
+            enrollment(company, company.connections['exit'], device=company.name == 'b')
+            selected(company, private)
+            assert observations(private)['session'] == previous_session, 'unchanged route lost its admission'
         for company in companies:
             selected(company, company.connections['private'])
         records = inventory()
@@ -383,6 +407,8 @@ def acceptance(context, client, server, geodata):
         direct_path()
         assert management() == default_route
         assert [path.read_bytes() for path in control_files] == original_files
+        for path, marker in legacy_profiles.items():
+            assert path.read_bytes() == marker, f'Host configuration changed: {path}'
         print('Service restart, all-down isolation, independent re-enrollment and host routes passed', flush=True)
 
 

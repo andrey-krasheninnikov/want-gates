@@ -426,6 +426,7 @@ fn namespace_child(
             .env("XDG_CONFIG_HOME", files.state)
             .env("NB_FORCE_RELAY", "true")
             .env("NB_WG_KERNEL_DISABLED", "true")
+            .env("NB_DISABLE_SSH_CONFIG", "true")
             .env("DBUS_SYSTEM_BUS_ADDRESS", "unix:path=/dev/null")
             .env("GODEBUG", "netdns=go")
             .stdout(Stdio::null())
@@ -1678,7 +1679,11 @@ impl Runtime {
             authentication: instance.auth.state.clone(),
             reason: instance.auth.reason.clone(),
             dns: instance.dns.clone(),
-            admitted: instance.admitted_session.as_ref() == Some(&instance.auth.session),
+            admitted: instance.admitted_session.as_ref() == Some(&instance.auth.session)
+                && instance
+                    .netbird
+                    .as_ref()
+                    .is_none_or(netbird::Session::routing_ready),
             resources_active: instance.record.namespace_identity.is_some()
                 || instance.client.is_some()
                 || instance.proxy.is_some(),
@@ -1731,10 +1736,13 @@ impl Runtime {
                 return Err(invalid("NetBird client exited"));
             }
             session.poll(&mut i.auth)?;
-            if crate::native::probe_ready(&i.auth.state) {
+            let authenticated = crate::native::probe_ready(&i.auth.state);
+            if session.routing_ready() && authenticated {
                 self.proxy(i, i.admitted_session.as_ref() == Some(&i.auth.session))?;
             } else {
-                i.admitted_session = None;
+                if !authenticated {
+                    i.admitted_session = None;
+                }
                 i.proxy_gate = None;
                 stop(&mut i.proxy);
             }
@@ -2033,16 +2041,17 @@ impl Runtime {
                 let admitted = request["admitted"]
                     .as_bool()
                     .ok_or_else(|| invalid("native admission boolean required"))?;
-                if admitted
-                    && (request["session"].as_str() != Some(&i.auth.session)
-                        || !crate::native::probe_ready(&i.auth.state))
-                {
+                let ready = crate::native::probe_ready(&i.auth.state)
+                    && i.netbird
+                        .as_ref()
+                        .is_none_or(netbird::Session::routing_ready);
+                if admitted && (request["session"].as_str() != Some(&i.auth.session) || !ready) {
                     return Err(invalid(
                         "native session changed; repeat resource verification",
                     ));
                 }
                 i.admitted_session = None;
-                if crate::native::probe_ready(&i.auth.state) {
+                if ready {
                     self.proxy(&mut i, admitted)?;
                 }
                 if admitted {

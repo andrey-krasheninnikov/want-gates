@@ -82,7 +82,6 @@ pub(super) fn resolve(profile: &Profile) -> io::Result<(Vec<Endpoint>, Hosts)> {
             .map_err(|_| invalid("NetBird control endpoint resolution failed"))?
             .lines()
             .filter_map(|line| line.split_whitespace().next()?.parse().ok())
-            .take(33)
             .collect()
         };
         hosts.insert(endpoint.host, ips);
@@ -156,15 +155,37 @@ impl ProcessFiles<'_> {
                     .map_err(|_| invalid("invalid NetBird mount target"))?,
             ));
         }
-        if Path::new("/etc/iproute2").is_dir() {
-            mounts.push((
-                CString::new(self.runtime.join("iproute2").as_os_str().as_encoded_bytes())
-                    .map_err(|_| invalid("invalid NetBird mount path"))?,
-                c"/etc/iproute2".into(),
-            ));
+        // NetBird may update rt_tables or import configuration during startup.
+        for (name, target) in [
+            ("iproute2", "/etc/iproute2"),
+            ("etc-netbird", "/etc/netbird"),
+            ("etc-wiretrustee", "/etc/wiretrustee"),
+            ("ssh-config", "/etc/ssh/ssh_config.d"),
+        ] {
+            match fs::symlink_metadata(target) {
+                Ok(meta) if meta.is_dir() => mounts.push((
+                    CString::new(self.runtime.join(name).as_os_str().as_encoded_bytes())
+                        .map_err(|_| invalid("invalid NetBird mount path"))?,
+                    CString::new(target).unwrap(),
+                )),
+                Ok(_) => {
+                    return Err(invalid(
+                        "NetBird host configuration path must be a directory",
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(mounts)
     }
+}
+
+#[derive(Clone, Copy)]
+enum StatusCheck {
+    Periodic,
+    AfterSelection,
+    Confirm(u64),
 }
 
 #[derive(Clone, Copy)]
@@ -173,9 +194,9 @@ enum Operation {
     Login { setup_key: bool },
     Wait,
     Up,
-    Status,
+    Status(StatusCheck),
     Networks { revision: u64, readback: bool },
-    Select { revision: u64 },
+    Select,
 }
 
 impl Operation {
@@ -185,9 +206,9 @@ impl Operation {
             Self::Login { .. } => "Login",
             Self::Wait => "WaitSSOLogin",
             Self::Up => "Up",
-            Self::Status => "Status",
+            Self::Status(_) => "Status",
             Self::Networks { .. } => "ListNetworks",
-            Self::Select { .. } => "SelectNetworks",
+            Self::Select => "SelectNetworks",
         }
     }
 }
@@ -202,6 +223,7 @@ impl Request {
     fn start(socket: &Path, operation: Operation, body: &Value) -> io::Result<Self> {
         let timeout = match operation {
             Operation::Wait => "300",
+            Operation::Up => "30",
             Operation::Login { .. } => "15",
             _ => "3",
         };
@@ -213,7 +235,8 @@ impl Request {
                 .args([
                     "--disable",
                     "--silent",
-                    "--fail",
+                    "--write-out",
+                    "\n%{http_code}",
                     "--noproxy",
                     "*",
                     "--max-time",
@@ -252,7 +275,7 @@ impl Request {
         Ok(request)
     }
 
-    fn poll(&mut self) -> io::Result<Option<Option<Value>>> {
+    fn poll(&mut self) -> io::Result<Option<Reply>> {
         let status = self.child.try_wait()?;
         let output = self.child.stdout.as_mut().unwrap();
         let mut buf = [0; 8192];
@@ -268,14 +291,11 @@ impl Request {
             }
         }
         Ok(status.map(|status| {
-            status
-                .success()
-                .then(|| {
-                    serde_json::from_slice::<Value>(&self.output)
-                        .ok()
-                        .filter(Value::is_object)
-                })
-                .flatten()
+            if status.success() {
+                Reply::parse(&self.output)
+            } else {
+                Reply::Unavailable
+            }
         }))
     }
 }
@@ -287,6 +307,57 @@ impl Drop for Request {
             let _ = self.child.wait();
         }
     }
+}
+
+enum Reply {
+    Data(Value),
+    Rejected,
+    Deadline,
+    Unavailable,
+}
+
+impl Reply {
+    fn parse(output: &[u8]) -> Self {
+        let mut parts = output.rsplitn(2, |byte| *byte == b'\n');
+        let (Some(http), Some(body)) = (parts.next(), parts.next()) else {
+            return Self::Unavailable;
+        };
+        let Ok(value) = serde_json::from_slice::<Value>(body) else {
+            return Self::Unavailable;
+        };
+        if http == b"200" && value.is_object() {
+            return Self::Data(value);
+        }
+        match value["code"].as_u64() {
+            Some(4) => Self::Deadline,
+            Some(2) if value["message"] == "context deadline exceeded" => Self::Deadline,
+            Some(7 | 16) => Self::Rejected,
+            _ => Self::Unavailable,
+        }
+    }
+}
+
+fn session_expiry(value: &Value) -> Option<u64> {
+    let timestamp = value.as_str()?.strip_suffix('Z')?;
+    let (seconds, fraction) = timestamp.split_once('.').unwrap_or((timestamp, ""));
+    if seconds.len() != 19 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let input = CString::new(seconds).ok()?;
+    let mut parsed = std::mem::MaybeUninit::<libc::tm>::zeroed();
+    // SAFETY: input and format are NUL-terminated. parsed holds writable storage for tm.
+    let end = unsafe {
+        libc::strptime(
+            input.as_ptr(),
+            c"%Y-%m-%dT%H:%M:%S".as_ptr(),
+            parsed.as_mut_ptr(),
+        )
+    };
+    if end != input.as_ptr().wrapping_add(seconds.len()).cast_mut() {
+        return None;
+    }
+    // SAFETY: strptime consumed the complete timestamp in the checked format.
+    u64::try_from(unsafe { libc::timegm(parsed.as_mut_ptr()) }).ok()
 }
 
 #[derive(Deserialize)]
@@ -302,41 +373,49 @@ struct Route {
     range: String,
     #[serde(default)]
     selected: bool,
+    #[serde(default)]
+    domains: Vec<String>,
 }
 
-fn route_selection(profile: &Profile, response: &Value) -> io::Result<(Vec<String>, bool)> {
+type Routes = BTreeMap<String, BTreeSet<String>>;
+
+fn route_selection(profile: &Profile, response: &Value) -> io::Result<(Routes, bool)> {
     let routes: Vec<Route> =
         serde_json::from_value(response.get("routes").cloned().unwrap_or(json!([])))
             .map_err(|_| invalid("invalid NetBird network inventory"))?;
     let mut target_found = profile.mode == Mode::Private;
-    let mut desired = BTreeSet::new();
+    let mut desired = Routes::new();
     let mut selected = BTreeSet::new();
     for route in routes {
         if !network_id(&route.id) {
             return Err(invalid("invalid NetBird network ID"));
         }
+        if route.selected {
+            selected.insert(route.id.clone());
+        }
+        if !route.domains.is_empty() {
+            continue;
+        }
         let mut is_exit = false;
+        let mut prefixes = BTreeSet::new();
         for prefix in route.range.split(',') {
-            is_exit |= Network::parse(prefix.trim())
-                .map_err(|_| invalid("unsupported NetBird network range"))?
-                .prefix
-                == 0;
+            let network = Network::parse(prefix.trim())
+                .map_err(|_| invalid("unsupported NetBird network range"))?;
+            is_exit |= network.prefix == 0;
+            prefixes.insert(network.canonical());
         }
         if is_exit && profile.exit_network_id.as_ref() == Some(&route.id) {
             target_found = true;
-            desired.insert(route.id.clone());
+            desired.insert(route.id, prefixes);
         } else if !is_exit {
-            desired.insert(route.id.clone());
-        }
-        if route.selected {
-            selected.insert(route.id);
+            desired.insert(route.id, prefixes);
         }
     }
     if !target_found {
         return Err(invalid("configured NetBird exit node is unavailable"));
     }
-    let matches = selected == desired;
-    Ok((desired.into_iter().collect(), matches))
+    let matches = selected.iter().eq(desired.keys());
+    Ok((desired, matches))
 }
 
 pub(super) struct Session {
@@ -350,6 +429,8 @@ pub(super) struct Session {
     request: Option<Request>,
     configured: bool,
     revision: Option<u64>,
+    active_routes: Option<Routes>,
+    pending_routes: Option<Routes>,
     explicit_selection: bool,
     user_code: Option<String>,
 }
@@ -380,7 +461,9 @@ impl Session {
             &runtime.join("resolv.conf"),
             "nameserver 127.0.0.1\noptions attempts:1 timeout:1\n",
         )?;
-        secure_directory(&runtime.join("iproute2"), 0o700, 0o077)?;
+        for name in ["iproute2", "etc-netbird", "etc-wiretrustee", "ssh-config"] {
+            secure_directory(&runtime.join(name), 0o700, 0o077)?;
+        }
         private_text(&runtime.join("iproute2/rt_tables"), "")?;
         if profile.mode == Mode::Private {
             let uid = format!("{bridge_uid}-{bridge_uid}");
@@ -474,6 +557,8 @@ impl Session {
                 request: None,
                 configured: false,
                 revision: None,
+                active_routes: None,
+                pending_routes: None,
                 explicit_selection: false,
                 user_code: None,
             },
@@ -554,13 +639,15 @@ impl Session {
     fn connect(&mut self, auth: &mut Authentication) -> io::Result<()> {
         self.user_code = None;
         auth.submitted();
-        self.send(Operation::Up, json!({"async":true}))
+        self.send(Operation::Up, json!({}))
     }
 
-    fn connected(&mut self, auth: &mut Authentication, revision: u64) {
-        auth.remembered = true;
-        auth.authenticated("netbird_connected");
-        self.revision = Some(revision);
+    pub fn routing_ready(&self) -> bool {
+        self.revision.is_some()
+    }
+
+    fn check_status(&mut self, check: StatusCheck) -> io::Result<()> {
+        self.send(Operation::Status(check), json!({"getFullPeerStatus":true}))
     }
 
     fn enrollment_finished(&mut self, auth: &mut Authentication) -> io::Result<()> {
@@ -572,9 +659,10 @@ impl Session {
     }
 
     pub fn poll(&mut self, auth: &mut Authentication) -> io::Result<()> {
-        if auth.state == "browser_required" && auth.expire() {
+        if matches!(auth.state.as_str(), "browser_required" | "authenticated") && auth.expire() {
             self.request = None;
             self.user_code = None;
+            self.revision = None;
             return Ok(());
         }
         if let Some(request) = self.request.as_mut() {
@@ -616,7 +704,7 @@ impl Session {
             )
         {
             self.next_status = Instant::now() + Duration::from_secs(1);
-            self.send(Operation::Status, json!({"getFullPeerStatus":true}))?;
+            self.check_status(StatusCheck::Periodic)?;
         }
         Ok(())
     }
@@ -625,13 +713,16 @@ impl Session {
         &mut self,
         auth: &mut Authentication,
         operation: Operation,
-        response: Option<Value>,
+        response: Reply,
     ) -> io::Result<()> {
-        let Some(value) = response else {
-            match operation {
-                Operation::Configure => return Err(invalid("NetBird configuration was refused")),
-                Operation::Wait | Operation::Login { .. } => {
-                    self.user_code = None;
+        let Reply::Data(value) = response else {
+            self.user_code = None;
+            match (operation, response) {
+                (Operation::Configure, _) => {
+                    return Err(invalid("NetBird configuration was refused"));
+                }
+                (Operation::Wait, Reply::Deadline) => auth.fail("authentication_expired"),
+                (Operation::Wait | Operation::Login { .. }, Reply::Rejected) => {
                     auth.fail("authentication_netbird_login_failed");
                 }
                 _ => self.unavailable(auth, "netbird_control_unavailable")?,
@@ -689,28 +780,24 @@ impl Session {
                 auth.reason = "netbird_connecting".into();
                 self.next_status = Instant::now();
             }
-            Operation::Status => self.status(auth, &value)?,
+            Operation::Status(check) => self.status(auth, &value, check)?,
             Operation::Networks { revision, readback } => {
-                let (ids, matches) = match route_selection(&self.profile, &value) {
+                let (routes, matches) = match route_selection(&self.profile, &value) {
                     Ok(selection) => selection,
                     Err(_) => return self.unavailable(auth, "netbird_routes_unavailable"),
                 };
                 if matches && (self.explicit_selection || readback) {
                     self.explicit_selection = true;
-                    self.connected(auth, revision);
+                    self.pending_routes = Some(routes);
+                    self.check_status(StatusCheck::Confirm(revision))?;
                 } else if readback {
                     self.unavailable(auth, "netbird_route_selection_unconfirmed")?;
                 } else {
-                    self.send(Operation::Select { revision }, json!({"networkIDs":ids}))?;
+                    let ids = routes.keys().collect::<Vec<_>>();
+                    self.send(Operation::Select, json!({"networkIDs":ids}))?;
                 }
             }
-            Operation::Select { revision } => self.send(
-                Operation::Networks {
-                    revision,
-                    readback: true,
-                },
-                json!({}),
-            )?,
+            Operation::Select => self.check_status(StatusCheck::AfterSelection)?,
         }
         Ok(())
     }
@@ -721,11 +808,18 @@ impl Session {
         }
         self.revision = None;
         self.explicit_selection = false;
+        self.active_routes = None;
+        self.pending_routes = None;
         auth.fail(reason);
         Ok(())
     }
 
-    fn status(&mut self, auth: &mut Authentication, value: &Value) -> io::Result<()> {
+    fn status(
+        &mut self,
+        auth: &mut Authentication,
+        value: &Value,
+        check: StatusCheck,
+    ) -> io::Result<()> {
         match value["status"].as_str() {
             Some("Connected")
                 if value.pointer("/fullStatus/managementState/connected") == Some(&json!(true)) =>
@@ -738,20 +832,35 @@ impl Session {
                             .or_else(|| v.as_u64())
                     })
                     .unwrap_or(0);
-                if self.revision != Some(revision) {
-                    if auth.state == "authenticated" {
+                let expiry = session_expiry(&value["sessionExpiresAt"]);
+                if let StatusCheck::Confirm(expected) = check
+                    && expected == revision
+                {
+                    if auth.state == "authenticated" && self.active_routes != self.pending_routes {
                         auth.session = random_id()?;
                     }
+                    self.active_routes = self.pending_routes.take();
+                    self.revision = Some(revision);
+                    auth.remembered = true;
+                    auth.authenticated("netbird_connected");
+                    auth.expires_at = expiry;
+                } else if self.revision != Some(revision)
+                    || matches!(check, StatusCheck::AfterSelection)
+                {
                     self.revision = None;
-                    auth.state = "connecting".into();
+                    if auth.state != "authenticated" {
+                        auth.state = "connecting".into();
+                    }
                     auth.reason = "netbird_confirming_routes".into();
                     self.send(
                         Operation::Networks {
                             revision,
-                            readback: false,
+                            readback: matches!(check, StatusCheck::AfterSelection),
                         },
                         json!({}),
                     )?;
+                } else {
+                    auth.expires_at = expiry;
                 }
             }
             Some("SessionExpired") => {
@@ -770,4 +879,45 @@ impl Session {
 
 pub(super) fn new_auth() -> io::Result<Authentication> {
     Authentication::new(Credentials::default(), false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Reply, session_expiry};
+    use serde_json::json;
+
+    #[test]
+    fn daemon_reply_distinguishes_expiry_and_rejected_credentials() {
+        assert!(matches!(
+            Reply::parse(b"{\"code\":4}\n504"),
+            Reply::Deadline
+        ));
+        assert!(matches!(
+            Reply::parse(b"{\"code\":2,\"message\":\"context deadline exceeded\"}\n500"),
+            Reply::Deadline
+        ));
+        assert!(matches!(
+            Reply::parse(b"{\"code\":7}\n403"),
+            Reply::Rejected
+        ));
+        assert!(matches!(
+            Reply::parse(b"{\"code\":14}\n503"),
+            Reply::Unavailable
+        ));
+        assert!(matches!(Reply::parse(b"{}\n200"), Reply::Data(_)));
+    }
+
+    #[test]
+    fn daemon_session_expiry_is_read_in_utc_seconds() {
+        assert_eq!(
+            session_expiry(&json!("2000-01-01T00:00:00.123456Z")),
+            Some(946684800)
+        );
+        assert_eq!(
+            session_expiry(&json!("2000-01-01T00:00:00Z")),
+            Some(946684800)
+        );
+        assert_eq!(session_expiry(&json!(null)), None);
+        assert_eq!(session_expiry(&json!("not a timestamp")), None);
+    }
 }

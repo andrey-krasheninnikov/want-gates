@@ -265,6 +265,8 @@ class Company:
         group = next(group['id'] for group in self.api('/groups') if group['name'] == 'All')
         resource_group = self.api('/groups', dict(name='Private LAN', peers=[]))['id']
         network = self.api('/networks', dict(name='private', description='Company LAN'))['id']
+        self.private_network = network
+        self.resource_group = resource_group
         self.api(f'/networks/{network}/routers', dict(peer=peers['router'], metric=100,
                                                       masquerade=True, enabled=True))
         for cidr in ('10.220.0.0/24', 'fd42:220::/64'):
@@ -310,7 +312,8 @@ class Company:
         state.mkdir(mode=0o700, exist_ok=True)
         args = [self.client, '--daemon-addr', f'unix://{state}/control.sock',
                 '--config', state / 'config.json', '--log-file', 'console', 'service', 'run']
-        process = self.spawn(namespace, args, role, cleanup, dict(self.env, NB_STATE_DIR=str(state)))
+        process = self.spawn(namespace, args, role, cleanup,
+                             dict(self.env, NB_STATE_DIR=str(state), NB_DISABLE_SSH_CONFIG='true'))
         def ready():
             if process.poll() is not None:
                 raise RuntimeError(f'{self.name} {role} daemon exited with {process.returncode}')
