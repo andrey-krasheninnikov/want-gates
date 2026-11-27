@@ -833,9 +833,12 @@ impl Service {
             }
             let working: Option<Working> = optional(&self.root.join("working.json"))?;
             if summary {
+                let journal = optional::<Journal>(&self.root.join("journal.json"))?;
+                let recovery = journal.as_ref().filter(|journal| !busy && pending(journal));
                 let observed_digest = working.as_ref().and_then(|working| {
                     let saved_digest = saved["saved_digest"].as_str()?;
                     (!busy
+                        && recovery.is_none()
                         && saved["mismatch"] == false
                         && saved["plan_id"] == working.plan_id
                         && saved["running_revision"] == working.config.revision
@@ -845,7 +848,7 @@ impl Service {
                 });
                 return Ok(Some(json!({"data":{
                     "desired_revision":store.config().revision,"busy":busy,
-                    "recovery_required":!busy && optional::<Journal>(&self.root.join("journal.json"))?.as_ref().is_some_and(pending),
+                    "recovery_required":recovery.is_some(),"recovery_plan_id":recovery.map(|journal|&journal.plan.id),
                     "observed_digest":observed_digest,"health_error":working.as_ref().and_then(|w|w.health_error.as_deref()).map(diagnostics::health_problem),
                     "last_observation":{
                         "state":saved["state"],"running_revision":saved["running_revision"],
@@ -1953,7 +1956,11 @@ impl Service {
     ) -> io::Result<()> {
         let expected = store::text(observed_digest)?;
         let changed = || invalid("routing observation changed during listing; retry");
-        if self.busy() {
+        if self.busy()
+            || optional::<Journal>(&self.root.join("journal.json"))?
+                .as_ref()
+                .is_some_and(pending)
+        {
             return Err(changed());
         }
         let working: Working = optional(&self.root.join("working.json"))?.ok_or_else(changed)?;
