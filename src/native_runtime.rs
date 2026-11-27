@@ -1673,8 +1673,8 @@ impl Runtime {
         }
         Ok(())
     }
-    fn observation(instance: &Instance) -> Observation {
-        Observation {
+    fn observation(instance: &Instance) -> Value {
+        let observation = Observation {
             session: instance.auth.session.clone(),
             authentication: instance.auth.state.clone(),
             reason: instance.auth.reason.clone(),
@@ -1687,7 +1687,12 @@ impl Runtime {
             expires_at: instance.auth.expires_at,
             remembered: instance.auth.remembered,
             netbird_routes_revision: instance.netbird.as_ref().and_then(|s| s.observed_revision),
+        };
+        let mut response = json!(observation);
+        if let Some(revision) = observation.netbird_routes_revision {
+            response["netbird_routes_revision"] = json!(revision);
         }
+        response
     }
     fn stop_in_poll(&mut self, process: &mut Option<Child>, forti: bool) {
         if !forti {
@@ -2058,7 +2063,7 @@ impl Runtime {
                 if admitted {
                     i.admitted_session = Some(i.auth.session.clone());
                 }
-                Ok(json!(Self::observation(&i)))
+                Ok(Self::observation(&i))
             }
             "logout" => {
                 i.record.paused = true;
@@ -2081,14 +2086,14 @@ impl Runtime {
                     i.auth.fail("native_cleanup_required");
                     return Err(error);
                 }
-                Ok(json!(Self::observation(&i)))
+                Ok(Self::observation(&i))
             }
             "restart" => {
                 if i.auth.reason == "native_cleanup_required" {
                     self.cleanup(&mut i.record, false)?;
                 }
                 self.restart(&mut i, true)?;
-                Ok(json!(Self::observation(&i)))
+                Ok(Self::observation(&i))
             }
             "forget-auth" => {
                 if i.record.profile["protocol"] == "netbird" {

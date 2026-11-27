@@ -137,13 +137,16 @@ pub struct Observation {
     pub resources_active: bool,
     pub expires_at: Option<u64>,
     pub remembered: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    // The live revision stays out of state read by older binaries.
+    #[serde(default, skip_serializing)]
     pub netbird_routes_revision: Option<u64>,
 }
 impl Observation {
-    pub fn netbird_routes_rechecked(&self, current: &Self) -> bool {
+    pub fn netbird_runtime_changed(&self, current: &Self) -> bool {
         self.netbird_routes_revision.is_some()
-            && (self.netbird_routes_revision != current.netbird_routes_revision
+            && (self.session != current.session
+                || self.authentication != current.authentication
+                || self.netbird_routes_revision != current.netbird_routes_revision
                 || self.reason == NETBIRD_CONFIRMING_ROUTES
                 || current.reason == NETBIRD_CONFIRMING_ROUTES)
     }
@@ -368,18 +371,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn route_recheck_detects_a_completed_revision_change() {
+    fn netbird_change_detection_covers_route_updates_and_expiry() {
         let before = Observation {
+            authentication: "authenticated".into(),
             netbird_routes_revision: Some(10),
             ..Observation::default()
         };
         let mut current = before.clone();
-        assert!(!before.netbird_routes_rechecked(&current));
+        assert!(!before.netbird_runtime_changed(&current));
         current.reason = NETBIRD_CONFIRMING_ROUTES.into();
-        assert!(before.netbird_routes_rechecked(&current));
+        assert!(before.netbird_runtime_changed(&current));
         current.reason.clear();
         current.netbird_routes_revision = Some(11);
-        assert!(before.netbird_routes_rechecked(&current));
-        assert!(!Observation::default().netbird_routes_rechecked(&current));
+        assert!(before.netbird_runtime_changed(&current));
+        current.netbird_routes_revision = before.netbird_routes_revision;
+        current.authentication = "expired".into();
+        assert!(before.netbird_runtime_changed(&current));
+        assert!(!Observation::default().netbird_runtime_changed(&current));
+    }
+
+    #[test]
+    fn live_netbird_revision_does_not_change_stored_observations() {
+        let mut previous = serde_json::to_value(Observation::default()).unwrap();
+        previous["netbird_routes_revision"] = json!(10);
+        let observation: Observation = serde_json::from_value(previous).unwrap();
+        assert_eq!(observation.netbird_routes_revision, Some(10));
+        assert_eq!(
+            serde_json::to_value(observation).unwrap(),
+            serde_json::to_value(Observation::default()).unwrap()
+        );
     }
 }

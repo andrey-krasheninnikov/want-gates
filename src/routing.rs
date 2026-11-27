@@ -2107,10 +2107,8 @@ impl Service {
         }
         self.reload_health = false;
         let ready = (|| -> io::Result<Option<(Working, Vec<String>)>> {
-            if optional::<Journal>(&self.root.join("journal.json"))?
-                .as_ref()
-                .is_some_and(pending)
-            {
+            let journal = optional::<Journal>(&self.root.join("journal.json"))?;
+            if journal.as_ref().is_some_and(pending) {
                 self.health_due.clear();
                 return Ok(None);
             }
@@ -2134,11 +2132,19 @@ impl Service {
                     }
                 }
             }
+            let restored = journal.as_ref().is_some_and(|j| j.phase == "restored");
             let mut due = Vec::new();
             for group in &working.config.groups {
                 if let Some(check) = &group.healthcheck {
                     let next = self.health_due.entry(group.id.clone()).or_insert(now);
-                    if *next <= now {
+                    let selection_needs_check = restored
+                        && working
+                            .selected
+                            .get(&group.id)
+                            .and_then(Option::as_ref)
+                            .and_then(|id| working.health.get(id))
+                            .is_some_and(|record| !record.fresh);
+                    if *next <= now || selection_needs_check {
                         due.push(group.id.clone());
                         *next = now + std::time::Duration::from_secs(check.interval_seconds);
                     }
@@ -2312,7 +2318,7 @@ fn health_cycle(
         phase: "applying".into(),
     };
     private_write(&root.join("journal.json"), &journal)?;
-    let mut netbird_rechecked = false;
+    let mut netbird_changed_during_switch = false;
     let result = (|| -> io::Result<()> {
         submit(root, &client, &mut journal, &candidate)?;
         let verification = crate::native::admit(
@@ -2333,15 +2339,15 @@ fn health_cycle(
                 Some(&working.health),
             )
         });
-        // A route recheck can pause the bridge during otherwise valid probes.
+        // NetBird may close the bridge while admission or traffic checks run.
         if verification.is_err()
             && working
                 .native_observations
                 .values()
                 .any(|state| state.netbird_routes_revision.is_some())
         {
-            netbird_rechecked =
-                crate::native::observe(native, &working.native).is_ok_and(|latest| {
+            netbird_changed_during_switch = crate::native::observe(native, &working.native)
+                .is_ok_and(|latest| {
                     effective
                         .groups
                         .iter()
@@ -2357,7 +2363,7 @@ fn health_cycle(
                                 .get(id)
                                 .zip(latest.get(id))
                                 .is_some_and(|(before, after)| {
-                                    before.netbird_routes_rechecked(after)
+                                    before.netbird_runtime_changed(after)
                                 })
                         })
                 });
@@ -2384,7 +2390,7 @@ fn health_cycle(
             recovery_required(root, &mut journal)?;
         } else {
             let restored = recover(root, &client, &mut journal, native);
-            if (crate::native::unavailable(&error) || netbird_rechecked)
+            if (crate::native::unavailable(&error) || netbird_changed_during_switch)
                 && restored.as_ref().is_ok_and(|report| {
                     matches!(
                         report["state"].as_str(),
