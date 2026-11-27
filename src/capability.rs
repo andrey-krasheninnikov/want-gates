@@ -69,7 +69,56 @@ pub fn observations(
     Value::Object(output)
 }
 
+pub fn public_reason(reason: &str) -> &str {
+    match reason {
+        "candidate" => "verification_required",
+        reason if reason.starts_with("probe_failed:") => "probe_failed",
+        "verified"
+        | "configured_limit"
+        | "protocol_limit"
+        | "probe_missing"
+        | "probe_failed"
+        | "probe_timed_out"
+        | "no_eligible_connection"
+        | "primary_missing"
+        | "not_checked"
+        | "not_rechecked"
+        | "inputs_changed"
+        | "awaiting_probe"
+        | "healthcheck_pending"
+        | "dns_missing"
+        | "dns_failed"
+        | "dns_capability_missing"
+        | "dns_transport_unverified"
+        | "native_authentication_required"
+        | "native_unavailable"
+        | "native_runtime_unavailable"
+        | "native_session_requires_verification"
+        | "netbird_confirming_routes"
+        | "target_failed"
+        | "target_status_failed"
+        | "target_response_mismatch"
+        | "target_response_too_large"
+        | "capability_missing"
+        | "tls_failed"
+        | "authenticated"
+        | "authenticating"
+        | "connecting"
+        | "credentials_required"
+        | "challenge_required"
+        | "browser_required"
+        | "configured"
+        | "unavailable"
+        | "stopped"
+        | "expired"
+        | "failed"
+        | "unknown" => reason,
+        _ => "unknown",
+    }
+}
+
 pub fn observation(reason: &str) -> Value {
+    let reason = public_reason(reason);
     let state = match reason {
         "configured_limit" | "protocol_limit" => "unsupported",
         "inputs_changed" => "stale",
@@ -77,8 +126,5 @@ pub fn observation(reason: &str) -> Value {
         "probe_missing" | "not_checked" | "not_rechecked" | "primary_missing" => "unverified",
         _ => "unavailable",
     };
-    let (reason, detail) = reason
-        .strip_prefix("probe_failed: ")
-        .map_or((reason, None), |detail| ("probe_failed", Some(detail)));
-    json!({"state":state,"reason":reason,"detail":detail})
+    json!({"state":state,"reason":reason,"detail":null})
 }

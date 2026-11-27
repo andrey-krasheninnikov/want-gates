@@ -199,7 +199,7 @@ fn controlled_path(path: &Path) -> io::Result<PathBuf> {
     ))
 }
 
-fn executable(path: &Path) -> io::Result<PathBuf> {
+pub(crate) fn executable(path: &Path) -> io::Result<PathBuf> {
     let path = path.canonicalize()?;
     let m = fs::metadata(&path)?;
     if !m.is_file() || m.uid() != 0 || m.mode() & 0o022 != 0 || m.mode() & 0o111 == 0 {
@@ -229,6 +229,15 @@ fn bootstrap_addresses(host: &str) -> io::Result<Vec<IpAddr>> {
         .collect())
 }
 fn command_input(program: &str, args: &[&str], stdin: Stdio) -> io::Result<String> {
+    command_input_with_limit(program, args, stdin, 1024 * 1024)
+}
+
+pub(crate) fn command_input_with_limit(
+    program: &str,
+    args: &[&str],
+    stdin: Stdio,
+    limit: usize,
+) -> io::Result<String> {
     let mut child = Command::new(program)
         .args(args)
         .env_clear()
@@ -254,7 +263,7 @@ fn command_input(program: &str, args: &[&str], stdin: Stdio) -> io::Result<Strin
                 match stdout.read(&mut chunk) {
                     Ok(0) => break,
                     Ok(n) => {
-                        if output.len() + n > 1024 * 1024 {
+                        if output.len() + n > limit {
                             return Err(invalid("native network output exceeds its limit"));
                         }
                         output.extend_from_slice(&chunk[..n]);
@@ -1748,9 +1757,8 @@ impl Runtime {
         for key in keys {
             let mut instance = self.instances.remove(&key).unwrap();
             let result = self.poll_instance(&mut instance);
-            if let Err(error) = result {
+            if result.is_err() {
                 instance.auth.fail("native_runtime_failed");
-                instance.auth.reason = error.to_string();
                 instance.dns = None;
                 instance.admitted_session = None;
                 let forti = instance.forti.is_some();
@@ -2367,13 +2375,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>, cleanup_only: bool) -> io::
     for binary in ["/usr/sbin/ip", "/usr/sbin/nft"] {
         executable(Path::new(binary))?;
     }
-    let xray = xray.unwrap_or_else(|| {
-        PathBuf::from(if cfg!(target_arch = "aarch64") {
-            "/usr/local/x-ui/bin/xray-linux-arm64"
-        } else {
-            "/usr/local/x-ui/bin/xray-linux-amd64"
-        })
-    });
+    let xray = xray.unwrap_or_else(crate::native::default_xray);
     let xray = if cleanup_only {
         xray
     } else {

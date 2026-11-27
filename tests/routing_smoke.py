@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run real VLESS traffic only on a disposable local Linux systemd host."""
 import argparse
+import copy
 import grp
 import ipaddress
 import json
@@ -416,6 +417,7 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
         uid=pwd.getpwnam(prefix).pw_uid
         text=(repo/'packaging/systemd/wgates.service').read_text().replace('wgates',prefix)
         text=text.replace('[Service]','[Service]\nNetworkNamespacePath=/run/netns/'+names['gateway'])
+        text=text.replace(' serve --socket ', f' serve --xray {xray} --socket ')
         if native_acceptance is not None:
             text=text.replace(' serve --socket ', f' serve --native-socket /run/{prefix}-native/control.sock --socket ')
         with unit.open('x') as file:
@@ -477,6 +479,42 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
             summary=control('connection','show',connection)['data']
             assert summary['runtime']=='applied' and set(summary['capabilities'])=={'tcp_ipv4','udp_ipv4','tcp_ipv6','udp_ipv6'}
         print('real 3x-ui apply verified TCP/UDP over IPv4/IPv6 for both groups')
+        routing_state=state/'routing'
+        assert 'probe_handlers' not in json.loads((routing_state/'working.json').read_text())
+        evidence=json.loads((routing_state/'probe-handlers.json').read_text())
+        assert evidence['plan_id']==applied['plan_id']
+        assert 'wgates-out-'+connections['a'] in evidence['handlers']
+        before_diagnose=api('xray/',{})
+        diagnostic=control('routing','diagnose','10.220.0.10','--capability','tcp_ipv4','--probe')['data']
+        assert diagnostic['runtime']=='last_observed',diagnostic
+        assert diagnostic['last_observed']['decision']=='group',diagnostic
+        assert diagnostic['last_observed']['connection']['id']==connections['a'],diagnostic
+        assert diagnostic['probe']['state']=='passed' and diagnostic['probe']['reason']=='verified',diagnostic
+        probe_fault=work/'probe-failures.json'
+        probe_fault.write_text(json.dumps(['10.211.0.1']))
+        try:
+            failed=control('routing','diagnose','10.220.0.10','--capability','udp_ipv4','--probe')['data']
+            assert failed['last_observed']['decision']=='group',failed
+            assert failed['probe']['state']=='failed' and failed['probe']['reason']=='probe_failed',failed
+        finally:
+            probe_fault.unlink()
+        assert api('xray/',{})==before_diagnose
+        observed=json.loads(before_diagnose) if isinstance(before_diagnose,str) else before_diagnose
+        drifted=copy.deepcopy(observed['xraySetting'])
+        alternate=outbound('10.214.0.2',19002,ids['b'])
+        target_tag='wgates-out-'+connections['a']
+        for index,item in enumerate(drifted['outbounds']):
+            if item['tag']==target_tag:
+                drifted['outbounds'][index]=dict(alternate,tag=target_tag)
+                break
+        else:
+            raise AssertionError('missing selected outbound')
+        api('xray/update',dict(xraySetting=json.dumps(drifted),outboundTestUrl=observed['outboundTestUrl']))
+        try:
+            mismatch=control('routing','diagnose','10.220.0.10','--capability','tcp_ipv4','--probe')['data']
+            assert mismatch['probe']['state']=='skipped' and mismatch['probe']['reason']=='panel_drift',mismatch
+        finally:
+            api('xray/update',dict(xraySetting=json.dumps(observed['xraySetting']),outboundTestUrl=observed['outboundTestUrl']))
 
         def tcp(address,expected,positive=True):
             marker='/'+secrets.token_hex(12)
@@ -808,6 +846,10 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
         assert control('group','show',groups['a'])['data']['primary']==connections['a']
         failures.write_text(json.dumps(['10.211.0.1','fd42:211::1','10.212.0.1','fd42:212::1']))
         group=await_health(lambda g:g['selected_connection'] is None)
+        diagnostic=control('routing','diagnose','v4.corp.test','--capability','tcp_ipv4')['data']
+        assert diagnostic['last_observed']['decision']=='blocked',diagnostic
+        assert diagnostic['last_observed']['reason']=='no_eligible_connection',diagnostic
+        assert any(c['reason']=='unhealthy' for c in diagnostic['last_observed']['candidates']),diagnostic
         markers=[tcp('10.220.0.10',None,False),udp(15354,None,False),named_tcp('v4.corp.test',None,positive=False)]
         denied=secrets.token_hex(10)+'.v4.corp.test';lookup(denied,rcode=5)
         tcp('10.221.0.10','10.212.0.1');tcp('1.1.1.1','10.210.0.1')

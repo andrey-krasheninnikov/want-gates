@@ -321,3 +321,150 @@ fn domain_rules_are_canonical_and_conflicts_identify_both_groups() {
         rule
     );
 }
+
+#[test]
+fn diagnose_reports_the_winning_rule_without_applying_policy() {
+    let service = Service::start();
+    let broad = ok(
+        &service,
+        &["group", "create", "--name", "Broad route"],
+        None,
+    );
+    let narrow = ok(
+        &service,
+        &["group", "create", "--name", "Specific route"],
+        None,
+    );
+    let broad_id = broad["data"]["id"].as_str().unwrap();
+    let narrow_id = narrow["data"]["id"].as_str().unwrap();
+    ok(
+        &service,
+        &[
+            "rule",
+            "create",
+            "--group",
+            broad_id,
+            "--destination",
+            "192.0.2.0/24",
+        ],
+        None,
+    );
+    let rule = ok(
+        &service,
+        &[
+            "rule",
+            "create",
+            "--group",
+            narrow_id,
+            "--destination",
+            "192.0.2.64/26",
+        ],
+        None,
+    );
+    let before = ok(&service, &["routing", "status"], None);
+    let matched = ok(
+        &service,
+        &[
+            "routing",
+            "diagnose",
+            "192.0.2.70",
+            "--capability",
+            "tcp_ipv4",
+        ],
+        None,
+    );
+    assert_eq!(matched["api_version"], 1);
+    assert_eq!(matched["data"]["runtime"], "unapplied");
+    assert_eq!(matched["data"]["desired"]["decision"], "blocked");
+    assert_eq!(matched["data"]["desired"]["rule_id"], rule["data"]["id"]);
+    assert_eq!(matched["data"]["desired"]["group_id"], narrow_id);
+    assert!(matched["data"]["last_observed"].is_null());
+    assert_eq!(matched["data"]["probe"]["state"], "not_requested");
+
+    let unmatched = ok(
+        &service,
+        &[
+            "routing",
+            "diagnose",
+            "example.test",
+            "--capability",
+            "tcp_ipv4",
+        ],
+        None,
+    );
+    assert_eq!(unmatched["data"]["desired"]["decision"], "unmatched");
+    assert_eq!(ok(&service, &["routing", "status"], None), before);
+}
+
+#[test]
+fn routing_logs_report_failed_operations_without_profile_contents() {
+    let service = Service::start();
+    let group = ok(&service, &["group", "create", "--name", "Company"], None);
+    let id = group["data"]["id"].as_str().unwrap();
+    let uuid = "00000000-0000-4000-8000-000000000099";
+    ok(
+        &service,
+        &[
+            "connection",
+            "import",
+            "--name",
+            "VPN",
+            "--group",
+            id,
+            "--protocol",
+            "vless",
+            "--file",
+            "-",
+        ],
+        Some(&format!(
+            "vless://{uuid}@127.0.0.1:443?encryption=none&security=none"
+        )),
+    );
+    assert!(
+        !run(&service, &["routing", "preview"], None)
+            .status
+            .success()
+    );
+    let logs = ok(&service, &["routing", "logs", "--limit", "1"], None);
+    assert_eq!(logs["data"].as_array().unwrap().len(), 1);
+    assert_eq!(logs["data"][0]["operation"], "routing.preview");
+    assert_eq!(logs["data"][0]["outcome"], "failed");
+    assert!(!logs.to_string().contains(uuid));
+    assert!(
+        !run(&service, &["routing", "logs", "--limit", "0"], None)
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn routing_status_redacts_saved_internal_errors() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let service = Service::start();
+    let sentinel = "synthetic-private-auth-value";
+    let observation = serde_json::json!({
+        "state": "restored_runtime_unverified",
+        "running_revision": null,
+        "runtime_verification_error": format!("native process reported {sentinel}"),
+        "capabilities": {"g1":{"tcp_ipv4":format!("probe_failed: {sentinel}")}}
+    });
+    let directory = service.state.join("routing");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&directory)
+        .unwrap();
+    let path = directory.join("status.json");
+    std::fs::write(&path, observation.to_string()).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let status = ok(&service, &["routing", "status"], None);
+    let saved = &status["data"]["last_observation"];
+    assert_eq!(
+        saved["runtime_verification_error"],
+        "runtime_verification_failed"
+    );
+    assert_eq!(saved["capabilities"]["g1"]["tcp_ipv4"], "probe_failed");
+    assert!(!status.to_string().contains(sentinel));
+    assert!(std::fs::read_to_string(path).unwrap().contains(sentinel));
+}

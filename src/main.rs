@@ -39,7 +39,7 @@ const MAX_MESSAGE: usize = 4 * 1024 * 1024;
 const HELP: &str = "Want Gates local control service
 
 Usage:
-  wgates serve [--socket PATH] [--state-dir PATH] [--native-socket PATH]
+  wgates serve [--socket PATH] [--state-dir PATH] [--native-socket PATH] [--xray PATH]
   wgates status [--socket PATH]
   wgates group create --name NAME [--socket PATH]
   wgates group list|show ID|delete ID [--socket PATH]
@@ -56,6 +56,8 @@ Usage:
   wgates panel configure --file PATH|-
   wgates panel preflight
   wgates routing preview|status
+  wgates routing diagnose HOST_OR_IP --capability tcp_ipv4|udp_ipv4|tcp_ipv6|udp_ipv6 [--probe]
+  wgates routing logs [--limit N]
   wgates routing apply PLAN_ID|recover PLAN_ID
   wgates --version
 
@@ -122,6 +124,7 @@ fn run() -> io::Result<()> {
     let mut socket = PathBuf::from("/run/wgates/control.sock");
     let mut state = PathBuf::from("/var/lib/wgates");
     let mut native_socket = PathBuf::from(native::DEFAULT_SOCKET);
+    let mut xray = native::default_xray();
     while let Some(option) = args.next() {
         if option == "--help" || option == "-h" {
             print!("{HELP}");
@@ -133,19 +136,21 @@ fn run() -> io::Result<()> {
             &mut state
         } else if option == "--native-socket" && command == "serve" {
             &mut native_socket
+        } else if option == "--xray" && command == "serve" {
+            &mut xray
         } else {
             return Err(invalid("unknown option; run wgates --help"));
         };
         *destination = args
             .next()
             .map(PathBuf::from)
-            .ok_or_else(|| invalid("a path is required after --socket or --state-dir"))?;
+            .ok_or_else(|| invalid("a path is required after the option"))?;
         if !destination.is_absolute() {
-            return Err(invalid("socket and state paths must be absolute"));
+            return Err(invalid("service paths must be absolute"));
         }
     }
     if command == "serve" {
-        serve(&socket, &state, &native_socket)
+        serve(&socket, &state, &native_socket, &xray)
     } else {
         status(&socket)
     }
@@ -213,7 +218,7 @@ impl Drop for OwnedSocket {
     }
 }
 
-fn serve(socket: &Path, state: &Path, native_socket: &Path) -> io::Result<()> {
+fn serve(socket: &Path, state: &Path, native_socket: &Path, xray: &Path) -> io::Result<()> {
     let parent = socket
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -241,7 +246,7 @@ fn serve(socket: &Path, state: &Path, native_socket: &Path) -> io::Result<()> {
     let stopping = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&stopping))?;
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&stopping))?;
-    let mut routing = routing::Service::new(state, Arc::clone(&stopping), native_socket)?;
+    let mut routing = routing::Service::new(state, Arc::clone(&stopping), native_socket, xray)?;
     eprintln!("wgates: control service ready at {}", socket.display());
     // Keep configuration writes serialized while network operations use one worker.
     while !stopping.load(Ordering::Relaxed) {

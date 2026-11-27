@@ -15,6 +15,13 @@ pub fn probe_ready(authentication: &str) -> bool {
 }
 
 pub const DEFAULT_SOCKET: &str = "/run/wgates-native/control.sock";
+pub fn default_xray() -> PathBuf {
+    PathBuf::from(if cfg!(target_arch = "aarch64") {
+        "/usr/local/x-ui/bin/xray-linux-arm64"
+    } else {
+        "/usr/local/x-ui/bin/xray-linux-amd64"
+    })
+}
 pub const NETBIRD_CONFIRMING_ROUTES: &str = "netbird_confirming_routes";
 
 #[derive(Clone)]

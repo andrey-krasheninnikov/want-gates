@@ -1,5 +1,5 @@
 use crate::panel::{Client, Settings, Snapshot};
-use crate::policy::Network;
+use crate::policy::{Network, Rule};
 use crate::store::{self, Config, Store, private_read, private_write, random_id};
 use crate::{API_VERSION, invalid, secure_directory, write_message};
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
+
+mod diagnostics;
 
 const PREFIX: &str = "wgates-";
 pub const PROBE_TAG: &str = "wgates-probe";
@@ -280,18 +282,30 @@ fn ingress(base: &Snapshot) -> io::Result<Vec<String>> {
     }
     Ok(tags.into_iter().collect())
 }
-fn winner(config: &Config, address: std::net::IpAddr) -> Option<&str> {
+fn network_order(left: &(Network, &Rule), right: &(Network, &Rule)) -> std::cmp::Ordering {
+    right
+        .0
+        .prefix
+        .cmp(&left.0.prefix)
+        .then_with(|| left.1.destination.cmp(&right.1.destination))
+}
+
+fn network_winner(config: &Config, address: std::net::IpAddr) -> Option<&Rule> {
     config
         .rules
         .iter()
-        .filter_map(|r| {
-            Network::parse(&r.destination)
+        .filter_map(|rule| {
+            Network::parse(&rule.destination)
                 .ok()
-                .filter(|n| n.contains(address))
-                .map(|n| (n.prefix, r.group_id.as_str()))
+                .filter(|network| network.contains(address))
+                .map(|network| (network, rule))
         })
-        .max_by_key(|(p, _)| *p)
-        .map(|(_, g)| g)
+        .min_by(network_order)
+        .map(|(_, rule)| rule)
+}
+
+fn winner(config: &Config, address: std::net::IpAddr) -> Option<&str> {
+    network_winner(config, address).map(|rule| rule.group_id.as_str())
 }
 fn validate(input: &Input, base: &Snapshot, working: Option<&Working>) -> io::Result<Vec<String>> {
     if base.template["routing"]["script"]
@@ -622,11 +636,7 @@ fn render(
         .iter()
         .filter_map(|r| Network::parse(&r.destination).ok().map(|n| (n, r)))
         .collect::<Vec<_>>();
-    ordered.sort_by(|(a, ar), (b, br)| {
-        b.prefix
-            .cmp(&a.prefix)
-            .then(ar.destination.cmp(&br.destination))
-    });
+    ordered.sort_by(network_order);
     for (network, rule) in ordered {
         let group = input
             .config
@@ -663,9 +673,16 @@ pub struct Service {
     active_plan: Option<String>,
     reload_health: bool,
     native: crate::native::Client,
+    events: diagnostics::Events,
+    xray: PathBuf,
 }
 impl Service {
-    pub fn new(state: &Path, stopping: Arc<AtomicBool>, native_socket: &Path) -> io::Result<Self> {
+    pub fn new(
+        state: &Path,
+        stopping: Arc<AtomicBool>,
+        native_socket: &Path,
+        xray: &Path,
+    ) -> io::Result<Self> {
         let root = state.join("routing");
         match std::fs::symlink_metadata(&root) {
             Ok(_) => secure_directory(&root, 0o700, 0o077)?,
@@ -700,6 +717,8 @@ impl Service {
             active_plan,
             reload_health: true,
             native: crate::native::Client::new(native_socket),
+            events: diagnostics::Events::default(),
+            xray: xray.to_owned(),
         })
     }
     pub fn busy(&self) -> bool {
@@ -727,6 +746,8 @@ impl Service {
             "panel.configure" => &["settings"],
             "panel.preflight" | "routing.preview" | "routing.status" => &[],
             "routing.apply" | "routing.recover" => &["plan_id"],
+            "routing.diagnose" => &["destination", "capability", "probe"],
+            "routing.logs" => &["limit"],
             "connection.verify" => &["id"],
             "connection.login" => &["id", "credentials", "remember"],
             "connection.logout" | "connection.restart" | "connection.forget-auth" => &["id"],
@@ -778,9 +799,31 @@ impl Service {
                 ));
             }
         }
+        if command == "routing.logs" {
+            return self.events.list(request.get("limit")).map(Some);
+        }
+        if command == "routing.diagnose" {
+            return self.diagnose(request, store.config(), stream);
+        }
         if command == "routing.status" {
-            let saved: Value = optional(&self.root.join("status.json"))?
+            let mut saved: Value = optional(&self.root.join("status.json"))?
                 .unwrap_or(json!({"state":"unapplied","running_revision":null}));
+            if let Some(error) = saved.get_mut("runtime_verification_error")
+                && error.is_string()
+            {
+                *error = json!("runtime_verification_failed");
+            }
+            if let Some(groups) = saved.get_mut("capabilities").and_then(Value::as_object_mut) {
+                for reasons in groups.values_mut().filter_map(Value::as_object_mut) {
+                    for reason in reasons.values_mut() {
+                        *reason = json!(
+                            reason
+                                .as_str()
+                                .map_or("unknown", crate::capability::public_reason)
+                        );
+                    }
+                }
+            }
             let working: Option<Working> = optional(&self.root.join("working.json"))?;
             let retired: Vec<_> = working
                 .as_ref()
@@ -819,14 +862,25 @@ impl Service {
         }
         let input = store.routing_input()?;
         let native = self.native.clone();
+        let root = self.root.clone();
+        let command = command.to_owned();
+        let request = request.clone();
+        let stopping = self.stopping.clone();
+        let xray = self.xray.clone();
+        self.launch(stream, command.clone(), move || {
+            execute(&root, &command, &request, input, stopping, &native, &xray)
+        })
+    }
+
+    fn launch(
+        &mut self,
+        stream: &UnixStream,
+        operation: String,
+        task: impl FnOnce() -> io::Result<Value> + Send + 'static,
+    ) -> io::Result<Option<Value>> {
         let mut stream = stream.try_clone()?;
-        let (root, command, request, busy, stopping) = (
-            self.root.clone(),
-            command.to_owned(),
-            request.clone(),
-            self.busy.clone(),
-            self.stopping.clone(),
-        );
+        let busy = self.busy.clone();
+        let events = self.events.clone();
         busy.store(true, Ordering::Relaxed);
         let worker = thread::Builder::new()
             .name("routing".to_owned())
@@ -838,7 +892,8 @@ impl Service {
                     }
                 }
                 let _guard = Guard(busy);
-                let result = execute(&root, &command, &request, input, stopping, &native);
+                let result = task();
+                events.record(&operation, diagnostics::event_outcome(&result));
                 let response = match result {
                     Ok(data) => json!({"api_version":API_VERSION,"data":data}),
                     Err(e) => json!({"api_version":API_VERSION,"error":e.to_string()}),
@@ -878,6 +933,7 @@ fn execute(
     mut input: Input,
     stopping: Arc<AtomicBool>,
     native: &crate::native::Client,
+    xray: &Path,
 ) -> io::Result<Value> {
     if matches!(
         command,
@@ -1383,6 +1439,7 @@ fn execute(
         {
             check_native_xray(native, &client.wait_running()?, json!([]))?;
         }
+        let probe_handlers = diagnostics::capture_handlers(xray, &client, &final_snapshot)?;
         let mut working = Working {
             plan_id: journal.plan.id.clone(),
             config: input.config.clone(),
@@ -1470,6 +1527,7 @@ fn execute(
             );
         }
         private_write(&root.join("status.json"), &report)?;
+        diagnostics::save_handlers(root, &working.plan_id, probe_handlers);
         Ok(report)
     })();
     match result {
@@ -2131,7 +2189,7 @@ impl Working {
         )
     }
     fn health_report(&self) -> Value {
-        json!({"plan_id":self.plan_id,"running_revision":self.config.revision,"error":self.health_error,
+        json!({"plan_id":self.plan_id,"running_revision":self.config.revision,"error":self.health_error.as_deref().map(diagnostics::health_problem),
             "groups":self.config.groups.iter().filter(|g|g.healthcheck.is_some()).map(|g|{
                 let selected=self.selected.get(&g.id).and_then(|v|v.as_ref());
                 json!({"group_id":g.id,"selected_connection":selected,"reason":if selected==g.primary.as_ref(){"primary"}else if selected.is_some(){"fallback"}else{"no_eligible_connection"},"required_capabilities":g.healthcheck.as_ref().unwrap().required_capabilities,
@@ -2211,13 +2269,16 @@ impl Service {
         let busy = self.busy.clone();
         let stopping = self.stopping.clone();
         let native = self.native.clone();
+        let events = self.events.clone();
         busy.store(true, Ordering::Relaxed);
         match thread::Builder::new()
             .name("healthcheck".into())
             .spawn(move || {
                 let result = health_cycle(&root, working, due, stopping.clone(), &native);
                 if let Err(error) = result {
-                    eprintln!("wgates: healthcheck stopped: {error}");
+                    let reason = diagnostics::health_problem(&error.to_string());
+                    events.record("healthcheck", reason);
+                    eprintln!("wgates: healthcheck stopped ({reason})");
                     if !stopping.load(Ordering::Relaxed)
                         && let Ok(Some(mut working)) =
                             optional::<Working>(&root.join("working.json"))
@@ -2225,6 +2286,8 @@ impl Service {
                         working.health_error = Some(error.to_string());
                         let _ = private_write(&root.join("working.json"), &working);
                     }
+                } else {
+                    events.record("healthcheck", "completed");
                 }
                 busy.store(false, Ordering::Relaxed);
             }) {
