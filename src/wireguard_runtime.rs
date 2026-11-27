@@ -1,4 +1,6 @@
-use super::{Endpoint, Record, command, command_input, executable, namespace_child, ns};
+use super::{
+    Endpoint, Record, bootstrap_addresses, command, command_input, executable, namespace_child, ns,
+};
 use crate::invalid;
 use crate::policy::Network;
 use crate::wireguard::{Profile, decoded_profile, endpoint, unicast};
@@ -37,11 +39,9 @@ pub(super) fn resolve(profile: &Profile) -> io::Result<Endpoint> {
     let (host, port) = endpoint(&profile.endpoint)?;
     let address: IpAddr = match host.parse() {
         Ok(ip) => ip,
-        Err(_) => command("/usr/bin/getent", &["-s", "files", "ahosts", &host])
-            .or_else(|_| command("/usr/bin/getent", &["ahosts", &format!("{host}.")]))
+        Err(_) => bootstrap_addresses(&host)
             .map_err(|_| invalid("WireGuard endpoint bootstrap resolution failed"))?
-            .lines()
-            .filter_map(|line| line.split_whitespace().next()?.parse().ok())
+            .into_iter()
             .find(|ip| unicast(*ip))
             .ok_or_else(|| invalid("WireGuard endpoint has no supported unicast address"))?,
     };

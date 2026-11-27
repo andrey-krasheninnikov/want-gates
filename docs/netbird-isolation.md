@@ -113,5 +113,5 @@ git show --stat HEAD
 
 If later changes conflict with the revert, inspect them before resolving the
 conflict. Use `git revert --abort` in that rollback worktree to abandon the
-in-progress revert. Any separate NetBird adapter requires its own rollout and
-rollback procedure.
+in-progress revert. See [adapter rollout and rollback](netbird.md#validate-and-roll-back)
+for the supported connection adapter.

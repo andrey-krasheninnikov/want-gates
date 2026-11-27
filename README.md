@@ -46,7 +46,7 @@ capabilities. Ambiguous rules of equal specificity are rejected.
 - Isolated OpenVPN with certificate, password and supported native MFA/SSO authentication.
 - Isolated Forti through openfortivpn with password, certificates, OTP/push, cookie SSO and native SAML.
 - [WireGuard](docs/wireguard.md) through the Linux native runtime.
-- Planned: NetBird.
+- [NetBird](docs/netbird.md) private networks and exit nodes through the Linux native runtime.
 - Profile import and native authentication, including supported MFA/SSO flows.
 - TCP, HTTP and HTTPS target checks, ordered failover, and stable failback within a group.
 
@@ -55,8 +55,7 @@ consecutive failures mark a connection unavailable; five consecutive successes
 make a recovered connection eligible again. These settings are configurable per
 group.
 
-Simultaneous isolated NetBird accounts still require runtime validation. Forti
-supports separately verified TCP/UDP over IPv4; IPv6 stays blocked. Session continuity during path changes or
+Forti supports separately verified TCP/UDP over IPv4; IPv6 stays blocked. Session continuity during path changes or
 Xray restarts is not guaranteed.
 
 ## Planned operation and installation

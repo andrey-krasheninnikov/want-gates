@@ -754,7 +754,7 @@ impl Service {
                 .ok_or_else(|| invalid("connection not found"))?;
             if !crate::native::is_native(&connection.protocol) {
                 return Err(invalid(
-                    "native session operations require OpenVPN, Forti or WireGuard",
+                    "native session operations require OpenVPN, Forti, WireGuard or NetBird",
                 ));
             }
             if connection.protocol == "wireguard"
@@ -1973,6 +1973,7 @@ impl Service {
                                     old.session == observation.session && old.dns == observation.dns
                                 });
                             if !observation.admitted
+                                || observation.reason == crate::native::NETBIRD_CONFIRMING_ROUTES
                                 || !current
                                 || !crate::native::probe_ready(&observation.authentication)
                             {
@@ -2106,10 +2107,8 @@ impl Service {
         }
         self.reload_health = false;
         let ready = (|| -> io::Result<Option<(Working, Vec<String>)>> {
-            if optional::<Journal>(&self.root.join("journal.json"))?
-                .as_ref()
-                .is_some_and(pending)
-            {
+            let journal = optional::<Journal>(&self.root.join("journal.json"))?;
+            if journal.as_ref().is_some_and(pending) {
                 self.health_due.clear();
                 return Ok(None);
             }
@@ -2133,11 +2132,19 @@ impl Service {
                     }
                 }
             }
+            let restored = journal.as_ref().is_some_and(|j| j.phase == "restored");
             let mut due = Vec::new();
             for group in &working.config.groups {
                 if let Some(check) = &group.healthcheck {
                     let next = self.health_due.entry(group.id.clone()).or_insert(now);
-                    if *next <= now {
+                    let selection_needs_check = restored
+                        && working
+                            .selected
+                            .get(&group.id)
+                            .and_then(Option::as_ref)
+                            .and_then(|id| working.health.get(id))
+                            .is_some_and(|record| !record.fresh);
+                    if *next <= now || selection_needs_check {
                         due.push(group.id.clone());
                         *next = now + std::time::Duration::from_secs(check.interval_seconds);
                     }
@@ -2198,18 +2205,24 @@ fn health_cycle(
         return Err(invalid("observed panel drift; automatic writes stopped"));
     }
     let observations = crate::native::health_observations(native, &working.native)?;
-    let native_changed = observations.iter().any(|(id, state)| {
-        working
-            .native_observations
-            .get(id)
-            .is_none_or(|old| old.session != state.session || old.dns != state.dns)
-    });
+    let verification_changed =
+        |id: &str, state: &crate::native::Observation| {
+            working.native_observations.get(id).is_none_or(|old| {
+                old.session != state.session
+                    || old.dns != state.dns
+                    || (crate::native::probe_ready(&old.authentication)
+                        && !crate::native::probe_ready(&state.authentication)
+                        && working.config.connections.iter().any(|connection| {
+                            connection.id == id && connection.protocol == "netbird"
+                        }))
+            })
+        };
+    let native_changed = observations
+        .iter()
+        .any(|(id, state)| verification_changed(id, state));
     let mut matrix = working.matrix.clone();
     for (id, state) in &observations {
-        let changed = working
-            .native_observations
-            .get(id)
-            .is_none_or(|old| old.session != state.session || old.dns != state.dns);
+        let changed = verification_changed(id, state);
         if (changed || !crate::native::probe_ready(&state.authentication))
             && let Some(connection) = working.config.connections.iter().find(|c| c.id == *id)
             && let Some(group) = working.config.groups.iter().find(|g| {
@@ -2229,10 +2242,8 @@ fn health_cycle(
             }
             matrix.insert(group.id.clone(), blocked);
         }
-        if working
-            .native_observations
-            .get(id)
-            .is_some_and(|old| old.session != state.session || old.dns != state.dns)
+        if changed
+            && working.native_observations.contains_key(id)
             && let Some(record) = working.health.get_mut(id)
         {
             record.available = false;
@@ -2278,6 +2289,31 @@ fn health_cycle(
     select_matrix(&working.config, &selected, &working.health, &mut matrix);
     if selected == working.selected && matrix == working.matrix && !native_changed {
         private_write(&root.join("working.json"), &working)?;
+        let status_path = root.join("status.json");
+        if optional::<Value>(&status_path)?.is_some_and(|status| {
+            matches!(
+                status["state"].as_str(),
+                Some("restored" | "restored_runtime_unverified")
+            )
+        }) {
+            let effective = effective_config(&config, &selected);
+            if verify(
+                &client,
+                &working.snapshot,
+                &effective,
+                &working.proxy,
+                &matrix,
+                &ingress(&working.snapshot)?,
+                None,
+            )
+            .is_ok()
+            {
+                private_write(
+                    &status_path,
+                    &observation(&working.plan_id, &effective, &working.snapshot, &matrix),
+                )?;
+            }
+        }
         return Ok(());
     }
     let effective = effective_config(&config, &selected);
@@ -2311,24 +2347,57 @@ fn health_cycle(
         phase: "applying".into(),
     };
     private_write(&root.join("journal.json"), &journal)?;
+    let mut netbird_changed_during_switch = false;
     let result = (|| -> io::Result<()> {
         submit(root, &client, &mut journal, &candidate)?;
-        crate::native::admit(
+        let verification = crate::native::admit(
             native,
             &working.native,
             &working.native_observations,
             &effective,
             &matrix,
-        )?;
-        verify(
-            &client,
-            &candidate,
-            &effective,
-            &working.proxy,
-            &matrix,
-            &ingress,
-            Some(&working.health),
-        )?;
+        )
+        .and_then(|()| {
+            verify(
+                &client,
+                &candidate,
+                &effective,
+                &working.proxy,
+                &matrix,
+                &ingress,
+                Some(&working.health),
+            )
+        });
+        // NetBird may close the bridge while admission or traffic checks run.
+        if verification.is_err()
+            && working
+                .native_observations
+                .values()
+                .any(|state| state.netbird_routes_revision.is_some())
+        {
+            netbird_changed_during_switch =
+                crate::native::health_observations(native, &working.native).is_ok_and(|latest| {
+                    effective
+                        .groups
+                        .iter()
+                        .filter(|group| {
+                            matrix
+                                .get(&group.id)
+                                .is_some_and(|m| m.values().any(|state| state == "verified"))
+                        })
+                        .filter_map(|group| group.primary.as_ref())
+                        .any(|id| {
+                            working
+                                .native_observations
+                                .get(id)
+                                .zip(latest.get(id))
+                                .is_some_and(|(before, after)| {
+                                    before.netbird_runtime_changed(after)
+                                })
+                        })
+                });
+        }
+        verification?;
         working.snapshot = candidate;
         working.selected = selected;
         working.matrix = matrix;
@@ -2350,7 +2419,7 @@ fn health_cycle(
             recovery_required(root, &mut journal)?;
         } else {
             let restored = recover(root, &client, &mut journal, native);
-            if crate::native::unavailable(&error)
+            if (crate::native::unavailable(&error) || netbird_changed_during_switch)
                 && restored.as_ref().is_ok_and(|report| {
                     matches!(
                         report["state"].as_str(),

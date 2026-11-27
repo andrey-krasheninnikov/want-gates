@@ -655,7 +655,7 @@ impl Session {
             &args,
             Stdio::piped(),
             None,
-            Some((&self.directory, &config_file)),
+            Some(super::NativeFiles::Forti(&self.directory, &config_file)),
         )?;
         let mut process = Some(process);
         let mut stdin = process.as_mut().unwrap().stdin.take();

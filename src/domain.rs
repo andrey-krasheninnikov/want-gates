@@ -153,6 +153,17 @@ pub fn validate(input: &Input, base: &Snapshot) -> io::Result<()> {
                 ));
             }
         }
+        if profile["protocol"] == "netbird" {
+            for endpoint in crate::netbird::decoded_profile(profile)?.endpoints()? {
+                if let Ok(name) = domain_name(&endpoint.host)
+                    && winner(&input.config, &name).is_some()
+                {
+                    return Err(invalid(
+                        "NetBird control endpoint overlaps a protected domain; avoid a DNS bootstrap cycle",
+                    ));
+                }
+            }
+        }
         if profile["protocol"] == "wireguard" {
             let wireguard = crate::wireguard::decoded_profile(profile)?;
             let (host, _) = crate::wireguard::endpoint(&wireguard.endpoint)?;

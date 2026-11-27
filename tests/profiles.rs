@@ -253,9 +253,9 @@ fn invalid_profiles_and_unavailable_adapters_do_not_change_saved_state() {
     let refused = rpc(
         &service,
         serde_json::json!({"api_version":1,"command":"connection.import",
-        "group_id":group,"name":"Native","protocol":"netbird","profile":"secret-value"}),
+        "group_id":group,"name":"Native","protocol":"l2tp","profile":"secret-value"}),
     );
-    assert!(refused["error"].as_str().unwrap().contains("unavailable"));
+    assert_eq!(refused["error"], "unsupported protocol");
     assert_eq!(ok(&service, &["connection", "list"]), serde_json::json!([]));
     assert!(!service.state.join("secrets").exists());
 }

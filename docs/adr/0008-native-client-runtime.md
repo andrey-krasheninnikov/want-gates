@@ -22,7 +22,7 @@ invalidate the associated access evidence. Host forwarding is a checked
 prerequisite; the runtime does not change global sysctl or the management route.
 This runtime extends the single-worker design in ADR 0007 with the privileged
 operations required by native clients. Health selection stays in the control
-service. OpenVPN, Forti and WireGuard share this runtime.
+service. OpenVPN, Forti, WireGuard and NetBird share this runtime.
 
 The private bridge uses VLESS over fixed TCP ports, carrying UDP without exposing
 ephemeral relay ports. Separate identities keep diagnostics apart from admitted
@@ -35,6 +35,11 @@ root home and pinned endpoint hosts. Server DNS is observed from native output;
 native route and resolver writes are disabled. Only IPv4 payloads are supported.
 Native SAML uses a temporary loopback relay reached through an operator SSH
 forward. Its callback closes on completion, logout or a 50-second deadline.
+
+NetBird keeps its enrolled peer identity in root-only state for each generation.
+It uses private daemon sockets, relay transport and pinned control endpoints.
+The bridge ignores default routes in private mode. In exit mode the helper
+selects the configured network ID. Protected DNS uses the connection resolver.
 
 Linux acceptance uses controlled OpenVPN/Forti servers and public CLI/VLESS traffic.
 It does not establish compatibility with corporate identity providers or every

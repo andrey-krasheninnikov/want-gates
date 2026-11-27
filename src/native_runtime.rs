@@ -1,5 +1,7 @@
 #[path = "forti_runtime.rs"]
 mod forti;
+#[path = "netbird_runtime.rs"]
+mod netbird;
 #[cfg(test)]
 mod netbird_fixture;
 #[path = "wireguard_runtime.rs"]
@@ -27,7 +29,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Endpoint {
     address: IpAddr,
@@ -46,6 +48,8 @@ struct Record {
     host6: Ipv6Addr,
     peer6: Ipv6Addr,
     endpoints: Vec<Endpoint>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    netbird_hosts: netbird::Hosts,
     namespace_identity: Option<(u64, u64)>,
     #[serde(default)]
     namespace_file: Option<(u64, u64)>,
@@ -99,6 +103,8 @@ impl Record {
         if self.profile["protocol"] == "wireguard" {
             let profile = crate::wireguard::decoded_profile(&self.profile)?;
             wireguard::validate_endpoints(self, &profile)?;
+        } else if self.profile["protocol"] == "netbird" {
+            netbird::validate(self)?;
         } else {
             profile(&self.profile)?;
         }
@@ -111,6 +117,7 @@ struct Instance {
     auth: Authentication,
     client: Option<Child>,
     forti: Option<forti::Session>,
+    netbird: Option<netbird::Session>,
     proxy: Option<Child>,
     listener: Option<UnixListener>,
     management: Option<UnixStream>,
@@ -127,6 +134,7 @@ impl Instance {
             auth,
             client: None,
             forti: None,
+            netbird: None,
             proxy: None,
             listener: None,
             management: None,
@@ -147,6 +155,7 @@ impl Instance {
         self.management = None;
         self.listener = None;
         self.forti = None;
+        self.netbird = None;
     }
 }
 struct Runtime {
@@ -156,6 +165,7 @@ struct Runtime {
     gid: u32,
     xray: PathBuf,
     openfortivpn: PathBuf,
+    netbird: PathBuf,
     instances: BTreeMap<String, Instance>,
     reaping: Vec<Child>,
 }
@@ -208,6 +218,14 @@ fn executable(path: &Path) -> io::Result<PathBuf> {
 }
 fn command(program: &str, args: &[&str]) -> io::Result<String> {
     command_input(program, args, Stdio::null())
+}
+fn bootstrap_addresses(host: &str) -> io::Result<Vec<IpAddr>> {
+    let output = command("/usr/bin/getent", &["-s", "files", "ahosts", host])
+        .or_else(|_| command("/usr/bin/getent", &["ahosts", &format!("{host}.")]))?;
+    Ok(output
+        .lines()
+        .filter_map(|line| line.split_whitespace().next()?.parse().ok())
+        .collect())
 }
 fn command_input(program: &str, args: &[&str], stdin: Stdio) -> io::Result<String> {
     let mut child = Command::new(program)
@@ -382,20 +400,27 @@ fn stop(child: &mut Option<Child>) {
         let _ = child.wait();
     }
 }
+enum NativeFiles<'a> {
+    Forti(&'a Path, &'a File),
+    Netbird(netbird::ProcessFiles<'a>),
+}
+
 fn namespace_child(
     record: &Record,
     program: &Path,
     args: &[&str],
     stdin: Stdio,
     uid: Option<(u32, u32)>,
-    forti: Option<(&Path, &File)>,
+    files: Option<NativeFiles<'_>>,
 ) -> io::Result<Child> {
     let namespace = File::open(Path::new("/run/netns").join(&record.namespace))?;
-    let config_fd = forti.map(|(_, config)| config.as_raw_fd());
-    let mounts = forti
-        .map(|(directory, _)| forti::mounts(directory))
-        .transpose()?
-        .unwrap_or_default();
+    let (mounts, config_fd) = match &files {
+        Some(NativeFiles::Forti(directory, config)) => {
+            (forti::mounts(directory)?, Some(config.as_raw_fd()))
+        }
+        Some(NativeFiles::Netbird(files)) => (files.mounts()?, None),
+        None => (Vec::new(), None),
+    };
     let mut cmd = Command::new(program);
     cmd.args(args)
         .env_clear()
@@ -403,6 +428,18 @@ fn namespace_child(
         .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(NativeFiles::Netbird(files)) = files {
+        cmd.env("NB_STATE_DIR", files.state)
+            .env("HOME", files.state)
+            .env("XDG_CONFIG_HOME", files.state)
+            .env("NB_FORCE_RELAY", "true")
+            .env("NB_WG_KERNEL_DISABLED", "true")
+            .env("NB_DISABLE_SSH_CONFIG", "true")
+            .env("DBUS_SYSTEM_BUS_ADDRESS", "unix:path=/dev/null")
+            .env("GODEBUG", "netdns=go")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    }
     // SAFETY: getpid has no arguments and cannot fail.
     let parent = unsafe { libc::getpid() };
     // SAFETY: after fork this closure uses only async-signal-safe Linux syscalls, then execs the fixed executable.
@@ -726,6 +763,7 @@ impl Runtime {
                 Ok(("openfortivpn", version.trim().into()))
             }
             "wireguard" => Ok(("wireguard", wireguard::version()?)),
+            "netbird" => Ok(("netbird", netbird::check(&self.netbird)?)),
             _ => Err(invalid("unsupported native preflight protocol")),
         }
     }
@@ -751,8 +789,13 @@ impl Runtime {
         let wg = (protocol == "wireguard")
             .then(|| crate::wireguard::decoded_profile(value))
             .transpose()?;
+        let mut netbird_hosts = netbird::Hosts::new();
         let endpoints = if let Some(profile) = &wg {
             vec![wireguard::resolve(profile)?]
+        } else if protocol == "netbird" {
+            let (endpoints, hosts) = netbird::resolve(&crate::netbird::decoded_profile(value)?)?;
+            netbird_hosts = hosts;
+            endpoints
         } else if protocol == "forti" {
             let profile = profile(value)?;
             let host = crate::forti::option(&profile, "host").unwrap();
@@ -829,6 +872,7 @@ impl Runtime {
             host6,
             peer6,
             endpoints,
+            netbird_hosts,
             namespace_identity: None,
             namespace_file: None,
             firewall_digest: None,
@@ -855,23 +899,8 @@ impl Runtime {
         if result.is_err() && self.cleanup(&mut record, true).is_err() {
             let mut auth = Authentication::new(Credentials::default(), false)?;
             auth.fail("native_cleanup_required");
-            self.instances.insert(
-                generation.into(),
-                Instance {
-                    record,
-                    auth,
-                    client: None,
-                    forti: None,
-                    proxy: None,
-                    listener: None,
-                    management: None,
-                    buffer: Vec::new(),
-                    environment: None,
-                    dns: None,
-                    admitted_session: None,
-                    proxy_gate: None,
-                },
-            );
+            self.instances
+                .insert(generation.into(), Instance::new(record, auth));
             return Err(invalid(
                 "native preparation failed; owned resources retained for guarded recovery",
             ));
@@ -1186,18 +1215,19 @@ impl Runtime {
                 "native firewall readback differs from the prepared rules",
             ));
         }
-        let forward = if wg {
+        let restricted = wg || r.profile["protocol"] == "netbird";
+        let forward = if restricted {
             "chain forward { type filter hook forward priority 0; policy drop; };"
         } else {
             ""
         };
         let loopback = if wg { "" } else { "oifname lo accept;" };
-        let bridge_input = if wg {
+        let bridge_input = if restricted {
             format!("iifname \"{}\" ", r.peer)
         } else {
             String::new()
         };
-        let tunnel_input = if wg {
+        let tunnel_input = if restricted {
             "ct state established,related "
         } else {
             ""
@@ -1213,6 +1243,24 @@ impl Runtime {
     fn start(&self, record: Record, automatic_forti: bool) -> io::Result<Instance> {
         let dir = self.directory.join(&record.prepared.generation);
         secure_directory(&dir, 0o700, 0o077)?;
+        if record.profile["protocol"] == "netbird" {
+            let mut instance = Instance::new(record, netbird::new_auth()?);
+            if instance.record.paused {
+                instance.auth.state = "stopped".into();
+                instance.auth.reason = "operator_stopped".into();
+            } else {
+                let (session, child) = netbird::Session::start(
+                    &instance.record,
+                    &self.root,
+                    &dir,
+                    &self.netbird,
+                    self.uid,
+                )?;
+                instance.client = Some(child);
+                instance.netbird = Some(session);
+            }
+            return Ok(instance);
+        }
         if record.profile["protocol"] == "wireguard" {
             let mut instance =
                 Instance::new(record, Authentication::new(Credentials::default(), false)?);
@@ -1380,9 +1428,11 @@ impl Runtime {
     fn restart(&self, instance: &mut Instance, automatic_forti: bool) -> io::Result<()> {
         self.ensure_wireguard_peer_available(&instance.record)?;
         instance.stop_for_restart();
-        if instance.record.profile["protocol"] == "wireguard"
-            && let Err(error) = self.cleanup(&mut instance.record, false)
-        {
+        let rebuild = matches!(
+            instance.record.profile["protocol"].as_str(),
+            Some("wireguard" | "netbird")
+        );
+        if rebuild && let Err(error) = self.cleanup(&mut instance.record, false) {
             instance.auth.fail("native_cleanup_required");
             return Err(error);
         }
@@ -1404,9 +1454,7 @@ impl Runtime {
                 Ok(())
             }
             Err(error) => {
-                if instance.record.profile["protocol"] == "wireguard"
-                    && self.cleanup(&mut instance.record, false).is_err()
-                {
+                if rebuild && self.cleanup(&mut instance.record, false).is_err() {
                     instance.auth.fail("native_cleanup_required");
                 }
                 Err(error)
@@ -1585,6 +1633,12 @@ impl Runtime {
                     forti::cleanup(&path)?;
                     continue;
                 }
+                if record.profile["protocol"] == "netbird"
+                    && path.file_name().is_some_and(|name| name == "netbird")
+                {
+                    netbird::remove_directory(&path)?;
+                    continue;
+                }
                 if !matches!(
                     path.file_name().and_then(|n| n.to_str()),
                     Some("management.sock" | "openvpn.conf" | "proxy.json")
@@ -1607,6 +1661,9 @@ impl Runtime {
         }
         self.cleanup_runtime_files(record)?;
         if forget {
+            if record.profile["protocol"] == "netbird" {
+                netbird::remove_state(&self.root, record)?;
+            }
             if !self.instances.values().any(|i| {
                 i.record.prepared.id == record.prepared.id
                     && i.record.prepared.profile_digest == record.prepared.profile_digest
@@ -1624,19 +1681,26 @@ impl Runtime {
         }
         Ok(())
     }
-    fn observation(instance: &Instance) -> Observation {
-        Observation {
+    fn observation(instance: &Instance) -> Value {
+        let observation = Observation {
             session: instance.auth.session.clone(),
             authentication: instance.auth.state.clone(),
             reason: instance.auth.reason.clone(),
             dns: instance.dns.clone(),
+            // Admission records the grant while NetBird pauses the bridge to confirm routes.
             admitted: instance.admitted_session.as_ref() == Some(&instance.auth.session),
             resources_active: instance.record.namespace_identity.is_some()
                 || instance.client.is_some()
                 || instance.proxy.is_some(),
             expires_at: instance.auth.expires_at,
             remembered: instance.auth.remembered,
+            netbird_routes_revision: instance.netbird.as_ref().and_then(|s| s.observed_revision),
+        };
+        let mut response = json!(observation);
+        if let Some(revision) = observation.netbird_routes_revision {
+            response["netbird_routes_revision"] = json!(revision);
         }
+        response
     }
     fn stop_in_poll(&mut self, process: &mut Option<Child>, forti: bool) {
         if !forti {
@@ -1669,11 +1733,32 @@ impl Runtime {
                     driver.stopped();
                 }
                 instance.management = None;
+                instance.netbird = None;
             }
             self.instances.insert(key, instance);
         }
     }
     fn poll_instance(&mut self, i: &mut Instance) -> io::Result<()> {
+        if let Some(session) = i.netbird.as_mut() {
+            if i.client
+                .as_ref()
+                .is_none_or(|child| child_exited(child).unwrap_or(true))
+            {
+                return Err(invalid("NetBird client exited"));
+            }
+            session.poll(&mut i.auth)?;
+            let authenticated = crate::native::probe_ready(&i.auth.state);
+            if session.routing_ready() && authenticated {
+                self.proxy(i, i.admitted_session.as_ref() == Some(&i.auth.session))?;
+            } else {
+                if !authenticated {
+                    i.admitted_session = None;
+                }
+                i.proxy_gate = None;
+                stop(&mut i.proxy);
+            }
+            return Ok(());
+        }
         let forti = i.forti.is_some();
         if let Some(reason) = (if !forti {
             child_diagnostic(&mut i.client)?
@@ -1863,7 +1948,7 @@ impl Runtime {
                 })
                 .transpose()?
                 .unwrap_or_default();
-            if protocols.len() > 3 {
+            if protocols.len() > 4 {
                 return Err(invalid("native preflight protocol limit exceeded"));
             }
             return self.preflight(&protocols);
@@ -1917,6 +2002,19 @@ impl Runtime {
                 {
                     self.restart(&mut i, false)?;
                 }
+                if let Some(session) = i.netbird.as_mut() {
+                    let action = session.login(
+                        &mut i.auth,
+                        request.get("credentials"),
+                        request["remember"] == true,
+                    )?;
+                    if !crate::native::probe_ready(&i.auth.state) {
+                        i.admitted_session = None;
+                        i.proxy_gate = None;
+                        stop(&mut i.proxy);
+                    }
+                    return Ok(action);
+                }
                 if let Some(credentials) = request.get("credentials") {
                     let remember = request["remember"].as_bool().unwrap_or(false);
                     if let Some(driver) = i.forti.as_mut() {
@@ -1954,22 +2052,26 @@ impl Runtime {
                 let admitted = request["admitted"]
                     .as_bool()
                     .ok_or_else(|| invalid("native admission boolean required"))?;
+                let authenticated = crate::native::probe_ready(&i.auth.state);
                 if admitted
-                    && (request["session"].as_str() != Some(&i.auth.session)
-                        || !crate::native::probe_ready(&i.auth.state))
+                    && (request["session"].as_str() != Some(&i.auth.session) || !authenticated)
                 {
                     return Err(invalid(
                         "native session changed; repeat resource verification",
                     ));
                 }
                 i.admitted_session = None;
-                if crate::native::probe_ready(&i.auth.state) {
+                if authenticated
+                    && i.netbird
+                        .as_ref()
+                        .is_none_or(netbird::Session::routing_ready)
+                {
                     self.proxy(&mut i, admitted)?;
                 }
                 if admitted {
                     i.admitted_session = Some(i.auth.session.clone());
                 }
-                Ok(json!(Self::observation(&i)))
+                Ok(Self::observation(&i))
             }
             "logout" => {
                 i.record.paused = true;
@@ -1987,20 +2089,32 @@ impl Runtime {
                 i.proxy_gate = None;
                 i.listener = None;
                 i.forti = None;
+                i.netbird = None;
                 if let Err(error) = self.cleanup(&mut i.record, false) {
                     i.auth.fail("native_cleanup_required");
                     return Err(error);
                 }
-                Ok(json!(Self::observation(&i)))
+                Ok(Self::observation(&i))
             }
             "restart" => {
                 if i.auth.reason == "native_cleanup_required" {
                     self.cleanup(&mut i.record, false)?;
                 }
                 self.restart(&mut i, true)?;
-                Ok(json!(Self::observation(&i)))
+                Ok(Self::observation(&i))
             }
             "forget-auth" => {
+                if i.record.profile["protocol"] == "netbird" {
+                    if !i.record.paused
+                        || i.client.is_some()
+                        || i.record.namespace_identity.is_some()
+                    {
+                        return Err(invalid("logout before forgetting NetBird enrollment"));
+                    }
+                    netbird::remove_state(&self.root, &i.record)?;
+                    i.auth.forget();
+                    return Ok(json!({"forgotten": true}));
+                }
                 let prefix = format!("{}-", i.record.prepared.id);
                 for file in fs::read_dir(&self.root)? {
                     let path = file?.path();
@@ -2048,6 +2162,7 @@ impl Runtime {
                 stop(&mut i.client);
                 i.management = None;
                 i.forti = None;
+                i.netbird = None;
                 self.cleanup(&mut i.record, true)?;
                 Ok(json!({"released":true}))
             }
@@ -2122,6 +2237,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>, cleanup_only: bool) -> io::
     let mut root = PathBuf::from("/var/lib/wgates-native");
     let mut xray = None;
     let mut openfortivpn = PathBuf::from("/usr/bin/openfortivpn");
+    let mut netbird = PathBuf::from("/usr/bin/netbird");
     let mut user = "wgates".to_owned();
     while let Some(arg) = args.next() {
         let value = args
@@ -2132,6 +2248,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>, cleanup_only: bool) -> io::
             Some("--state-dir") => root = value.into(),
             Some("--xray-bin") => xray = Some(PathBuf::from(value)),
             Some("--openfortivpn-bin") => openfortivpn = PathBuf::from(value),
+            Some("--netbird-bin") => netbird = PathBuf::from(value),
             Some("--service-user") => {
                 user = value
                     .into_string()
@@ -2238,6 +2355,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>, cleanup_only: bool) -> io::
         gid,
         xray,
         openfortivpn,
+        netbird,
         instances: BTreeMap::new(),
         reaping: Vec::new(),
     };

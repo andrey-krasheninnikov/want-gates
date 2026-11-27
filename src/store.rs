@@ -156,7 +156,7 @@ impl Store {
         for connection in &config.connections {
             if !matches!(
                 connection.protocol.as_str(),
-                "vless" | "openvpn" | "forti" | "wireguard"
+                "vless" | "openvpn" | "forti" | "wireguard" | "netbird"
             ) || id_number(&connection.id, 'c').is_none_or(|n| n > connection.revision)
                 || connection.revision == 0
                 || connection.revision > config.revision
@@ -778,10 +778,7 @@ fn dns_setting(value: Option<&Value>) -> io::Result<Option<String>> {
 
 fn protocol(value: &Value) -> io::Result<()> {
     match text(value)? {
-        "vless" | "openvpn" | "forti" | "wireguard" => Ok(()),
-        "netbird" => Err(invalid(
-            "protocol adapter unavailable; NetBird profile import is not implemented",
-        )),
+        "vless" | "openvpn" | "forti" | "wireguard" | "netbird" => Ok(()),
         _ => Err(invalid("unsupported protocol")),
     }
 }

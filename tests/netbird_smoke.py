@@ -201,7 +201,7 @@ class Company:
         self.name = company
         self.client = client
         self.gateway = context['names']['gateway']
-        self.bridge = bridge['namespace']
+        self.bridge = bridge['namespace'] if bridge else None
         self.router = context['names'][company]
         self.work = context['work'] / company
         self.work.mkdir(mode=0o700)
@@ -219,8 +219,10 @@ class Company:
             return self.api('/instance', pending=True)
 
         wait_for(f'{company} control plane', ready)
-        self.token = self.api('/setup', dict(email=f'owner@{company}.test', name='Stand owner',
-                                            password=secrets.token_urlsafe(32), create_pat=True)
+        self.email = f'owner@{company}.test'
+        self.password = secrets.token_urlsafe(32)
+        self.token = self.api('/setup', dict(email=self.email, name='Stand owner',
+                                            password=self.password, create_pat=True)
                               )['personal_access_token']
         self.lan = f'{context["prefix"]}-lan-{company}'
         stand.checked('ip', 'netns', 'add', self.lan)
@@ -253,14 +255,22 @@ class Company:
         self.gateway_port = 51820 + slot
         self.start(self.router, 'router', cleanup)
         self.enroll(self.router, 'router', self.router_port, 'nb-router')
-        self.start(self.bridge, 'gateway', cleanup)
-        self.enroll(self.bridge, 'gateway', self.gateway_port, 'wgates-tun')
+        if self.bridge:
+            self.start(self.bridge, 'gateway', cleanup)
+            self.enroll(self.bridge, 'gateway', self.gateway_port, 'wgates-tun')
         peers = {peer['name']: peer['id'] for peer in self.api('/peers')}
-        assert set(peers) == {'gateway', 'router'}, 'control plane peer inventory differs'
-        self.peer = peers['gateway']
+        expected_peers = {'gateway', 'router'} if self.bridge else {'router'}
+        assert set(peers) == expected_peers, 'control plane peer inventory differs'
+        self.peer = peers.get('gateway')
         group = next(group['id'] for group in self.api('/groups') if group['name'] == 'All')
+        self.route_groups = {}
+        for mode in ('private', 'exit'):
+            self.route_groups[mode] = group if self.bridge else self.api(
+                '/groups', dict(name=f'Want Gates {mode}', peers=[]))['id']
         resource_group = self.api('/groups', dict(name='Private LAN', peers=[]))['id']
         network = self.api('/networks', dict(name='private', description='Company LAN'))['id']
+        self.private_network = network
+        self.resource_group = resource_group
         self.api(f'/networks/{network}/routers', dict(peer=peers['router'], metric=100,
                                                       masquerade=True, enabled=True))
         for cidr in ('10.220.0.0/24', 'fd42:220::/64'):
@@ -268,16 +278,16 @@ class Company:
                 name=cidr, address=cidr, enabled=True, groups=[resource_group]))
         self.api('/policies', dict(name='Private LAN', enabled=True, rules=[dict(
             name='Private LAN', enabled=True, action='accept', protocol='all',
-            bidirectional=False, sources=[group], destinations=[resource_group])]))
+            bidirectional=False, sources=[self.route_groups['private']], destinations=[resource_group])]))
         self.api('/routes', dict(description='Test exit', network_id='exit', enabled=True,
                                  peer=peers['router'], network='0.0.0.0/0', metric=100,
-                                 masquerade=True, groups=[group], keep_route=True,
+                                 masquerade=True, groups=[self.route_groups['exit']], keep_route=True,
                                  skip_auto_apply=True))
 
-    def api(self, endpoint, payload=None, pending=False):
+    def api(self, endpoint, payload=None, pending=False, method=None):
         result = stand.run('ip', 'netns', 'exec', self.gateway, sys.executable, __file__,
                            '--api', self.url + '/api' + endpoint, str(self.work / 'cert.pem'),
-                           input=json.dumps(dict(payload=payload, token=self.token)), timeout=8)
+                           input=json.dumps(dict(payload=payload, token=self.token, method=method)), timeout=8)
         if not result.returncode:
             status, value = json.loads(result.stdout)
             if 200 <= status < 300:
@@ -306,7 +316,8 @@ class Company:
         state.mkdir(mode=0o700, exist_ok=True)
         args = [self.client, '--daemon-addr', f'unix://{state}/control.sock',
                 '--config', state / 'config.json', '--log-file', 'console', 'service', 'run']
-        process = self.spawn(namespace, args, role, cleanup, dict(self.env, NB_STATE_DIR=str(state)))
+        process = self.spawn(namespace, args, role, cleanup,
+                             dict(self.env, NB_STATE_DIR=str(state), NB_DISABLE_SSH_CONFIG='true'))
         def ready():
             if process.poll() is not None:
                 raise RuntimeError(f'{self.name} {role} daemon exited with {process.returncode}')
@@ -326,9 +337,12 @@ class Company:
             raise RuntimeError(f'{self.name} NetBird {role} {command[0]} failed')
         return result.stdout
 
+    def setup_key(self, name):
+        return self.api('/setup-keys', dict(name=name, type='one-off', expires_in=86400,
+                                            auto_groups=[], usage_limit=1))['key']
+
     def enroll(self, namespace, role, port, interface):
-        key = self.api('/setup-keys', dict(name=role, type='one-off', expires_in=86400,
-                                           auto_groups=[], usage_limit=1))['key']
+        key = self.setup_key(role)
         path = self.work / 'setup-key'
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         try:
@@ -349,7 +363,8 @@ class Company:
 def api_request(url, cert):
     arguments = json.load(sys.stdin)
     body = json.dumps(arguments['payload']).encode() if arguments['payload'] is not None else None
-    request = Request(url, data=body, headers={'Content-Type': 'application/json'})
+    request = Request(url, data=body, headers={'Content-Type': 'application/json'},
+                      method=arguments.get('method'))
     if arguments['token']:
         request.add_header('Authorization', 'Token ' + arguments['token'])
     opener = build_opener(ProxyHandler({}), HTTPSHandler(context=ssl.create_default_context(cafile=cert)))

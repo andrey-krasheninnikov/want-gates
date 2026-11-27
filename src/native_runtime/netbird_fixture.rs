@@ -10,7 +10,7 @@ struct Fixture {
     servers: [SocketAddr; 2],
 }
 
-fn record(slot: u8, server: SocketAddr) -> io::Result<Record> {
+pub(super) fn record(slot: u8, server: SocketAddr) -> io::Result<Record> {
     let id = random_id()?;
     let host = Ipv4Addr::new(169, 254, 230, slot * 4 + 1);
     let index = (230 << 6) | u16::from(slot);
@@ -41,6 +41,7 @@ fn record(slot: u8, server: SocketAddr) -> io::Result<Record> {
                 protocol: protocol.into(),
             })
             .collect(),
+        netbird_hosts: BTreeMap::new(),
         namespace_identity: None,
         namespace_file: None,
         firewall_digest: None,
@@ -74,6 +75,7 @@ fn bridges() -> io::Result<()> {
         uid,
         gid,
         xray: executable(&xray)?,
+        netbird: PathBuf::new(),
         openfortivpn: PathBuf::new(),
         instances: BTreeMap::new(),
         reaping: Vec::new(),
