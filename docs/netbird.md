@@ -24,11 +24,11 @@ Create a NetBird profile:
 ```
 
 Use `"mode": "private"` and omit `exit_network_id` for private networks. Exit
-mode selects one advertised NetBird network ID and keeps its private routes.
+mode selects only the advertised NetBird network ID in `exit_network_id`.
 Publish exit routes to these peers with Auto Apply disabled. Use IP/CIDR
 resources for protected destinations. Want Gates deselects advertised domain
-resources. Resolve company names through the connection's explicit `--dns`
-resolver, which must be reachable through its tunnel.
+resources. Use an explicit `--dns` resolver and health targets that the
+connection can reach through its selected routes.
 
 The HTTPS management endpoint is included automatically. List any separate
 signal, relay, and device authorization or token endpoints, with their exact

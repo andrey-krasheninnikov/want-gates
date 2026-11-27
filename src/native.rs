@@ -387,6 +387,7 @@ mod tests {
         current.netbird_routes_revision = before.netbird_routes_revision;
         current.authentication = "expired".into();
         assert!(before.netbird_runtime_changed(&current));
+        assert!(before.netbird_runtime_changed(&unavailable_observation()));
         assert!(!Observation::default().netbird_runtime_changed(&current));
     }
 

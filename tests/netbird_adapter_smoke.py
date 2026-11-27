@@ -381,16 +381,28 @@ def acceptance(context, client, server, geodata):
                 traffic(b, 'exit', allowed=False)
         print('Both exit nodes passed and failed over within their own groups', flush=True)
 
-        previous = observations(b.connections['exit'])['session']
-        stand.checked('systemctl', 'restart', f'{prefix}.service')
-        fixture.wait_for('restarted control socket', lambda: stand.run(
-            str(context['installed']), 'status', '--socket', f'/run/{prefix}/control.sock'
-        ).returncode == 0)
-        fixture.wait_for('B enrollment restored', lambda: observations(b.connections['exit']),
-                         lambda v: v['authentication'] == 'authenticated' and v['session'] != previous)
-        selected(b, b.connections['exit'])
-        selected(a, a.connections['exit'])
-        traffic(b, 'exit')
+        control_unit = f'{prefix}.service'
+
+        def control_pid():
+            return int(stand.checked('systemctl', 'show', '--property=MainPID',
+                                     '--value', control_unit).stdout)
+
+        initial_pid = control_pid()
+        assert initial_pid > 0
+        for restarted_unit in (unit.name, control_unit):
+            previous = observations(b.connections['exit'])['session']
+            stand.checked('systemctl', 'restart', restarted_unit)
+            fixture.wait_for('restarted control socket', lambda: stand.run(
+                str(context['installed']), 'status', '--socket', f'/run/{prefix}/control.sock'
+            ).returncode == 0)
+            if restarted_unit == unit.name:
+                assert control_pid() == initial_pid, 'native restart stopped the control service'
+            fixture.wait_for('B enrollment restored', lambda: observations(b.connections['exit']),
+                             lambda v: v.get('authentication') == 'authenticated' and v['session'] != previous)
+            selected(b, b.connections['exit'])
+            selected(a, a.connections['exit'])
+            traffic(b, 'exit')
+        print('Native-only and full service restarts restored the exit groups', flush=True)
 
         data('connection', 'logout', a.connections['exit'])
         selected(a, None)

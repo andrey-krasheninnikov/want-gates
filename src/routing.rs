@@ -2375,8 +2375,8 @@ fn health_cycle(
                 .values()
                 .any(|state| state.netbird_routes_revision.is_some())
         {
-            netbird_changed_during_switch = crate::native::observe(native, &working.native)
-                .is_ok_and(|latest| {
+            netbird_changed_during_switch =
+                crate::native::health_observations(native, &working.native).is_ok_and(|latest| {
                     effective
                         .groups
                         .iter()

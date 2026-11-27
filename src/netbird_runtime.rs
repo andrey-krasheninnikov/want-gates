@@ -405,10 +405,11 @@ fn route_selection(profile: &Profile, response: &Value) -> io::Result<(Routes, b
             is_exit |= network.prefix == 0;
             prefixes.insert(network.canonical());
         }
+        // NetBird groups routes by ID, so exit mode selects only the configured ID.
         if is_exit && profile.exit_network_id.as_ref() == Some(&route.id) {
             target_found = true;
             desired.insert(route.id, prefixes);
-        } else if !is_exit {
+        } else if profile.mode == Mode::Private && !is_exit {
             desired.insert(route.id, prefixes);
         }
     }
@@ -970,6 +971,29 @@ mod tests {
                 }))
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn exit_mode_selects_only_the_configured_exit_id() -> io::Result<()> {
+        let profile = decoded_profile(&json!({
+            "protocol": "netbird",
+            "settings": {
+                "management_url": "https://netbird.example",
+                "mode": "exit",
+                "exit_network_id": "office-exit"
+            }
+        }))?;
+        let (routes, confirmed) = route_selection(
+            &profile,
+            &json!({"routes": [
+                {"ID": "office-exit", "range": "0.0.0.0/0, ::/0", "selected": true},
+                {"ID": "other-exit", "range": "0.0.0.0/0"},
+                {"ID": "office-lan", "range": "10.220.0.0/24"}
+            ]}),
+        )?;
+        assert!(confirmed);
+        assert_eq!(routes.into_keys().collect::<Vec<_>>(), ["office-exit"]);
         Ok(())
     }
 
