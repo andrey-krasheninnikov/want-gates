@@ -265,20 +265,21 @@ check_units() {
 }
 
 enable_unit() {
-    local i=$1 unit link
+    local i=$1 unit directory
     unit=${units[i]}
     if [[ -f $pending/enabled/$unit ]] || systemctl is-enabled --quiet "$unit" 2>/dev/null; then
         return 0
     fi
-    link=/etc/systemd/system/${targets[i]}.wants/$unit
-    absent "$link" || fail "inspect the existing boot link for $unit"
-    touch "$pending/enabling/$unit"
-    sync -f "$root"
-    systemctl add-wants "${targets[i]}" "$unit"
+    directory=/etc/systemd/system/${targets[i]}.wants
+    if ! absent "$directory" && { [[ ! -d $directory ]] || ! trusted "$directory"; }; then
+        printf 'Inspect the boot target directory for %s before installing.\n' "$unit" >&2
+        return 1
+    fi
+    systemctl enable "$unit"
 }
 
 recover() {
-    local i file destination unit link
+    local i file destination unit
     if [[ -f $pending/verified ]]; then
         for i in "${!files[@]}"; do
             file=${files[i]} destination=${destinations[i]}
@@ -286,6 +287,11 @@ recover() {
                 same "$destination" "$pending/new/$file" || return 1
             fi
         done
+        check_units || return 1
+        for i in "${!units[@]}"; do
+            if [[ -f $pending/enable/${units[i]} ]]; then enable_unit "$i" || return 1; fi
+        done
+        sync -f /etc || return 1
         if ! absent "$root/receipt.wgates-new"; then
             [[ -f $root/receipt.wgates-new && ! -L $root/receipt.wgates-new ]] || return 1
             rm -- "$root/receipt.wgates-new" || return 1
@@ -311,16 +317,6 @@ recover() {
             fi
         done
         systemctl daemon-reload && check_units || return 1
-        for i in "${!units[@]}"; do
-            unit=${units[i]}
-            [[ -f $pending/enabling/$unit ]] || continue
-            link=/etc/systemd/system/${targets[i]}.wants/$unit
-            if ! absent "$link"; then
-                [[ -L $link && $(readlink -- "$link") == "/etc/systemd/system/$unit" ]] &&
-                    trusted "$(dirname -- "$link")" || return 1
-                rm -- "$link" || return 1
-            fi
-        done
         for unit in "${units[@]}"; do
             [[ -f $pending/new/$unit ]] || continue
             if [[ $(systemctl show -p LoadState --value "$unit") != not-found ]]; then
@@ -502,7 +498,9 @@ if ((!native)) && absent "${destinations[3]}"; then
     rm -- "$workspace/new/wgates-native.service"
 fi
 absent "$root/receipt.wgates-new" || fail 'unexpected installation receipt staging file'
-mkdir -- "$workspace/old" "$workspace/active" "$workspace/enabled" "$workspace/enabling"
+mkdir -- "$workspace/old" "$workspace/active" "$workspace/enabled" "$workspace/enable"
+touch "$workspace/enable/wgates.service"
+if ((native)); then touch "$workspace/enable/wgates-native.service"; fi
 changed=0
 for i in "${!files[@]}"; do
     file=${files[i]} destination=${destinations[i]}
@@ -553,8 +551,6 @@ systemd-sysusers /usr/lib/sysusers.d/wgates.conf
 check_identity
 systemctl daemon-reload
 check_units || fail 'unit ownership check failed'
-if ((native)); then enable_unit 1; fi
-enable_unit 0
 systemctl start wgates.service
 if ((native)) || [[ -f $pending/active/wgates-native.service ]]; then
     systemctl start wgates-native.service

@@ -17,7 +17,8 @@ custom_unit=/run/systemd/system/wgates.service
 override_dir=/run/systemd/system/wgates.service.d
 custom_wants=/etc/systemd/system/wgates-bootstrap-fixture.target.wants
 default_link=/etc/systemd/system/multi-user.target.wants/wgates.service
-for owned in /usr/local/x-ui "$fixture_unit" "$custom_unit" "$override_dir" "$custom_wants" "$default_link" "$binary" "$unit" \
+native_link=/etc/systemd/system/wgates.service.wants/wgates-native.service
+for owned in /usr/local/x-ui "$fixture_unit" "$custom_unit" "$override_dir" "$custom_wants" "$default_link" "$native_link" "$binary" "$unit" \
     /etc/systemd/system/wgates-native.service /usr/lib/sysusers.d/wgates.conf \
     /var/lib/wgates /var/lib/wgates-install /var/lib/wgates-native; do
     [[ ! -e $owned && ! -L $owned ]] || { echo "Fixture path already exists: $owned"; exit 1; }
@@ -118,7 +119,10 @@ if (( ${#protocol[@]} )); then
     if "$script" install --archive "$archive" --sha256 "$digest" > "$tmp/result" 2>&1; then exit 1; fi
     grep -q 'native service is enabled but inactive' "$tmp/result"
     systemctl is-active --quiet wgates.service
-    ! systemctl is-active --quiet wgates-native.service
+    if systemctl is-active --quiet wgates-native.service; then
+        echo 'The rejected install started the stopped native service.' >&2
+        exit 1
+    fi
     systemctl start wgates-native.service
 fi
 wgates group create --name 'Bootstrap example' >/dev/null
@@ -200,7 +204,8 @@ systemctl reset-failed wgates.service 2>/dev/null || true
 systemctl start wgates.service
 service_pid=$(systemctl show -p MainPID --value wgates.service)
 if (( ${#protocol[@]} )); then
-    ln -s -- /etc/systemd/system/wgates-native.service "$custom_wants/wgates-native.service"
+    mkdir -p -- "$(dirname -- "$native_link")"
+    ln -s -- /etc/systemd/system/wgates-native.service "$native_link"
 fi
 mkdir -- "$override_dir"
 printf '[Service]\nPrivateTmp=yes\n' > "$override_dir/override.conf"
@@ -219,7 +224,7 @@ grep -q 'Restored the previous wgates files and service state' "$tmp/result"
 grep -q 'start an existing 3x-ui' "$tmp/result"
 [[ ! -e /var/lib/wgates-install/pending ]]
 if (( ${#protocol[@]} )); then
-    [[ -L $custom_wants/wgates-native.service ]]
+    [[ -L $native_link ]]
 fi
 wgates group list | cmp - "$tmp/groups"
 systemctl start x-ui.service

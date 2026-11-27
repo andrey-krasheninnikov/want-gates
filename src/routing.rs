@@ -1360,15 +1360,13 @@ fn execute(
         if final_snapshot != candidate {
             submit(root, &client, &mut journal, &final_snapshot)?;
         }
-        if !input.native.is_empty() {
-            check_native_xray(native, &client.status()?, json!([]))?;
-        }
         crate::native::admit(
             native,
             &input.native,
             &native_observations,
             &effective,
             &matrix,
+            || check_native_xray(native, &client.status()?, json!([])),
         )?;
         verify(
             &client,
@@ -1379,6 +1377,12 @@ fn execute(
             &journal.plan.ingress,
             Some(&health),
         )?;
+        if native_observations
+            .iter()
+            .any(|(id, state)| crate::native::should_admit(id, state, &effective, &matrix))
+        {
+            check_native_xray(native, &client.status()?, json!([]))?;
+        }
         let mut working = Working {
             plan_id: journal.plan.id.clone(),
             config: input.config.clone(),
@@ -1793,23 +1797,13 @@ fn recover(
                 ));
             }
             let effective = previous.effective_config();
-            let mut wanted = observations
-                .iter()
-                .filter(|(id, state)| {
-                    crate::native::should_admit(id, state, &effective, &previous.matrix)
-                })
-                .peekable();
-            let uses_native = wanted.peek().is_some();
-            let opening_native = wanted.any(|(_, state)| !state.admitted);
-            if opening_native {
-                check_native_xray(native, &client.status()?, json!([]))?;
-            }
             crate::native::admit(
                 native,
                 &previous.native,
                 &observations,
                 &effective,
                 &previous.matrix,
+                || check_native_xray(native, &client.status()?, json!([])),
             )?;
             verify(
                 client,
@@ -1820,7 +1814,9 @@ fn recover(
                 &journal.plan.ingress,
                 None,
             )?;
-            if uses_native && !opening_native {
+            if observations.iter().any(|(id, state)| {
+                crate::native::should_admit(id, state, &effective, &previous.matrix)
+            }) {
                 check_native_xray(native, &client.status()?, json!([]))?;
             }
             Ok(())
@@ -2410,15 +2406,13 @@ fn health_cycle(
     let mut netbird_changed_during_switch = false;
     let result = (|| -> io::Result<()> {
         submit(root, &client, &mut journal, &candidate)?;
-        if opening_native {
-            check_native_xray(native, &client.status()?, json!([]))?;
-        }
         let verification = crate::native::admit(
             native,
             &working.native,
             &working.native_observations,
             &effective,
             &matrix,
+            || check_native_xray(native, &client.status()?, json!([])),
         )
         .and_then(|()| {
             verify(
