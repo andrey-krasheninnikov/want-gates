@@ -52,14 +52,18 @@ trusted() {
     done
 }
 checked_executable() {
-    local binary=$1 target
-    if [[ $binary == /usr/sbin/* && -L /usr/sbin ]]; then
-        target=$(readlink -- /usr/sbin) || return 1
-        [[ $(stat -c %u -- /usr/sbin) == 0 && ( $target == bin || $target == /usr/bin ) ]] ||
-            return 1
-        binary=/usr/bin/${binary##*/}
-    fi
+    local binary
+    binary=$(realpath -e -- "$1") || return 1
     [[ -f $binary && -x $binary ]] && trusted "$binary" || return 1
+    if [[ $binary != "$1" ]]; then
+        # Check every component of the aliases used by the package and runtime.
+        namei -l -- "$1" | awk '
+            NR == 1 { next }
+            NF < 4 || $2 != "root" { exit 1 }
+            substr($1, 1, 1) != "l" && (substr($1, 6, 1) == "w" || substr($1, 9, 1) == "w") { exit 1 }
+            END { if (NR < 2) exit 1 }
+        ' || return 1
+    fi
     printf '%s\n' "$binary"
 }
 require_executable() {
