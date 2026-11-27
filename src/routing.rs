@@ -825,6 +825,24 @@ impl Service {
                 }
             }
             let working: Option<Working> = optional(&self.root.join("working.json"))?;
+            let selected: BTreeMap<_, _> = working
+                .as_ref()
+                .map(|working| {
+                    let config = working.effective_config();
+                    config
+                        .groups
+                        .iter()
+                        .filter_map(|group| {
+                            let connection = crate::domain::connection(&config, group)?;
+                            crate::capability::ALL.iter()
+                        .any(|capability| allowed(&working.matrix, &group.id, capability))
+                        .then(|| (group.id.clone(), json!({
+                            "id":connection.id,"name":connection.name,"protocol":connection.protocol
+                        })))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             let retired: Vec<_> = working
                 .as_ref()
                 .map(|w| {
@@ -835,7 +853,7 @@ impl Service {
                 })
                 .unwrap_or_default();
             return Ok(Some(
-                json!({"data":{"native_retained":retired,"desired_revision":store.config().revision,"busy":self.busy(),"recovery_required":optional::<Journal>(&self.root.join("journal.json"))?.as_ref().is_some_and(pending) && !self.busy(),"last_observation":saved,"health_schedule":self.health_due.iter().map(|(group,due)|json!({"group_id":group,"due_in_seconds":due.saturating_duration_since(std::time::Instant::now()).as_secs(),"overdue_seconds":std::time::Instant::now().saturating_duration_since(*due).as_secs()})).collect::<Vec<_>>(),"health":optional::<Working>(&self.root.join("working.json"))?.map(|w|w.health_report()),"connection_verifications":connection_reports(&self.root,store.config(), &self.native).unwrap_or_else(|_|json!({"state":"unknown","reason":"observation_state_unreadable"}))}}),
+                json!({"data":{"native_retained":retired,"desired_revision":store.config().revision,"selected_connections":selected,"busy":self.busy(),"recovery_required":optional::<Journal>(&self.root.join("journal.json"))?.as_ref().is_some_and(pending) && !self.busy(),"last_observation":saved,"health_schedule":self.health_due.iter().map(|(group,due)|json!({"group_id":group,"due_in_seconds":due.saturating_duration_since(std::time::Instant::now()).as_secs(),"overdue_seconds":std::time::Instant::now().saturating_duration_since(*due).as_secs()})).collect::<Vec<_>>(),"health":working.as_ref().map(Working::health_report),"connection_verifications":connection_reports(&self.root,store.config(), &self.native).unwrap_or_else(|_|json!({"state":"unknown","reason":"observation_state_unreadable"}))}}),
             ));
         }
         if self.busy() {

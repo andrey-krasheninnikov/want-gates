@@ -1,0 +1,57 @@
+--- a/internal/web/controller/spa.go
++++ b/internal/web/controller/spa.go
+@@ -46,0 +47,2 @@
++	g.GET("/want-gates", a.panelSPA)
++	g.GET("/api/want-gates/status", wantGatesStatus)
+--- a/frontend/src/routes/panelRoutes.tsx
++++ b/frontend/src/routes/panelRoutes.tsx
+@@ -25,0 +26 @@
++const WantGatesPage = lazy(() => import('@/pages/want-gates/WantGatesPage'));
+@@ -46,0 +48 @@
++  { path: '/want-gates', titleKey: 'menu.wantGates', icon: GlobalOutlined, component: WantGatesPage },
+--- a/internal/web/translation/en-US.json
++++ b/internal/web/translation/en-US.json
+@@ -109,0 +110 @@
++    "wantGates": "Want Gates",
+--- a/frontend/src/components/command-palette/CommandPalette.tsx
++++ b/frontend/src/components/command-palette/CommandPalette.tsx
+@@ -82,0 +83 @@
++  '/want-gates': ['want gates', 'vpn', 'health', 'gateway'],
+--- a/frontend/src/styles/page-shell.css
++++ b/frontend/src/styles/page-shell.css
+@@ -6,0 +7 @@
++.want-gates-page,
+@@ -21,0 +23 @@
++.want-gates-page.is-dark,
+@@ -34,0 +37 @@
++.want-gates-page.is-dark.is-ultra,
+@@ -52,0 +56 @@
++.want-gates-page .ant-layout,
+@@ -53,0 +58 @@
++.want-gates-page .ant-layout-content,
+@@ -66,0 +72 @@
++.want-gates-page .content-shell,
+@@ -77,0 +84 @@
++.want-gates-page .content-area,
+@@ -85,0 +93 @@
++  .want-gates-page .content-area,
+@@ -179,0 +188 @@
++.want-gates-page .summary-card,
+@@ -187,0 +197 @@
++  .want-gates-page .summary-card,
+--- a/frontend/src/styles/page-cards.css
++++ b/frontend/src/styles/page-cards.css
+@@ -6,0 +7 @@
++.want-gates-page .ant-card,
+@@ -22,0 +24 @@
++.want-gates-page.is-dark .ant-card,
+@@ -35,0 +38 @@
++.want-gates-page.is-dark.is-ultra .ant-card,
+@@ -48,0 +52 @@
++.want-gates-page .ant-card.ant-card-hoverable:hover,
+@@ -60,0 +65 @@
++.want-gates-page.is-dark .ant-card.ant-card-hoverable:hover,
+@@ -73,0 +79 @@
++.want-gates-page.is-dark.is-ultra .ant-card.ant-card-hoverable:hover,
+@@ -86,0 +93 @@
++.want-gates-page .ant-card .ant-card-actions,

@@ -110,3 +110,35 @@ jobs:
           tar -xzf "$fixture/panel.tar.gz" -C "$fixture"
           (cd dist && sha256sum --check --strict SHA256SUMS)
           bash tests/bootstrap_container.sh "$IMAGE" "$SETUP" "$fixture/x-ui" dist/wgates-*.tar.gz
+
+  panel:
+    name: Build 3x-ui on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: '1.27.3'
+          cache: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '26.0.0'
+          package-manager-cache: false
+      - name: Build patched panel and source archive
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -qy --no-install-recommends musl-tools
+          packaging/panel/build.sh panel-dist
+          (cd panel-dist && sha256sum -- *.tar.gz > SHA256SUMS)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: panel-linux-${{ runner.arch }}
+          path: panel-dist/
+          if-no-files-found: error
