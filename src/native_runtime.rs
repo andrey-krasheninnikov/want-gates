@@ -1496,6 +1496,9 @@ impl Runtime {
             return Ok(());
         }
         stop(&mut instance.proxy);
+        if gate {
+            self.check_xray_metadata()?;
+        }
         let p = &instance.record.prepared;
         let inbounds = [("data", p.data_port, false), ("diagnostic", p.probe_port, true)].into_iter().map(|(tag, port, diagnostic)| json!({"tag":tag,"listen":p.address.to_string(),"port":port,"protocol":"vless","settings":{"clients":[{"id":p.bridge_id(diagnostic)}],"decryption":"none"},"streamSettings":{"network":"raw","security":"none"}})).collect::<Vec<_>>();
         let value = json!({"log":{"loglevel":"none"},"inbounds":inbounds,"outbounds":[{"tag":"tunnel","protocol":"freedom","settings":{"finalRules":[{"action":"allow","ip":["0.0.0.0/0","::/0"]}]}},{"tag":"block","protocol":"blackhole"}],"routing":{"domainStrategy":"AsIs","rules":[{"type":"field","domain":["regexp:.+"],"outboundTag":"block"},{"type":"field","inboundTag":["data"],"outboundTag":if gate{"tunnel"}else{"block"}}]}});

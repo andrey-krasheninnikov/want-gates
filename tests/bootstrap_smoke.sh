@@ -199,6 +199,9 @@ systemctl daemon-reload
 systemctl reset-failed wgates.service 2>/dev/null || true
 systemctl start wgates.service
 service_pid=$(systemctl show -p MainPID --value wgates.service)
+if (( ${#protocol[@]} )); then
+    ln -s -- /etc/systemd/system/wgates-native.service "$custom_wants/wgates-native.service"
+fi
 mkdir -- "$override_dir"
 printf '[Service]\nPrivateTmp=yes\n' > "$override_dir/override.conf"
 if "$script" install --archive "$archive" --sha256 "$digest" > "$tmp/result" 2>&1; then exit 1; fi
@@ -215,6 +218,9 @@ if "$script" install --archive "$archive" --sha256 "$digest" > "$tmp/result" 2>&
 grep -q 'Restored the previous wgates files and service state' "$tmp/result"
 grep -q 'start an existing 3x-ui' "$tmp/result"
 [[ ! -e /var/lib/wgates-install/pending ]]
+if (( ${#protocol[@]} )); then
+    [[ -L $custom_wants/wgates-native.service ]]
+fi
 wgates group list | cmp - "$tmp/groups"
 systemctl start x-ui.service
 for _ in {1..50}; do

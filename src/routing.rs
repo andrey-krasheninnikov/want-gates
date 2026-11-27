@@ -1781,28 +1781,49 @@ fn recover(
     }
     let runtime_error = if let Some(previous) = &journal.previous {
         (|| -> io::Result<()> {
-        let observations = crate::native::observe(native, &previous.native)?;
-        if observations.iter().any(|(id,state)|previous.native_observations.get(id).is_none_or(|old|old.session!=state.session || old.dns!=state.dns)) { return Err(invalid("previous native session changed; resource verification requires a fresh preview and apply")); }
-        let effective = previous.effective_config();
-        if observations.iter().any(|(id, state)| {
-            crate::native::should_admit(id, state, &effective, &previous.matrix)
-        }) && let Err(error) = client
-            .status()
-            .and_then(|status| check_native_xray(native, &status, json!([])))
-        {
-            crate::native::admit(native, &previous.native, &observations, &effective, &Matrix::new())?;
-            return Err(error);
-        }
-        crate::native::admit(native, &previous.native, &observations, &effective, &previous.matrix)?;
-        verify(
-            client,
-            &journal.plan.base,
-            &effective,
-            &previous.proxy,
-            &previous.matrix,
-            &journal.plan.ingress,
-            None,
-        )
+            let observations = crate::native::observe(native, &previous.native)?;
+            if observations.iter().any(|(id, state)| {
+                previous
+                    .native_observations
+                    .get(id)
+                    .is_none_or(|old| old.session != state.session || old.dns != state.dns)
+            }) {
+                return Err(invalid(
+                    "Previous native session changed. Preview and apply again to verify resources.",
+                ));
+            }
+            let effective = previous.effective_config();
+            let mut wanted = observations
+                .iter()
+                .filter(|(id, state)| {
+                    crate::native::should_admit(id, state, &effective, &previous.matrix)
+                })
+                .peekable();
+            let uses_native = wanted.peek().is_some();
+            let opening_native = wanted.any(|(_, state)| !state.admitted);
+            if opening_native {
+                check_native_xray(native, &client.status()?, json!([]))?;
+            }
+            crate::native::admit(
+                native,
+                &previous.native,
+                &observations,
+                &effective,
+                &previous.matrix,
+            )?;
+            verify(
+                client,
+                &journal.plan.base,
+                &effective,
+                &previous.proxy,
+                &previous.matrix,
+                &journal.plan.ingress,
+                None,
+            )?;
+            if uses_native && !opening_native {
+                check_native_xray(native, &client.status()?, json!([]))?;
+            }
+            Ok(())
         })()
         .err()
         .map(|error| error.to_string())
@@ -2347,10 +2368,10 @@ fn health_cycle(
         return Ok(());
     }
     let effective = effective_config(&config, &selected);
-    if working.native_observations.iter().any(|(id, state)| {
+    let opening_native = working.native_observations.iter().any(|(id, state)| {
         !state.admitted && crate::native::should_admit(id, state, &effective, &matrix)
-    }) && let Err(error) = check_native_xray(native, &client.running()?, json!([]))
-    {
+    });
+    if opening_native && let Err(error) = check_native_xray(native, &client.running()?, json!([])) {
         if crate::native::unavailable(&error) {
             return Ok(());
         }
@@ -2389,6 +2410,9 @@ fn health_cycle(
     let mut netbird_changed_during_switch = false;
     let result = (|| -> io::Result<()> {
         submit(root, &client, &mut journal, &candidate)?;
+        if opening_native {
+            check_native_xray(native, &client.status()?, json!([]))?;
+        }
         let verification = crate::native::admit(
             native,
             &working.native,
