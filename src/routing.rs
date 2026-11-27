@@ -840,7 +840,8 @@ impl Service {
                         && saved["plan_id"] == working.plan_id
                         && saved["running_revision"] == working.config.revision
                         && digest(&working.snapshot).is_ok_and(|current| current == saved_digest))
-                    .then_some(saved_digest)
+                    .then(|| working.observation_token().ok())
+                    .flatten()
                 });
                 return Ok(Some(json!({"data":{
                     "desired_revision":store.config().revision,"busy":busy,
@@ -1956,7 +1957,7 @@ impl Service {
             return Err(changed());
         }
         let working: Working = optional(&self.root.join("working.json"))?.ok_or_else(changed)?;
-        if digest(&working.snapshot)? != expected {
+        if working.observation_token()? != expected {
             return Err(changed());
         }
         let config = working.effective_config();
@@ -1994,7 +1995,7 @@ impl Service {
         if let Some(requested) = observed_digest {
             let expected = store::text(requested)?;
             let matches = matches!(&inspected, Ok((false, Some(working)))
-                if digest(&working.snapshot).is_ok_and(|current| current == expected));
+                if working.observation_token().is_ok_and(|current| current == expected));
             if busy || !matches {
                 return Err(invalid("routing observation changed during listing; retry"));
             }
@@ -2252,6 +2253,16 @@ fn select_matrix(
     }
 }
 impl Working {
+    fn observation_token(&self) -> io::Result<String> {
+        digest(&(
+            &self.plan_id,
+            self.config.revision,
+            &self.snapshot,
+            &self.selected,
+            &self.matrix,
+        ))
+    }
+
     fn effective_config(&self) -> Config {
         effective_config(
             &crate::native::effective(&self.config, &self.native_observations),

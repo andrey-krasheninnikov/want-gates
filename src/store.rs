@@ -277,7 +277,7 @@ impl Store {
         let command = text(&request["command"])?;
         let fields: &[&str] = match command {
             "group.create" => &["name"],
-            "group.list" => &["offset", "list_revision", "observed_digest"],
+            "group.list" => &["offset", "list_revision", "observed_digest", "page_size"],
             "group.show" | "connection.show" => &["id"],
             "group.update" => &[
                 "id",
@@ -289,7 +289,7 @@ impl Store {
                 "healthcheck",
             ],
             "rule.create" => &["group_id", "destination"],
-            "rule.list" => &["group_id", "offset", "list_revision"],
+            "rule.list" => &["group_id", "offset", "list_revision", "page_size"],
             "rule.show" => &["id"],
             "rule.update" => &["id", "expected_revision", "group_id", "destination"],
             "rule.delete" => &["id", "expected_revision"],
@@ -300,6 +300,7 @@ impl Store {
                 "offset",
                 "list_revision",
                 "observed_digest",
+                "page_size",
             ],
             "connection.import" => &[
                 "name",
@@ -740,10 +741,16 @@ impl Store {
         if offset > items.len() {
             return Err(invalid("invalid list offset"));
         }
+        let page_size = request
+            .get("page_size")
+            .map_or(Some(PAGE_SIZE as u64), Value::as_u64)
+            .filter(|size| (1..=1000).contains(size))
+            .ok_or_else(|| invalid("page_size must be an integer from 1 to 1000"))?
+            as usize;
         let total = items.len();
         let mut data = Vec::new();
         let mut bytes = 128;
-        for item in items.skip(offset).take(PAGE_SIZE) {
+        for item in items.skip(offset).take(page_size) {
             let item = serde_json::to_value(item)?;
             let size = serde_json::to_vec(&item)?.len() + 1;
             if bytes + size > crate::MAX_MESSAGE / 2 {

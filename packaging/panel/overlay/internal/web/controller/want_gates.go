@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"time"
 
@@ -140,7 +141,7 @@ func wantGatesExchange(ctx context.Context, socket string, request map[string]an
 	}
 	reader := bufio.NewReader(io.LimitReader(conn, wantGatesFrameLimit+1))
 	frame, err := reader.ReadBytes('\n')
-	if err != nil || len(frame) > wantGatesFrameLimit || json.Unmarshal(frame, &reply) != nil || reply.Version != 1 || len(reply.Data) == 0 && reply.Error == "" {
+	if err != nil || len(frame) > wantGatesFrameLimit+1 || json.Unmarshal(frame, &reply) != nil || reply.Version != 1 || len(reply.Data) == 0 && reply.Error == "" {
 		return wantGatesReply{}, errWantGatesReply
 	}
 	return reply, nil
@@ -150,7 +151,7 @@ func wantGatesList[T any](ctx context.Context, socket, command string, revision 
 	items := make([]T, 0)
 	var offset uint64
 	for {
-		request := map[string]any{"command": command, "list_revision": revision, "offset": offset}
+		request := map[string]any{"command": command, "list_revision": revision, "offset": offset, "page_size": 1000}
 		if observedDigest != nil {
 			request["observed_digest"] = *observedDigest
 		}
@@ -177,18 +178,28 @@ func wantGatesList[T any](ctx context.Context, socket, command string, revision 
 	}
 }
 
-func loadWantGatesSnapshot(ctx context.Context, socket string) (wantGatesSnapshot, error) {
-	var result wantGatesSnapshot
+type wantGatesSummary struct {
+	wantGatesRouting
+	ObservedDigest *string `json:"observed_digest"`
+}
+
+func readWantGatesSummary(ctx context.Context, socket string) (wantGatesSummary, error) {
+	var routing wantGatesSummary
 	reply, err := wantGatesExchange(ctx, socket, map[string]any{"command": "routing.status", "summary": true})
 	if err != nil {
-		return result, err
-	}
-	var routing struct {
-		wantGatesRouting
-		ObservedDigest *string `json:"observed_digest"`
+		return routing, err
 	}
 	if reply.Error != "" || json.Unmarshal(reply.Data, &routing) != nil || routing.Last.State == "" {
-		return result, errWantGatesReply
+		return routing, errWantGatesReply
+	}
+	return routing, nil
+}
+
+func loadWantGatesSnapshot(ctx context.Context, socket string) (wantGatesSnapshot, error) {
+	var result wantGatesSnapshot
+	routing, err := readWantGatesSummary(ctx, socket)
+	if err != nil {
+		return result, err
 	}
 	result.Routing = routing.wantGatesRouting
 	revision := uint64(routing.DesiredRevision)
@@ -201,7 +212,25 @@ func loadWantGatesSnapshot(ctx context.Context, socket string) (wantGatesSnapsho
 		return result, err
 	}
 	result.Rules, err = wantGatesList[wantGatesRule](ctx, socket, "rule.list", revision, nil)
-	return result, err
+	if err != nil {
+		return result, err
+	}
+	latest, err := readWantGatesSummary(ctx, socket)
+	if err != nil {
+		return result, err
+	}
+	if !reflect.DeepEqual(routing, latest) {
+		return wantGatesSnapshot{}, errWantGatesChanged
+	}
+	if routing.ObservedDigest == nil {
+		for index := range result.Connections {
+			connection := &result.Connections[index]
+			connection.Runtime = "unavailable"
+			connection.RuntimeReason = "observation_unavailable"
+			connection.Capabilities = nil
+		}
+	}
+	return result, nil
 }
 
 func wantGatesSocketPath() string {
@@ -213,7 +242,7 @@ func wantGatesSocketPath() string {
 
 func wantGatesStatus(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 25*time.Second)
 	defer cancel()
 	socket := wantGatesSocketPath()
 	if !filepath.IsAbs(socket) {

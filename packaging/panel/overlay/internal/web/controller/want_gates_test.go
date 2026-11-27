@@ -30,6 +30,7 @@ func TestWantGatesSnapshotKeepsRevisionAndOmitsPrivateFields(t *testing.T) {
 		{"connection.list", 0, `{"data":[{"id":"c3","revision":18446744073709551614,"group_id":"g1","name":"VLESS path","profile":"synthetic-profile-secret","verification":{"capabilities":{"tcp_ipv4":{"state":"verified","reason":"verified","detail":"synthetic-profile-secret"}}}}],"list_revision":18446744073709551614}`},
 		{"rule.list", 0, `{"data":[],"list_revision":18446744073709551614}`},
 	}
+	replies = append(replies, replies[0])
 	served := make(chan error, 1)
 	go func() {
 		for _, page := range replies {
@@ -44,11 +45,12 @@ func TestWantGatesSnapshotKeepsRevisionAndOmitsPrivateFields(t *testing.T) {
 				ListRevision   *uint64 `json:"list_revision"`
 				Offset         uint64  `json:"offset"`
 				Summary        bool    `json:"summary"`
+				PageSize       uint64  `json:"page_size"`
 				ObservedDigest string  `json:"observed_digest"`
 			}
 			err = json.NewDecoder(conn).Decode(&request)
 			if err == nil && (request.Version != 1 || request.Command != page.command || request.Offset != page.offset ||
-				page.command != "routing.status" && (request.ListRevision == nil || *request.ListRevision != revision) ||
+				page.command != "routing.status" && (request.ListRevision == nil || *request.ListRevision != revision || request.PageSize != 1000) ||
 				page.command == "routing.status" && !request.Summary ||
 				(page.command == "group.list" || page.command == "connection.list") && request.ObservedDigest != "observed-fixture") {
 				err = errWantGatesReply
