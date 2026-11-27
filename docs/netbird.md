@@ -85,10 +85,11 @@ code sooner. After login, the deadline reflects the session expiry NetBird
 reports when one is available.
 
 Setup keys and device codes are transient. NetBird keeps its enrolled peer
-identity under the root-owned native state directory. A service restart
-reconnects the saved peer and requires fresh traffic checks. A changed profile
-creates a new generation that requires enrollment. After a disconnected or
-expired session, repeat the appropriate login or restart the connection.
+identity under the root-owned native state directory. On service restart, Want
+Gates tries to reconnect unpaused connections with saved peer identities and
+requires fresh traffic checks. A changed profile creates a new generation that
+requires enrollment. After a disconnection, restart the connection. Repeat
+login when NetBird requires authentication.
 
 Log out to pause the connection and remove its network resources.
 
