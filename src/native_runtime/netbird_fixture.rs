@@ -10,7 +10,7 @@ struct Fixture {
     servers: [SocketAddr; 2],
 }
 
-fn record(slot: u8, server: SocketAddr) -> io::Result<Record> {
+pub(super) fn record(slot: u8, server: SocketAddr) -> io::Result<Record> {
     let id = random_id()?;
     let host = Ipv4Addr::new(169, 254, 230, slot * 4 + 1);
     let index = (230 << 6) | u16::from(slot);

@@ -15,6 +15,7 @@ pub fn probe_ready(authentication: &str) -> bool {
 }
 
 pub const DEFAULT_SOCKET: &str = "/run/wgates-native/control.sock";
+pub const NETBIRD_CONFIRMING_ROUTES: &str = "netbird_confirming_routes";
 
 #[derive(Clone)]
 pub struct Client {
@@ -136,6 +137,16 @@ pub struct Observation {
     pub resources_active: bool,
     pub expires_at: Option<u64>,
     pub remembered: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub netbird_routes_revision: Option<u64>,
+}
+impl Observation {
+    pub fn netbird_routes_rechecked(&self, current: &Self) -> bool {
+        self.netbird_routes_revision.is_some()
+            && (self.netbird_routes_revision != current.netbird_routes_revision
+                || self.reason == NETBIRD_CONFIRMING_ROUTES
+                || current.reason == NETBIRD_CONFIRMING_ROUTES)
+    }
 }
 impl Prepared {
     pub fn bridge_id(&self, diagnostic: bool) -> String {
@@ -350,4 +361,25 @@ pub fn verification_context(
         return Ok(None);
     };
     crate::routing::digest(&json!({"generation":prepared.generation,"session":observation.session,"dns":connection.dns.as_ref().or(observation.dns.as_ref())})).map(Some)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_recheck_detects_a_completed_revision_change() {
+        let before = Observation {
+            netbird_routes_revision: Some(10),
+            ..Observation::default()
+        };
+        let mut current = before.clone();
+        assert!(!before.netbird_routes_rechecked(&current));
+        current.reason = NETBIRD_CONFIRMING_ROUTES.into();
+        assert!(before.netbird_routes_rechecked(&current));
+        current.reason.clear();
+        current.netbird_routes_revision = Some(11);
+        assert!(before.netbird_routes_rechecked(&current));
+        assert!(!Observation::default().netbird_routes_rechecked(&current));
+    }
 }

@@ -18,6 +18,12 @@ use std::time::Duration;
 
 pub(super) const CURL: &str = "/usr/bin/curl";
 const LOGIN_SECONDS: u64 = 300;
+const PRIVATE_DIRECTORIES: [(&str, &str); 4] = [
+    ("iproute2", "/etc/iproute2"),
+    ("etc-netbird", "/etc/netbird"),
+    ("etc-wiretrustee", "/etc/wiretrustee"),
+    ("ssh-config", "/etc/ssh/ssh_config.d"),
+];
 
 pub(super) type Hosts = BTreeMap<String, BTreeSet<IpAddr>>;
 
@@ -156,12 +162,7 @@ impl ProcessFiles<'_> {
             ));
         }
         // NetBird may update rt_tables or import configuration during startup.
-        for (name, target) in [
-            ("iproute2", "/etc/iproute2"),
-            ("etc-netbird", "/etc/netbird"),
-            ("etc-wiretrustee", "/etc/wiretrustee"),
-            ("ssh-config", "/etc/ssh/ssh_config.d"),
-        ] {
+        for (name, target) in PRIVATE_DIRECTORIES {
             match fs::symlink_metadata(target) {
                 Ok(meta) if meta.is_dir() => mounts.push((
                     CString::new(self.runtime.join(name).as_os_str().as_encoded_bytes())
@@ -429,6 +430,7 @@ pub(super) struct Session {
     request: Option<Request>,
     configured: bool,
     revision: Option<u64>,
+    pub(super) observed_revision: Option<u64>,
     active_routes: Option<Routes>,
     pending_routes: Option<Routes>,
     explicit_selection: bool,
@@ -461,7 +463,7 @@ impl Session {
             &runtime.join("resolv.conf"),
             "nameserver 127.0.0.1\noptions attempts:1 timeout:1\n",
         )?;
-        for name in ["iproute2", "etc-netbird", "etc-wiretrustee", "ssh-config"] {
+        for (name, _) in PRIVATE_DIRECTORIES {
             secure_directory(&runtime.join(name), 0o700, 0o077)?;
         }
         private_text(&runtime.join("iproute2/rt_tables"), "")?;
@@ -557,6 +559,7 @@ impl Session {
                 request: None,
                 configured: false,
                 revision: None,
+                observed_revision: None,
                 active_routes: None,
                 pending_routes: None,
                 explicit_selection: false,
@@ -832,6 +835,7 @@ impl Session {
                             .or_else(|| v.as_u64())
                     })
                     .unwrap_or(0);
+                self.observed_revision = Some(revision);
                 let expiry = session_expiry(&value["sessionExpiresAt"]);
                 if let StatusCheck::Confirm(expected) = check
                     && expected == revision
@@ -851,7 +855,7 @@ impl Session {
                     if auth.state != "authenticated" {
                         auth.state = "connecting".into();
                     }
-                    auth.reason = "netbird_confirming_routes".into();
+                    auth.reason = crate::native::NETBIRD_CONFIRMING_ROUTES.into();
                     self.send(
                         Operation::Networks {
                             revision,
@@ -883,8 +887,69 @@ pub(super) fn new_auth() -> io::Result<Authentication> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Reply, session_expiry};
-    use serde_json::json;
+    use super::*;
+    use crate::native_runtime::{Instance, Runtime, netbird_fixture};
+
+    #[test]
+    fn pending_routes_allow_admission_reconciliation() -> io::Result<()> {
+        let record = netbird_fixture::record(1, "192.0.2.1:443".parse().unwrap())?;
+        let generation = record.prepared.generation.clone();
+        let mut instance = Instance::new(record, new_auth()?);
+        instance
+            .auth
+            .authenticated(crate::native::NETBIRD_CONFIRMING_ROUTES);
+        let session = instance.auth.session.clone();
+        instance.admitted_session = Some(session.clone());
+        instance.netbird = Some(Session {
+            socket: PathBuf::new(),
+            state: PathBuf::new(),
+            profile: decoded_profile(&json!({
+                "protocol":"netbird",
+                "settings":{"management_url":"https://netbird.example","mode":"private"}
+            }))?,
+            hostname: "test".into(),
+            port: 40000,
+            startup: Instant::now(),
+            next_status: Instant::now(),
+            request: None,
+            configured: true,
+            revision: None,
+            observed_revision: Some(10),
+            active_routes: Some(Routes::new()),
+            pending_routes: None,
+            explicit_selection: true,
+            user_code: None,
+        });
+        let mut runtime = Runtime {
+            root: PathBuf::new(),
+            directory: PathBuf::new(),
+            uid: 65534,
+            gid: 65534,
+            xray: PathBuf::new(),
+            openfortivpn: PathBuf::new(),
+            netbird: PathBuf::new(),
+            instances: BTreeMap::from([(generation.clone(), instance)]),
+            reaping: Vec::new(),
+        };
+        let state = runtime.dispatch(&json!({"command":"state","generation":generation}))?;
+        assert_eq!(state["observation"]["admitted"], true);
+        assert_eq!(state["observation"]["netbird_routes_revision"], 10);
+        for admitted in [false, true] {
+            let state = runtime.dispatch(&json!({
+                "command":"admit","generation":generation,"session":session,"admitted":admitted
+            }))?;
+            assert_eq!(state["admitted"], admitted);
+            assert!(runtime.instances[&generation].proxy.is_none());
+        }
+        assert!(
+            runtime
+                .dispatch(&json!({
+                    "command":"admit","generation":generation,"session":"stale","admitted":true
+                }))
+                .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn daemon_reply_distinguishes_expiry_and_rejected_credentials() {

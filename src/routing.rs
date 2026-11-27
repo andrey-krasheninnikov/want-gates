@@ -1973,6 +1973,7 @@ impl Service {
                                     old.session == observation.session && old.dns == observation.dns
                                 });
                             if !observation.admitted
+                                || observation.reason == crate::native::NETBIRD_CONFIRMING_ROUTES
                                 || !current
                                 || !crate::native::probe_ready(&observation.authentication)
                             {
@@ -2311,24 +2312,57 @@ fn health_cycle(
         phase: "applying".into(),
     };
     private_write(&root.join("journal.json"), &journal)?;
+    let mut netbird_rechecked = false;
     let result = (|| -> io::Result<()> {
         submit(root, &client, &mut journal, &candidate)?;
-        crate::native::admit(
+        let verification = crate::native::admit(
             native,
             &working.native,
             &working.native_observations,
             &effective,
             &matrix,
-        )?;
-        verify(
-            &client,
-            &candidate,
-            &effective,
-            &working.proxy,
-            &matrix,
-            &ingress,
-            Some(&working.health),
-        )?;
+        )
+        .and_then(|()| {
+            verify(
+                &client,
+                &candidate,
+                &effective,
+                &working.proxy,
+                &matrix,
+                &ingress,
+                Some(&working.health),
+            )
+        });
+        // A route recheck can pause the bridge during otherwise valid probes.
+        if verification.is_err()
+            && working
+                .native_observations
+                .values()
+                .any(|state| state.netbird_routes_revision.is_some())
+        {
+            netbird_rechecked =
+                crate::native::observe(native, &working.native).is_ok_and(|latest| {
+                    effective
+                        .groups
+                        .iter()
+                        .filter(|group| {
+                            matrix
+                                .get(&group.id)
+                                .is_some_and(|m| m.values().any(|state| state == "verified"))
+                        })
+                        .filter_map(|group| group.primary.as_ref())
+                        .any(|id| {
+                            working
+                                .native_observations
+                                .get(id)
+                                .zip(latest.get(id))
+                                .is_some_and(|(before, after)| {
+                                    before.netbird_routes_rechecked(after)
+                                })
+                        })
+                });
+        }
+        verification?;
         working.snapshot = candidate;
         working.selected = selected;
         working.matrix = matrix;
@@ -2350,7 +2384,7 @@ fn health_cycle(
             recovery_required(root, &mut journal)?;
         } else {
             let restored = recover(root, &client, &mut journal, native);
-            if crate::native::unavailable(&error)
+            if (crate::native::unavailable(&error) || netbird_rechecked)
                 && restored.as_ref().is_ok_and(|report| {
                     matches!(
                         report["state"].as_str(),

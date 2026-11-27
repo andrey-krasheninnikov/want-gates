@@ -1679,16 +1679,14 @@ impl Runtime {
             authentication: instance.auth.state.clone(),
             reason: instance.auth.reason.clone(),
             dns: instance.dns.clone(),
-            admitted: instance.admitted_session.as_ref() == Some(&instance.auth.session)
-                && instance
-                    .netbird
-                    .as_ref()
-                    .is_none_or(netbird::Session::routing_ready),
+            // Admission records the grant while NetBird pauses the bridge to confirm routes.
+            admitted: instance.admitted_session.as_ref() == Some(&instance.auth.session),
             resources_active: instance.record.namespace_identity.is_some()
                 || instance.client.is_some()
                 || instance.proxy.is_some(),
             expires_at: instance.auth.expires_at,
             remembered: instance.auth.remembered,
+            netbird_routes_revision: instance.netbird.as_ref().and_then(|s| s.observed_revision),
         }
     }
     fn stop_in_poll(&mut self, process: &mut Option<Child>, forti: bool) {
@@ -2041,17 +2039,20 @@ impl Runtime {
                 let admitted = request["admitted"]
                     .as_bool()
                     .ok_or_else(|| invalid("native admission boolean required"))?;
-                let ready = crate::native::probe_ready(&i.auth.state)
-                    && i.netbird
-                        .as_ref()
-                        .is_none_or(netbird::Session::routing_ready);
-                if admitted && (request["session"].as_str() != Some(&i.auth.session) || !ready) {
+                let authenticated = crate::native::probe_ready(&i.auth.state);
+                if admitted
+                    && (request["session"].as_str() != Some(&i.auth.session) || !authenticated)
+                {
                     return Err(invalid(
                         "native session changed; repeat resource verification",
                     ));
                 }
                 i.admitted_session = None;
-                if ready {
+                if authenticated
+                    && i.netbird
+                        .as_ref()
+                        .is_none_or(netbird::Session::routing_ready)
+                {
                     self.proxy(&mut i, admitted)?;
                 }
                 if admitted {
