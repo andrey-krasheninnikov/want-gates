@@ -164,6 +164,7 @@ struct Runtime {
     uid: u32,
     gid: u32,
     xray: PathBuf,
+    xray_metadata: Option<fs::Metadata>,
     openfortivpn: PathBuf,
     netbird: PathBuf,
     instances: BTreeMap<String, Instance>,
@@ -710,6 +711,18 @@ impl Runtime {
         for protocol in protocols {
             let (name, version) = self.client_version(protocol)?;
             versions.insert(name.into(), json!(version));
+        }
+        let current_xray = fs::metadata(&self.xray)?;
+        if self.xray_metadata.as_ref().is_some_and(|loaded| {
+            loaded.dev() != current_xray.dev()
+                || loaded.ino() != current_xray.ino()
+                || loaded.len() != current_xray.len()
+                || loaded.mtime() != current_xray.mtime()
+                || loaded.mtime_nsec() != current_xray.mtime_nsec()
+        }) {
+            return Err(invalid(
+                "native Xray changed; restart wgates-native.service",
+            ));
         }
         let version_output = command(
             self.xray
@@ -2358,6 +2371,11 @@ pub fn run(mut args: impl Iterator<Item = OsString>, cleanup_only: bool) -> io::
         directory,
         uid,
         gid,
+        xray_metadata: if cleanup_only {
+            None
+        } else {
+            Some(fs::metadata(&xray)?)
+        },
         xray,
         openfortivpn,
         netbird,

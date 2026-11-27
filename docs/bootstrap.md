@@ -45,8 +45,9 @@ Control-service readiness does not establish route, DNS or VPN health.
 Pass one --protocol option per native protocol you plan to use. The supported
 values are openvpn, forti, wireguard and netbird. Native routing requires
 IPv4 forwarding and a root-controlled Xray executable. Check the relevant
-devices, kernel support and client versions
-before installation. See [OpenVPN](openvpn.md), [Forti](forti.md),
+devices, kernel support and client versions before installation.
+After a panel upgrade that replaces Xray, restart wgates-native.service
+before applying native routes. See [OpenVPN](openvpn.md), [Forti](forti.md),
 [WireGuard](wireguard.md) and [NetBird](netbird.md).
 
 The upstream archive may preserve its build UID. Compare the installed Xray

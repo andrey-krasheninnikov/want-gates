@@ -940,6 +940,7 @@ mod tests {
             uid: 65534,
             gid: 65534,
             xray: PathBuf::new(),
+            xray_metadata: None,
             openfortivpn: PathBuf::new(),
             netbird: PathBuf::new(),
             instances: BTreeMap::from([(generation.clone(), instance)]),

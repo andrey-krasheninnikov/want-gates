@@ -2217,7 +2217,7 @@ fn health_cycle(
         ));
     }
     let client = Client::new(settings, stopping)?;
-    let panel_status = client.running()?;
+    client.running()?;
     if client.read()? != working.snapshot {
         return Err(invalid("observed panel drift; automatic writes stopped"));
     }
@@ -2333,10 +2333,14 @@ fn health_cycle(
         }
         return Ok(());
     }
-    if !working.native.is_empty() {
-        check_native_xray(native, &panel_status, json!([]))?;
-    }
     let effective = effective_config(&config, &selected);
+    if working
+        .native_observations
+        .iter()
+        .any(|(id, state)| crate::native::should_admit(id, state, &effective, &matrix))
+    {
+        check_native_xray(native, &client.running()?, json!([]))?;
+    }
     let input = Input {
         config: effective.clone(),
         profiles: working.profiles.clone(),

@@ -257,6 +257,21 @@ pub fn effective(
     }
     config
 }
+pub fn should_admit(
+    id: &str,
+    state: &Observation,
+    config: &crate::store::Config,
+    matrix: &crate::routing::Matrix,
+) -> bool {
+    probe_ready(&state.authentication)
+        && config.groups.iter().any(|g| {
+            g.primary.as_deref() == Some(id)
+                && matrix
+                    .get(&g.id)
+                    .is_some_and(|m| m.values().any(|s| s == "verified"))
+        })
+}
+
 pub fn admit(
     client: &Client,
     prepared: &Generations,
@@ -268,13 +283,7 @@ pub fn admit(
         let state = observations
             .get(id)
             .ok_or_else(|| invalid("native observation missing"))?;
-        let admitted = probe_ready(&state.authentication)
-            && config.groups.iter().any(|g| {
-                g.primary.as_ref() == Some(id)
-                    && matrix
-                        .get(&g.id)
-                        .is_some_and(|m| m.values().any(|s| s == "verified"))
-            });
+        let admitted = should_admit(id, state, config, matrix);
         if admitted != state.admitted {
             client.call(json!({"command":"admit","generation":generation.generation,"session":state.session,"admitted":admitted}))?;
         }

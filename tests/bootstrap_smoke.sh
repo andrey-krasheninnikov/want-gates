@@ -14,7 +14,8 @@ binary=/usr/local/bin/wgates
 unit=/etc/systemd/system/wgates.service
 fixture_unit=/run/systemd/system/x-ui.service
 custom_unit=/run/systemd/system/wgates.service
-for owned in /usr/local/x-ui "$fixture_unit" "$custom_unit" "$binary" "$unit" \
+override_dir=/run/systemd/system/wgates.service.d
+for owned in /usr/local/x-ui "$fixture_unit" "$custom_unit" "$override_dir" "$binary" "$unit" \
     /etc/systemd/system/wgates-native.service /usr/lib/sysusers.d/wgates.conf \
     /var/lib/wgates /var/lib/wgates-install /var/lib/wgates-native; do
     [[ ! -e $owned && ! -L $owned ]] || { echo "Fixture path already exists: $owned"; exit 1; }
@@ -34,6 +35,7 @@ cleanup() {
     systemctl disable --now wgates-native.service wgates.service >/dev/null 2>&1 || true
     systemctl stop x-ui.service || true
     rm -f -- "$unit" /etc/systemd/system/wgates-native.service "$fixture_unit" "$custom_unit" "$binary" /usr/lib/sysusers.d/wgates.conf
+    rm -rf -- "$override_dir"
     systemctl daemon-reload
     rm -rf -- /usr/local/x-ui /var/lib/wgates /var/lib/wgates-install /var/lib/wgates-native "$tmp"
     if getent passwd wgates >/dev/null; then userdel wgates; fi
@@ -91,7 +93,7 @@ grep -q 'archive checksum mismatch' "$tmp/result"
 printf '[Service]\nExecStart=/usr/bin/true\n' > "$custom_unit"
 systemctl daemon-reload
 if "$script" install --archive "$archive" --sha256 "$digest" > "$tmp/result" 2>&1; then exit 1; fi
-grep -q 'unmanaged unit wgates.service' "$tmp/result"
+grep -q 'Unmanaged unit wgates.service' "$tmp/result"
 [[ -f $custom_unit && ! -e $unit && ! -e $binary ]]
 rm -- "$custom_unit"
 systemctl daemon-reload
@@ -182,6 +184,16 @@ kill -KILL "$installer"
 wait "$installer" 2>/dev/null || test "$?" = 137
 # Let any in-flight systemd command release the installer's lock.
 flock -w 20 /var/lib/wgates-install/lock true
+mkdir -- "$override_dir"
+printf '[Service]\nPrivateTmp=yes\n' > "$override_dir/override.conf"
+systemctl daemon-reload
+if "$script" install --archive "$archive" --sha256 "$digest" > "$tmp/result" 2>&1; then exit 1; fi
+grep -q 'Inspect the overrides for wgates.service' "$tmp/result"
+[[ -f $override_dir/override.conf && -d /var/lib/wgates-install/pending ]]
+cmp -s "$unit" "$tmp/changed/wgates.service"
+rm -- "$override_dir/override.conf"
+rmdir -- "$override_dir"
+systemctl daemon-reload
 [[ $(systemctl show -p MainPID --value x-ui.service) == "$panel_pid" ]]
 systemctl stop x-ui.service
 if "$script" install --archive "$archive" --sha256 "$digest" > "$tmp/result" 2>&1; then exit 1; fi

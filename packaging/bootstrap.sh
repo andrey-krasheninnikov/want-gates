@@ -52,11 +52,12 @@ trusted() {
     done
 }
 checked_executable() {
-    local binary
-    binary=$(realpath -e -- "$1") || return 1
-    if [[ $1 != "$binary" ]]; then
-        # Distributions with a merged sbin directory use the same binary in bin.
-        [[ $1 == /usr/sbin/* && $binary == "/usr/bin/${1##*/}" ]] || return 1
+    local binary=$1 target
+    if [[ $binary == /usr/sbin/* && -L /usr/sbin ]]; then
+        target=$(readlink -- /usr/sbin) || return 1
+        [[ $(stat -c %u -- /usr/sbin) == 0 && ( $target == bin || $target == /usr/bin ) ]] ||
+            return 1
+        binary=/usr/bin/${binary##*/}
     fi
     [[ -f $binary && -x $binary ]] && trusted "$binary" || return 1
     printf '%s\n' "$binary"
@@ -233,6 +234,31 @@ flush_destinations() {
     sync -f /etc
 }
 
+check_units() {
+    local unit fragment dropins dropin defaults
+    local -a paths
+    for unit in "${units[@]}"; do
+        fragment=$(systemctl show -p FragmentPath --value "$unit") || return 1
+        if [[ -n $fragment && $fragment != "/etc/systemd/system/$unit" ]]; then
+            printf 'Unmanaged unit %s. See manual installation.\n' "$unit" >&2
+            return 1
+        fi
+        dropins=$(systemctl show -p DropInPaths --value "$unit") || return 1
+        read -r -a paths <<< "$dropins"
+        for dropin in "${paths[@]}"; do
+            if [[ $dropin == /usr/lib/systemd/system/service.d/* ]] && trusted "$dropin"; then
+                defaults=$(sed -E '/^[[:space:]]*([#;].*)?$/d' "$dropin") || return 1
+                case $defaults in
+                    $'[Service]\nTimeoutStopFailureMode=abort'|$'[Service]\nEnvironment=SYSTEMD_SLEEP_FREEZE_USER_SESSIONS=0')
+                        continue ;;
+                esac
+            fi
+            printf 'Inspect the overrides for %s before installing.\n' "$unit" >&2
+            return 1
+        done
+    done
+}
+
 recover() {
     local i file destination unit
     if [[ -f $pending/verified ]]; then
@@ -248,6 +274,7 @@ recover() {
         fi
         put "$pending/receipt" "$root/receipt" || return 1
     else
+        check_units || return 1
         for i in "${!files[@]}"; do
             file=${files[i]} destination=${destinations[i]}
             [[ -f $pending/new/$file ]] || continue
@@ -284,6 +311,7 @@ recover() {
             fi
         done
         systemctl daemon-reload || return 1
+        check_units || return 1
         for unit in "${units[@]}"; do
             if [[ -f $pending/active/$unit ]]; then
                 # A stopped unit can retain its start counter or be unloaded.
@@ -338,24 +366,12 @@ locked=0
 if [[ $mode == install ]] && ! absent "$root"; then lock_installation; fi
 preflight
 
-check_units() {
-    local unit fragment dropins
-    for unit in "${units[@]}"; do
-        fragment=$(systemctl show -p FragmentPath --value "$unit")
-        [[ -z $fragment || $fragment == "/etc/systemd/system/$unit" ]] ||
-            fail "unmanaged unit $unit; see manual installation"
-        dropins=$(systemctl show -p DropInPaths --value "$unit")
-        case $dropins in
-            */"$unit".d/*|*/wgates-.service.d/*) fail "inspect the overrides for $unit before installing" ;;
-        esac
-    done
-}
 
 if [[ -n $archive || -n $digest ]]; then
     [[ -f $archive && $digest =~ ^[a-f0-9]{64}$ ]] || fail 'provide a regular archive and a 64-digit SHA-256'
     if [[ $mode == install ]]; then
         if ((!locked)); then lock_installation; fi
-        check_units
+        check_units || fail 'unit ownership check failed'
         staging=$root/staging
         if ! absent "$staging"; then
             [[ -d $staging && ! -L $staging && $(stat -c '%u:%a' "$staging") == 0:700 ]] ||
@@ -386,11 +402,6 @@ if [[ -n $archive || -n $digest ]]; then
     printf 'Verified wgates %s release archive for %s\n' "$release" "$architecture"
 fi
 [[ $mode == install ]] || exit 0
-
-if systemctl is-enabled --quiet wgates-native.service &&
-    ! systemctl is-active --quiet wgates-native.service; then
-    fail 'native service is enabled but inactive; reconcile its state before installing'
-fi
 
 check_identity() {
     local account service_gid service_home service_shell
@@ -493,6 +504,9 @@ for unit in "${units[@]}"; do
         *) fail "reconcile $unit enablement ($state) before installation" ;;
     esac
 done
+if [[ -f $workspace/enabled/wgates-native.service && ! -f $workspace/active/wgates-native.service ]]; then
+    fail 'native service is enabled but inactive; reconcile its state before installing'
+fi
 rm -- "$workspace/release.tar.gz" "$workspace/new/support"
 mv -T -- "$workspace" "$pending"
 workspace=
@@ -509,7 +523,7 @@ done
 systemd-sysusers /usr/lib/sysusers.d/wgates.conf
 check_identity
 systemctl daemon-reload
-check_units
+check_units || fail 'unit ownership check failed'
 if ((native)); then systemctl enable wgates-native.service; fi
 systemctl enable --now wgates.service
 if ((!native)) && [[ -f $pending/active/wgates-native.service ]]; then

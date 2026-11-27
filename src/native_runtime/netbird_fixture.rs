@@ -75,6 +75,7 @@ fn bridges() -> io::Result<()> {
         uid,
         gid,
         xray: executable(&xray)?,
+        xray_metadata: None,
         netbird: PathBuf::new(),
         openfortivpn: PathBuf::new(),
         instances: BTreeMap::new(),
