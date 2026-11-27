@@ -13,6 +13,8 @@ Choose the archive that matches uname -m. Verify the named script and archive
 against the checksums from that release before running the installer. For example:
 
 ```sh
+(
+set -eu
 version=v0.1.0
 architecture=$(uname -m)
 archive="wgates-$version-linux-$architecture.tar.gz"
@@ -22,6 +24,7 @@ digest=$(sha256sum "$archive" | cut -d ' ' -f 1)
 bash bootstrap.sh preflight --archive "$archive" --sha256 "$digest"
 sudo bash bootstrap.sh install --archive "$archive" --sha256 "$digest"
 sudo wgates status
+)
 ```
 
 Preflight inspects the OS, systemd, panel, archive and selected dependencies.

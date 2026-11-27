@@ -39,7 +39,8 @@ cleanup() {
 }
 trap cleanup EXIT
 
-script="$repo/packaging/bootstrap.sh"
+script="$tmp/bootstrap.sh"
+install -m 0755 -- "$repo/packaging/bootstrap.sh" "$script"
 cp -- "$archive" "$tmp/release.tar.gz"
 chmod 0644 "$tmp/release.tar.gz"
 archive=$tmp/release.tar.gz
