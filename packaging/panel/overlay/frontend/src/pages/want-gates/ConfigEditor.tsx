@@ -361,6 +361,13 @@ export default function ConfigEditor({
                 try {
                   const profile = await file.text();
                   if (selection !== fileSelection.current) return;
+                  if (!profile.trim()) {
+                    setFileRead('failed');
+                    setError(
+                      'The selected profile is empty. Choose another file or edit the profile.',
+                    );
+                    return;
+                  }
                   form.setFieldValue('profile', profile);
                   setFileRead('ready');
                 } catch {
