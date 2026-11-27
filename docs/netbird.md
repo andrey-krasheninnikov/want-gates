@@ -46,10 +46,11 @@ wgates routing preview
 wgates routing apply PLAN_ID
 ```
 
-Initial apply prepares the daemon with application traffic blocked. Apply
-again after authenticating a static group. Groups with a configured healthcheck
-can admit traffic when the target and required capability probes pass. Each
-connection gets its own tunnel and resolver. Private mode suppresses the
+Initial apply prepares the daemon with application traffic blocked. After
+authenticating a static group, run `wgates routing preview` again and apply the
+new plan ID. Groups with a configured healthcheck can admit traffic when the
+target and required capability probes pass. Each connection gets its own
+tunnel and resolver. Private mode suppresses the
 tunnel default route for the bridge. The gateway routes unmatched traffic
 directly and blocks protected traffic when the group has no eligible connection.
 
@@ -107,7 +108,17 @@ affected groups. Back up the two Want Gates state directories using the service
 backup procedure before removing NetBird connections. Remove them from group
 primary and fallback references, delete them, then preview and apply. Resolve
 any retained native resources shown by `routing status` before downgrading the
-binary. Verify the intended protected paths and the gateway management route.
+binary. Remove any `--netbird-bin` option from the native runtime's `ExecStart`
+and `ExecStopPost` overrides before installing the older binary. Reload systemd
+and restart Want Gates after installation.
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl restart wgates.service
+systemctl is-active wgates-native.service
+```
+
+Verify the intended protected paths and the gateway management route.
 
 For a source rollback, fetch current `main` and create a clean worktree on
 `revert/12-netbird-routing` from `origin/main`. Use the adapter PR number and

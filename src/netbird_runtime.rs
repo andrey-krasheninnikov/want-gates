@@ -662,11 +662,11 @@ impl Session {
     }
 
     pub fn poll(&mut self, auth: &mut Authentication) -> io::Result<()> {
-        if matches!(auth.state.as_str(), "browser_required" | "authenticated") && auth.expire() {
+        if matches!(auth.state.as_str(), "browser_required" | "authenticated")
+            && auth.expires_at.is_some_and(|deadline| now() >= deadline)
+        {
             self.request = None;
-            self.user_code = None;
-            self.revision = None;
-            return Ok(());
+            return self.unavailable(auth, "authentication_expired");
         }
         if let Some(request) = self.request.as_mut() {
             let Some(response) = request.poll()? else {
@@ -724,7 +724,9 @@ impl Session {
                 (Operation::Configure, _) => {
                     return Err(invalid("NetBird configuration was refused"));
                 }
-                (Operation::Wait, Reply::Deadline) => auth.fail("authentication_expired"),
+                (Operation::Wait, Reply::Deadline) => {
+                    self.unavailable(auth, "authentication_expired")?;
+                }
                 (Operation::Wait | Operation::Login { .. }, Reply::Rejected) => {
                     auth.fail("authentication_netbird_login_failed");
                 }
@@ -813,6 +815,7 @@ impl Session {
         self.explicit_selection = false;
         self.active_routes = None;
         self.pending_routes = None;
+        self.user_code = None;
         auth.fail(reason);
         Ok(())
     }
@@ -867,10 +870,7 @@ impl Session {
                     auth.expires_at = expiry;
                 }
             }
-            Some("SessionExpired") => {
-                self.unavailable(auth, "netbird_session_ended")?;
-                auth.fail("authentication_expired");
-            }
+            Some("SessionExpired") => self.unavailable(auth, "authentication_expired")?,
             Some("NeedsLogin" | "LoginFailed") => {
                 self.unavailable(auth, "netbird_login_required")?;
                 auth.state = "credentials_required".into();
@@ -890,17 +890,8 @@ mod tests {
     use super::*;
     use crate::native_runtime::{Instance, Runtime, netbird_fixture};
 
-    #[test]
-    fn pending_routes_allow_admission_reconciliation() -> io::Result<()> {
-        let record = netbird_fixture::record(1, "192.0.2.1:443".parse().unwrap())?;
-        let generation = record.prepared.generation.clone();
-        let mut instance = Instance::new(record, new_auth()?);
-        instance
-            .auth
-            .authenticated(crate::native::NETBIRD_CONFIRMING_ROUTES);
-        let session = instance.auth.session.clone();
-        instance.admitted_session = Some(session.clone());
-        instance.netbird = Some(Session {
+    fn session_fixture() -> io::Result<Session> {
+        Ok(Session {
             socket: PathBuf::new(),
             state: PathBuf::new(),
             profile: decoded_profile(&json!({
@@ -919,7 +910,38 @@ mod tests {
             pending_routes: None,
             explicit_selection: true,
             user_code: None,
-        });
+        })
+    }
+
+    #[test]
+    fn authenticated_deadline_invalidates_the_session_grant() -> io::Result<()> {
+        let mut session = session_fixture()?;
+        let mut auth = new_auth()?;
+        auth.authenticated("netbird_connected");
+        auth.expires_at = Some(now());
+        session.revision = Some(10);
+        let previous = auth.session.clone();
+        session.poll(&mut auth)?;
+        assert_eq!(auth.state, "expired");
+        assert!(
+            auth.session != previous,
+            "expired session retained its grant"
+        );
+        assert!(!session.routing_ready());
+        Ok(())
+    }
+
+    #[test]
+    fn pending_routes_allow_admission_reconciliation() -> io::Result<()> {
+        let record = netbird_fixture::record(1, "192.0.2.1:443".parse().unwrap())?;
+        let generation = record.prepared.generation.clone();
+        let mut instance = Instance::new(record, new_auth()?);
+        instance
+            .auth
+            .authenticated(crate::native::NETBIRD_CONFIRMING_ROUTES);
+        let session = instance.auth.session.clone();
+        instance.admitted_session = Some(session.clone());
+        instance.netbird = Some(session_fixture()?);
         let mut runtime = Runtime {
             root: PathBuf::new(),
             directory: PathBuf::new(),
