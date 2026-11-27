@@ -7,8 +7,9 @@ panel=$(realpath -e -- "$1")
 archive=$(realpath -e -- "$2")
 protocol=()
 if [[ ${3:-} == wireguard ]]; then protocol=(--protocol wireguard); fi
-digest=$(sha256sum -- "$archive")
-digest=${digest%% *}
+release=$(dirname -- "$archive")
+(cd "$release" && sha256sum --check --strict SHA256SUMS)
+digest=$(awk -v archive="$(basename -- "$archive")" '$2 == archive { hash=$1; count++ } END { if (count != 1) exit 1; print hash }' "$release/SHA256SUMS")
 binary=/usr/local/bin/wgates
 unit=/etc/systemd/system/wgates.service
 fixture_unit=/run/systemd/system/x-ui.service
@@ -43,7 +44,7 @@ trap cleanup EXIT
 trap 'echo "Bootstrap smoke failed at line $LINENO." >&2; if [[ -s $tmp/result ]]; then tail -n 18 "$tmp/result" >&2; fi' ERR
 
 script="$tmp/bootstrap.sh"
-install -m 0755 -- "$repo/packaging/bootstrap.sh" "$script"
+install -m 0755 -- "$release/bootstrap.sh" "$script"
 cp -- "$archive" "$tmp/release.tar.gz"
 chmod 0644 "$tmp/release.tar.gz"
 archive=$tmp/release.tar.gz
@@ -110,11 +111,19 @@ printf '\nBootstrap upgrade fixture\n' >> "$tmp/changed/wgates"
 # Use the same member names as the released package.
 tar -C "$tmp/changed" -czf "$tmp/upgrade.tar.gz" LICENSE support wgates wgates-native.service wgates.conf wgates.service
 upgrade=$(sha256sum -- "$tmp/upgrade.tar.gz")
+if (( ${#protocol[@]} )); then
+    systemctl disable wgates-native.service
+    systemctl is-active --quiet wgates-native.service
+fi
+chmod 0700 -- "$binary"
 "$script" install --archive "$tmp/upgrade.tar.gz" --sha256 "${upgrade%% *}"
 cmp -- "$tmp/changed/wgates" "$binary"
+[[ $(stat -c %a "$binary") == 755 ]]
 wgates group list | cmp - "$tmp/groups"
 
 if (( ${#protocol[@]} )); then
+    systemctl is-active --quiet wgates-native.service
+    [[ $(systemctl is-enabled wgates-native.service || true) == disabled ]]
     sed -i 's|^ExecStart=.*|ExecStart=/usr/local/bin/wgates unsupported-command|' "$tmp/changed/wgates-native.service"
     tar -C "$tmp/changed" -czf "$tmp/bad-native.tar.gz" LICENSE support wgates wgates-native.service wgates.conf wgates.service
     bad_native=$(sha256sum -- "$tmp/bad-native.tar.gz")
@@ -149,9 +158,18 @@ kill -KILL "$installer"
 wait "$installer" 2>/dev/null || test "$?" = 137
 # Let any in-flight systemd command release the installer's lock.
 flock -w 20 /var/lib/wgates-install/lock true
-"$script" install --archive "$archive" --sha256 "$digest"
+[[ $(systemctl show -p MainPID --value x-ui.service) == "$panel_pid" ]]
+systemctl stop x-ui.service
+if "$script" install --archive "$archive" --sha256 "$digest" > "$tmp/result" 2>&1; then exit 1; fi
+grep -q 'Restored the previous wgates files and service state' "$tmp/result"
+grep -q 'start an existing 3x-ui' "$tmp/result"
 [[ ! -e /var/lib/wgates-install/pending ]]
 wgates group list | cmp - "$tmp/groups"
-[[ $(systemctl show -p MainPID --value x-ui.service) == "$panel_pid" ]]
+systemctl start x-ui.service
+for _ in {1..50}; do
+    if "$script" preflight > "$tmp/result" 2>&1; then break; fi
+    sleep 0.2
+done
+"$script" install --archive "$archive" --sha256 "$digest"
 [[ $(sha256sum /usr/local/x-ui/x-ui) == "$panel_hash" ]]
 printf 'Bootstrap preflight, archive rejection, permissions, install, repeat, upgrade and recovery passed on %s.\n' "$(uname -m)"

@@ -6,7 +6,8 @@ binary=$(realpath -- "$1")
 architecture=$(uname -m)
 [[ $(uname -s) == Linux && $architecture =~ ^(x86_64|aarch64)$ ]] ||
     { printf 'Package on the target Linux architecture.\n' >&2; exit 1; }
-read -r product version < <("$binary" --version)
+version_output=$(timeout --kill-after=1s 5s "$binary" --version </dev/null)
+read -r product version <<< "$version_output"
 [[ $product == wgates && $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 mkdir -p -- "$2"
 output=$(realpath -- "$2")

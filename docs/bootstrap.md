@@ -77,8 +77,9 @@ with the installed system. The installer uses the existing indexes.
 
 For a different install path or package manager, follow [manual systemd
 installation](service.md#manual-systemd-installation). Confirm the panel and
-Xray versions with wgates panel preflight. Published release and PR checks
-report the versions and architectures actually exercised.
+Xray versions with wgates panel preflight. The bootstrap checks install
+WireGuard tools and run the systemd services in Ubuntu 24.04 (x86_64 and
+aarch64), Fedora 44, Arch Linux and openSUSE Leap 16.0 (x86_64).
 
 ## Repeat an installation or recover
 

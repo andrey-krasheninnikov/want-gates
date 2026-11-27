@@ -40,58 +40,36 @@ if [[ $mode == install ]]; then
     ((EUID == 0)) || fail 'installation requires root'
     [[ -n $archive ]] || fail 'provide the release archive and its published SHA-256'
 fi
-[[ -d /run/systemd/system ]] && command -v systemctl >/dev/null || fail 'systemd must be running'
-systemctl is-active --quiet x-ui.service ||
-    fail 'start an existing 3x-ui v3.11.0 installation in x-ui.service'
 trusted() {
-    local name owner permissions
-    name=$(realpath -e -- "$1") || return 1
-    until [[ $name == / ]]; do
-        read -r owner permissions < <(stat -c '%u %a' -- "$name")
-        [[ $owner == 0 && $permissions =~ ^[0-7]{3,4}$ ]] &&
-            (((8#$permissions & 022) == 0)) || return 1
-        name=$(dirname -- "$name")
-    done
-}
-panel=/usr/local/x-ui
-xray=$panel/bin/xray-linux-$xray_arch
-[[ -x $panel/x-ui && -x $xray ]] ||
-    fail 'expected panel and Xray executables under /usr/local/x-ui; see manual steps'
-version_user=()
-if ((EUID == 0)); then
-    version_user=(setpriv --reuid 65534 --regid 65534 --clear-groups --no-new-privs)
-    panel_pid=$(systemctl show -p MainPID --value x-ui.service)
-    [[ $panel_pid =~ ^[1-9][0-9]*$ && $panel/x-ui -ef /proc/$panel_pid/exe ]] ||
-        fail 'x-ui.service uses another executable; see manual installation'
-    live_xray=0
-    for child_list in /proc/"$panel_pid"/task/*/children; do
-        [[ -r $child_list ]] || continue
-        read -r -a children < "$child_list" || true
-        for child in "${children[@]}"; do
-            if [[ $xray -ef /proc/$child/exe ]]; then live_xray=1; break 2; fi
+    local resolved name owner permissions
+    resolved=$(realpath -e -- "$1") || return 1
+    for name in "$1" "$resolved"; do
+        while [[ $name != / ]]; do
+            read -r owner permissions < <(stat -c '%u %a' -- "$name")
+            [[ $owner == 0 && $permissions =~ ^[0-7]{3,4}$ ]] || return 1
+            [[ -L $name ]] || (((8#$permissions & 022) == 0)) || return 1
+            name=$(dirname -- "$name")
         done
     done
-    ((live_xray)) || fail 'the panel has not started the expected Xray executable; see manual installation'
-fi
-version_probe() { "${version_user[@]}" timeout 5s "$@"; }
-[[ $(version_probe "$panel/x-ui" -v) == 3.11.0 ]] || fail 'bootstrap requires 3x-ui 3.11.0'
-read -r product version _ < <(version_probe "$xray" version) ||
-    fail 'cannot read the Xray version'
-[[ $product == Xray && $version == 26.10.21 ]] || fail 'bootstrap requires Xray 26.10.21'
+}
+bounded_version() { timeout --kill-after=1s 5s "$@" </dev/null; }
+version_probe() {
+    local binary
+    if trusted "$1"; then
+        binary=$(realpath -e -- "$1") || return 1
+        shift
+        bounded_version "$binary" "$@"
+    else
+        "${version_user[@]}" timeout --kill-after=1s 5s "$@" </dev/null
+    fi
+}
 
-distribution=$(sed -nE 's/^ID="?([a-z0-9_-]+)"?$/\1/p' /etc/os-release)
-case $distribution in
-    debian|ubuntu) manager=apt; ip_package=iproute2; proc_package=procps; libc_package=libc-bin ;;
-    fedora) manager=dnf; ip_package=iproute; proc_package=procps-ng; libc_package=glibc-common ;;
-    arch) manager=pacman; ip_package=iproute2; proc_package=procps-ng; libc_package=glibc ;;
-    opensuse-leap|opensuse-tumbleweed)
-        manager=zypper; ip_package=iproute2; proc_package=procps; libc_package=glibc ;;
-    *) fail 'no supported package mapping for this distribution; see docs/bootstrap.md for manual installation' ;;
-esac
-command -v "$manager" >/dev/null || fail "missing $manager; see manual installation"
-
+missing_paths=()
 need() {
-    [[ -x $1 ]] || packages[$2]=1
+    if [[ ! -x $1 ]]; then
+        packages[$2]=1
+        missing_paths+=("$1")
+    fi
 }
 check_version() {
     local value
@@ -99,53 +77,101 @@ check_version() {
     value=$(version_probe "$1" --version 2>&1) || fail "cannot read $1 version"
     [[ $value =~ $2 ]] || fail "$1 requires $3; install a supported version manually"
 }
-native=0
-if [[ -v protocols[openvpn] || -v protocols[forti] || -v protocols[wireguard] || -v protocols[netbird] ]]; then
-    native=1
-    trusted "$xray" || fail 'native routing requires a root-controlled Xray executable; see docs/bootstrap.md#optional-native-protocols'
-    [[ $(< /proc/sys/net/ipv4/ip_forward) == 1 ]] ||
-        fail 'native connections require IPv4 forwarding; configure it before installing'
-    need /usr/sbin/ip "$ip_package"
-    need /usr/sbin/nft nftables
-    need /usr/sbin/sysctl "$proc_package"
-    need /usr/bin/getent "$libc_package"
-fi
-if [[ -v protocols[openvpn] || -v protocols[netbird] ]]; then
-    [[ -c /dev/net/tun ]] || fail 'OpenVPN and NetBird require /dev/net/tun'
-fi
-if [[ -v protocols[openvpn] ]]; then
-    need /usr/sbin/openvpn openvpn
-    if [[ -x /usr/sbin/openvpn ]]; then
-        check_version /usr/sbin/openvpn '^OpenVPN 2\.6\.' 'OpenVPN 2.6.x'
+
+preflight() {
+    [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null || fail 'systemd must be running'
+    systemctl is-active --quiet x-ui.service ||
+        fail 'start an existing 3x-ui v3.11.0 installation in x-ui.service'
+    panel=/usr/local/x-ui
+    xray=$panel/bin/xray-linux-$xray_arch
+    [[ -x $panel/x-ui && -x $xray ]] ||
+        fail 'expected panel and Xray executables under /usr/local/x-ui; see manual steps'
+    version_user=()
+    if ((EUID == 0)); then
+        version_user=(setpriv --reuid 65534 --regid 65534 --clear-groups --no-new-privs)
+        panel_pid=$(systemctl show -p MainPID --value x-ui.service)
+        [[ $panel_pid =~ ^[1-9][0-9]*$ && $panel/x-ui -ef /proc/$panel_pid/exe ]] ||
+            fail 'x-ui.service uses another executable; see manual installation'
+        live_xray=0
+        for child_list in /proc/"$panel_pid"/task/*/children; do
+            [[ -r $child_list ]] || continue
+            read -r -a children < "$child_list" || true
+            for child in "${children[@]}"; do
+                if [[ $xray -ef /proc/$child/exe ]]; then live_xray=1; break 2; fi
+            done
+        done
+        ((live_xray)) || fail 'the panel has not started the expected Xray executable; see manual installation'
     fi
-fi
-if [[ -v protocols[forti] ]]; then
-    [[ -c /dev/ppp ]] || fail 'Forti requires kernel PPP and /dev/ppp'
-    need /usr/sbin/pppd ppp
-    need /usr/bin/openfortivpn openfortivpn
-    if [[ -x /usr/sbin/pppd ]]; then
-        check_version /usr/sbin/pppd '(^| )2\.4\.9($|[[:space:]])' 'pppd 2.4.9'
+    panel_version=$(version_probe "$panel/x-ui" -v) || fail 'cannot read the panel version'
+    [[ $panel_version == 3.11.0 ]] || fail 'bootstrap requires 3x-ui 3.11.0'
+    xray_version=$(version_probe "$xray" version) || fail 'cannot read the Xray version'
+    read -r product version _ <<< "$xray_version"
+    [[ $product == Xray && $version == 26.10.21 ]] || fail 'bootstrap requires Xray 26.10.21'
+
+    distribution=$(sed -nE 's/^ID="?([a-z0-9_-]+)"?$/\1/p' /etc/os-release)
+    case $distribution in
+        debian|ubuntu) manager=apt; ip_package=iproute2; proc_package=procps; libc_package=libc-bin ;;
+        fedora) manager=dnf; ip_package=iproute; proc_package=procps-ng; libc_package=glibc-common ;;
+        arch) manager=pacman; ip_package=iproute2; proc_package=procps-ng; libc_package=glibc ;;
+        opensuse-leap|opensuse-tumbleweed)
+            manager=zypper; ip_package=iproute2; proc_package=procps; libc_package=glibc ;;
+        *) manager=manual; ip_package=iproute2; proc_package=procps; libc_package=libc ;;
+    esac
+    if ! command -v "$manager" >/dev/null || [[ $manager == manual ]]; then manager=manual; fi
+
+    native=0
+    if [[ -v protocols[openvpn] || -v protocols[forti] || -v protocols[wireguard] || -v protocols[netbird] ]]; then
+        native=1
+        trusted "$xray" || fail 'native routing requires a root-controlled Xray executable; see docs/bootstrap.md#optional-native-protocols'
+        [[ $(< /proc/sys/net/ipv4/ip_forward) == 1 ]] ||
+            fail 'native connections require IPv4 forwarding; configure it before installing'
+        need /usr/sbin/ip "$ip_package"
+        need /usr/sbin/nft nftables
+        need /usr/sbin/sysctl "$proc_package"
+        need /usr/bin/getent "$libc_package"
     fi
-    if [[ -x /usr/bin/openfortivpn ]]; then
-        check_version /usr/bin/openfortivpn '^1\.(21|22|23|24)(\.|$)' 'openfortivpn 1.21–1.24'
+    if [[ -v protocols[openvpn] || -v protocols[netbird] ]]; then
+        [[ -c /dev/net/tun ]] || fail 'OpenVPN and NetBird require /dev/net/tun'
     fi
-fi
-if [[ -v protocols[wireguard] ]]; then
-    need /usr/bin/wg wireguard-tools
-fi
-if [[ -v protocols[netbird] ]]; then
-    [[ -x /usr/bin/netbird ]] || fail 'install the verified NetBird 0.83.2 client manually; see docs/netbird.md'
-    trusted /usr/bin/netbird || fail 'the NetBird client must be controlled by root'
-    [[ $(version_probe /usr/bin/netbird version) == 0.83.2 ]] || fail 'NetBird 0.83.2 is required'
-    need /usr/bin/curl curl
-fi
-printf 'Platform %s/%s, package manager %s, panel 3.11.0 with Xray 26.10.21\n' \
-    "$distribution" "$architecture" "$manager"
-if (( ${#packages[@]} )); then
-    printf 'Missing selected dependencies:'
-    printf ' %s' "${!packages[@]}"
-    printf '\n'
-fi
+    if [[ -v protocols[openvpn] ]]; then
+        need /usr/sbin/openvpn openvpn
+        if [[ -x /usr/sbin/openvpn ]]; then
+            check_version /usr/sbin/openvpn '^OpenVPN 2\.6\.' 'OpenVPN 2.6.x'
+        fi
+    fi
+    if [[ -v protocols[forti] ]]; then
+        [[ -c /dev/ppp ]] || fail 'Forti requires kernel PPP and /dev/ppp'
+        need /usr/sbin/pppd ppp
+        need /usr/bin/openfortivpn openfortivpn
+        if [[ -x /usr/sbin/pppd ]]; then
+            check_version /usr/sbin/pppd '(^| )2\.4\.9($|[[:space:]])' 'pppd 2.4.9'
+        fi
+        if [[ -x /usr/bin/openfortivpn ]]; then
+            check_version /usr/bin/openfortivpn '^1\.(21|22|23|24)(\.|$)' 'openfortivpn 1.21–1.24'
+        fi
+    fi
+    if [[ -v protocols[wireguard] ]]; then
+        need /usr/bin/wg wireguard-tools
+    fi
+    if [[ -v protocols[netbird] ]]; then
+        [[ -x /usr/bin/netbird ]] || fail 'install the verified NetBird 0.83.2 client manually; see docs/netbird.md'
+        trusted /usr/bin/netbird || fail 'the NetBird client must be controlled by root'
+        netbird_version=$(version_probe /usr/bin/netbird version) || fail 'cannot read the NetBird version'
+        [[ $netbird_version == 0.83.2 ]] || fail 'NetBird 0.83.2 is required'
+        need /usr/bin/curl curl
+    fi
+    printf 'Platform %s/%s, package manager %s, panel 3.11.0 with Xray 26.10.21\n' \
+        "$distribution" "$architecture" "$manager"
+    if (( ${#packages[@]} )); then
+        printf 'Missing selected executables:'
+        printf ' %s' "${missing_paths[@]}"
+        printf '\n'
+    fi
+    if [[ $manager == manual ]]; then
+        printf 'Use the manual steps in docs/bootstrap.md for this distribution.\n'
+        [[ $mode == preflight ]] || fail 'automatic package installation is unavailable'
+    fi
+}
 
 workspace=$(mktemp -d /var/tmp/wgates-bootstrap.XXXXXXXX)
 root=/var/lib/wgates-install
@@ -159,6 +185,7 @@ transaction=
 
 same() {
     [[ -f $1 && ! -L $1 && -f $2 && ! -L $2 ]] || return 1
+    [[ $(stat -c '%u:%g:%a' -- "$1") == "$(stat -c '%u:%g:%a' -- "$2")" ]] || return 1
     local left right
     left=$(sha256sum -- "$1") && right=$(sha256sum -- "$2") &&
         [[ ${left%% *} == "${right%% *}" ]]
@@ -169,6 +196,17 @@ put() {
     absent "$destination.wgates-new" || return 1
     cp -p -- "$source" "$destination.wgates-new" &&
         mv -fT -- "$destination.wgates-new" "$destination"
+}
+
+wait_ready() {
+    local attempt
+    for attempt in {1..30}; do
+        if systemctl is-active --quiet wgates.service && /usr/local/bin/wgates status >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
 }
 
 flush_destinations() {
@@ -237,6 +275,7 @@ recover() {
                 systemctl reset-failed "$unit" && systemctl start "$unit" || return 1
             fi
         done
+        if [[ -f $pending/active/wgates.service ]]; then wait_ready || return 1; fi
         flush_destinations || return 1
         printf 'Restored the previous wgates files and service state. Package dependencies and persistent data remain installed.\n' >&2
     fi
@@ -259,6 +298,31 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+lock_installation() {
+    trusted /var/lib || fail 'unsafe /var/lib'
+    if absent "$root"; then mkdir -m 0700 -- "$root"; fi
+    [[ -d $root && ! -L $root && $(stat -c '%u:%a' "$root") == 0:700 ]] ||
+        fail 'unsafe installation directory'
+    for destination in "${destinations[@]}"; do
+        trusted "$(dirname -- "$destination")" || fail "unsafe destination directory for $destination"
+    done
+    exec 9>"$root/lock"
+    flock -n 9 || fail 'another installation is in progress'
+    if ! absent "$retired"; then
+        [[ -d $retired && ! -L $retired && $(stat -c '%u:%a' "$retired") == 0:700 ]] ||
+            fail 'unsafe retired installation record'
+        rm -rf -- "$retired"
+    fi
+    if ! absent "$pending"; then
+        [[ -d $pending && ! -L $pending ]] || fail 'invalid pending installation directory'
+        recover || fail 'previous installation could not be reconciled'
+    fi
+    locked=1
+}
+locked=0
+if [[ $mode == install ]] && ! absent "$root"; then lock_installation; fi
+preflight
+
 if [[ -n $archive || -n $digest ]]; then
     [[ -f $archive && $digest =~ ^[a-f0-9]{64}$ ]] || fail 'provide a regular archive and a 64-digit SHA-256'
     cp -- "$archive" "$workspace/release.tar.gz"
@@ -275,30 +339,13 @@ if [[ -n $archive || -n $digest ]]; then
     [[ $release =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && $release_arch == "$architecture" ]] ||
         fail 'release archive version or architecture mismatch'
     chmod 0755 "$workspace/new/wgates"
-    [[ $("$workspace/new/wgates" --version) == "wgates $release" ]] ||
-        fail 'release binary version mismatch'
+    binary_version=$(bounded_version "$workspace/new/wgates" --version) || fail 'cannot execute the release binary'
+    [[ $binary_version == "wgates $release" ]] || fail 'release binary version mismatch'
     printf 'Verified wgates %s release archive for %s\n' "$release" "$architecture"
 fi
 [[ $mode == install ]] || exit 0
 
-trusted /var/lib || fail 'unsafe /var/lib'
-if absent "$root"; then mkdir -m 0700 -- "$root"; fi
-[[ -d $root && ! -L $root && $(stat -c '%u:%a' "$root") == 0:700 ]] ||
-    fail 'unsafe installation directory'
-for destination in "${destinations[@]}"; do
-    trusted "$(dirname -- "$destination")" || fail "unsafe destination directory for $destination"
-done
-exec 9>"$root/lock"
-flock -n 9 || fail 'another installation is in progress'
-if ! absent "$retired"; then
-    [[ -d $retired && ! -L $retired && $(stat -c '%u:%a' "$retired") == 0:700 ]] ||
-        fail 'unsafe retired installation record'
-    rm -rf -- "$retired"
-fi
-if ! absent "$pending"; then
-    [[ -d $pending && ! -L $pending ]] || fail 'invalid pending installation directory'
-    recover || fail 'previous installation could not be reconciled'
-fi
+if ((!locked)); then lock_installation; fi
 
 check_identity() {
     local account service_gid service_home service_shell
@@ -430,15 +477,10 @@ check_identity
 systemctl daemon-reload
 if ((native)); then systemctl enable wgates-native.service; fi
 systemctl enable --now wgates.service
-ready=0
-for _ in {1..30}; do
-    if systemctl is-active --quiet wgates.service && /usr/local/bin/wgates status >/dev/null 2>&1; then
-        ready=1
-        break
-    fi
-    sleep 1
-done
-((ready)) || fail 'wgates did not reach control-service readiness'
+if ((!native)) && [[ -f $pending/active/wgates-native.service ]]; then
+    systemctl start wgates-native.service
+fi
+wait_ready || fail 'wgates did not reach control-service readiness'
 if ((native)) || [[ -f $pending/active/wgates-native.service ]]; then
     systemctl is-active --quiet wgates-native.service || fail 'native runtime did not start'
 fi

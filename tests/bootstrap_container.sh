@@ -22,7 +22,7 @@ container=$(docker run --detach --privileged --cgroupns=private --tmpfs /run --t
     --label want-gates.fixture=bootstrap --sysctl net.ipv4.ip_forward=1 \
     --mount "type=bind,source=$repo,target=/src,readonly" \
     --mount "type=bind,source=$panel,target=/fixture/panel,readonly" \
-    --mount "type=bind,source=$archive,target=/fixture/release.tar.gz,readonly" \
+    --mount "type=bind,source=$(dirname -- "$archive"),target=/fixture/release,readonly" \
     "$image" /bin/bash -ec "$setup; exec /sbin/init")
 for _ in {1..180}; do
     if docker exec "$container" test -d /run/systemd/system 2>/dev/null; then break; fi
@@ -41,5 +41,5 @@ docker exec "$container" bash -ec '
     echo "WireGuard tools are already installed in the dependency fixture." >&2
     exit 1
   fi
-  bash /src/tests/bootstrap_smoke.sh /fixture/panel /fixture/release.tar.gz wireguard
-'
+  bash /src/tests/bootstrap_smoke.sh /fixture/panel "/fixture/release/$1" wireguard
+' -- "$(basename -- "$archive")"
