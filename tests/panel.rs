@@ -943,9 +943,66 @@ fn exhausted_health_budget_records_a_failure_without_stopping_automation() {
     );
 }
 
+fn local_request(service: &Service, mut request: Value) -> Value {
+    use std::os::unix::net::UnixStream;
+
+    request["api_version"] = json!(1);
+    let mut stream = UnixStream::connect(&service.socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    writeln!(stream, "{request}").unwrap();
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).unwrap();
+    serde_json::from_str(&reply).unwrap()
+}
+
+#[test]
+fn native_sign_in_rejects_an_outdated_connection_revision() {
+    let service = Service::start();
+    let group = ok(&service, &["group", "create", "--name", "Office"], None);
+    let connection = ok(
+        &service,
+        &[
+            "connection",
+            "import",
+            "--group",
+            group["data"]["id"].as_str().unwrap(),
+            "--name",
+            "NetBird fixture",
+            "--protocol",
+            "netbird",
+            "--file",
+            "-",
+        ],
+        Some(r#"{"management_url":"https://management.example.test","mode":"private"}"#),
+    );
+    let id = &connection["data"]["id"];
+    let revision = connection["data"]["revision"].as_u64().unwrap();
+    let stale = local_request(
+        &service,
+        json!({"command":"connection.auth-status","id":id,"expected_revision":revision-1}),
+    );
+    assert!(
+        stale["error"]
+            .as_str()
+            .unwrap()
+            .contains("revision conflict")
+    );
+    let current = local_request(
+        &service,
+        json!({"command":"connection.auth-status","id":id,"expected_revision":revision}),
+    );
+    assert!(
+        current["error"]
+            .as_str()
+            .unwrap()
+            .contains("requires a current routing preview and apply")
+    );
+}
+
 #[test]
 fn compact_status_exposes_pending_recovery_without_a_selection_token() {
-    use std::os::unix::net::UnixStream;
     let service = Service::start();
     let panel = Panel::start();
     configured_rule(&service, &panel);
@@ -966,16 +1023,7 @@ fn compact_status_exposes_pending_recovery_without_a_selection_token() {
     journal["plan"]["id"] = json!(interrupted);
     std::fs::write(&path, journal.to_string()).unwrap();
 
-    let mut stream = UnixStream::connect(&service.socket).unwrap();
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .unwrap();
-    stream
-        .write_all(b"{\"api_version\":1,\"command\":\"routing.status\",\"summary\":true}\n")
-        .unwrap();
-    let mut reply = String::new();
-    stream.read_to_string(&mut reply).unwrap();
-    let reply: Value = serde_json::from_str(&reply).unwrap();
+    let reply = local_request(&service, json!({"command":"routing.status","summary":true}));
     let summary = &reply["data"];
     assert_eq!(summary["recovery_required"], true);
     assert!(summary["observed_digest"].is_null());

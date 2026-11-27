@@ -13,7 +13,7 @@ import {
 import { useQuery } from '@tanstack/react-query';
 import { useState } from 'react';
 
-import { capabilities, operation, protocols } from './operations';
+import { adapterSchema, capabilities, operation, protocols } from './operations';
 import type { WantGatesSnapshot } from './status';
 
 export type Editor = {
@@ -54,6 +54,29 @@ function objectField(text?: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+const adapterGuides = {
+  vless: {
+    path: 'service.md#vless-import-and-limits',
+    hint: 'Use a vless:// profile or one Xray VLESS outbound with the server address, port and client UUID.',
+  },
+  openvpn: {
+    path: 'openvpn.md#import-and-apply',
+    hint: 'Use a client .ovpn profile with dev tun, a remote server and the inline CA. Include any client certificate and key inline.',
+  },
+  forti: {
+    path: 'forti.md#profiles-and-routing',
+    hint: 'Use a client profile with the Forti gateway host and port. Include a configured client certificate and key inline.',
+  },
+  wireguard: {
+    path: 'wireguard.md',
+    hint: 'Use a WireGuard profile with interface private key and addresses and one peer with public key, endpoint and AllowedIPs.',
+  },
+  netbird: {
+    path: 'netbird.md#configure-and-apply',
+    hint: 'Use JSON with an HTTPS management_url and mode private or exit. Exit mode requires exit_network_id.',
+  },
+};
+
 const capabilityOptions = capabilities.map((capability) => ({
   label: capability.replaceAll('_', ' ').toUpperCase(),
   value: capability,
@@ -61,13 +84,19 @@ const capabilityOptions = capabilities.map((capability) => ({
 
 export default function ConfigEditor({
   editor,
+  live,
   pending,
+  locked,
+  retryStatus,
   errorMessage,
   close,
   submit,
 }: {
   editor: Editor;
+  live: WantGatesSnapshot;
   pending: boolean;
+  locked: boolean;
+  retryStatus?: () => void;
   errorMessage: string;
   close: () => void;
   submit: (command: string, body: Record<string, unknown>) => Promise<void>;
@@ -79,18 +108,20 @@ export default function ConfigEditor({
   const rule = kind === 'rule' ? snapshot.rules.find((row) => row.id === id) : undefined;
   const current = group ?? connection ?? rule;
   const revision = current ? { id: current.id, expected_revision: current.revision } : {};
+  const currentRows =
+    kind === 'group' ? live.groups : kind === 'rule' ? live.rules : live.connections;
+  const outdated =
+    current && current.revision !== currentRows.find((row) => row.id === current.id)?.revision;
+  const editingDisabled = locked || outdated;
   const [form] = Form.useForm<Values>();
   const [error, setError] = useState('');
   const selectedProtocol = Form.useWatch('protocol', form) ?? connection?.protocol ?? 'vless';
   const healthEnabled = Form.useWatch('health_enabled', form) ?? Boolean(group?.healthcheck);
+  const guide = adapterGuides[selectedProtocol as keyof typeof adapterGuides];
   const adapter = useQuery({
     queryKey: ['want-gates', 'adapter', selectedProtocol],
     queryFn: ({ signal }) =>
-      operation<{ available: boolean; reason: string }>(
-        'connection.adapter',
-        { protocol: selectedProtocol },
-        signal,
-      ),
+      operation(adapterSchema, 'connection.adapter', { protocol: selectedProtocol }, signal),
     enabled: kind === 'connection' && selectedProtocol !== 'vless',
     retry: false,
     staleTime: 15_000,
@@ -123,6 +154,7 @@ export default function ConfigEditor({
   };
 
   async function finish(values: Values) {
+    if (editingDisabled) return;
     setError('');
     if (kind === 'group') {
       if (!group) {
@@ -192,29 +224,47 @@ export default function ConfigEditor({
           {current && (
             <Popconfirm
               title={`Remove this ${kind} from desired routing?`}
-              onConfirm={() => submit(`${kind}.delete`, revision)}
+              onConfirm={() => {
+                if (!editingDisabled) return submit(`${kind}.delete`, revision);
+              }}
             >
-              <Button danger disabled={pending}>
+              <Button danger disabled={editingDisabled}>
                 Remove
               </Button>
             </Popconfirm>
           )}
+          {retryStatus && (
+            <Button disabled={pending} onClick={retryStatus}>
+              Refresh status
+            </Button>
+          )}
           <Button onClick={close} disabled={pending}>
             Cancel
           </Button>
-          <Button type="primary" loading={pending} onClick={() => form.submit()}>
+          <Button
+            type="primary"
+            loading={pending}
+            disabled={editingDisabled}
+            onClick={() => form.submit()}
+          >
             Save desired configuration
           </Button>
         </Space>
       }
     >
       {(error || errorMessage) && <Alert title={error || errorMessage} type="error" role="alert" />}
+      {outdated && (
+        <Alert
+          type="warning"
+          title="This object changed. Close the form and reopen it with current settings."
+        />
+      )}
       <Form<Values>
         form={form}
         layout="vertical"
         initialValues={initial}
         onFinish={finish}
-        disabled={pending}
+        disabled={editingDisabled}
       >
         {kind !== 'rule' && (
           <Form.Item label="Name" name="name" rules={[{ required: true, whitespace: true }]}>
@@ -256,9 +306,25 @@ export default function ConfigEditor({
               name="profile"
               rules={[{ required: !connection, whitespace: true }]}
               extra={
-                connection
-                  ? 'Leave blank to keep the saved profile.'
-                  : 'Paste a self-contained profile or choose a local file.'
+                <>
+                  <p>
+                    {connection
+                      ? 'Leave blank to keep the saved profile.'
+                      : 'Paste a self-contained profile or choose a local file.'}
+                  </p>
+                  {guide && (
+                    <>
+                      <p>{guide.hint}</p>
+                      <a
+                        href={`https://github.com/andrey-krasheninnikov/want-gates/blob/main/docs/${guide.path}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        {selectedProtocol} profile guide
+                      </a>
+                    </>
+                  )}
+                </>
               }
             >
               <Input.TextArea autoComplete="off" autoSize={{ minRows: 3, maxRows: 8 }} />
@@ -266,7 +332,7 @@ export default function ConfigEditor({
             <input
               type="file"
               aria-label="Connection profile file"
-              disabled={pending}
+              disabled={editingDisabled}
               onChange={async (event) => {
                 const file = event.currentTarget.files?.[0];
                 event.currentTarget.value = '';
@@ -334,7 +400,7 @@ export default function ConfigEditor({
                   <InputNumber min={1} precision={0} />
                 </Form.Item>
                 <Form.Item label="Expected HTTP status" name="expected_status">
-                  <InputNumber min={100} max={599} precision={0} />
+                  <InputNumber min={200} max={599} precision={0} />
                 </Form.Item>
                 <Form.Item label="Trust certificate (PEM)" name="ca_pem">
                   <Input.TextArea autoSize />

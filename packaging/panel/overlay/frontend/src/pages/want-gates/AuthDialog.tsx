@@ -1,7 +1,7 @@
 import { Alert, Button, Checkbox, Form, Input, Modal, Popconfirm, Select, Space } from 'antd';
 import { useState } from 'react';
 
-import { operation, type AuthState } from './operations';
+import { authSchema, operation, OperationError, type AuthState } from './operations';
 
 type Credential =
   | 'username'
@@ -34,7 +34,7 @@ export function challengeFields(
   if (protocol === 'forti') {
     if (auth.method === 'text') return ['response'];
     if (method === 'certificate' || method === 'saml') return ['private_key_password'];
-    if (method === 'cookie') return ['cookie'];
+    if (method === 'cookie') return ['cookie', 'private_key_password'];
     return ['username', 'password', 'private_key_password'];
   }
   switch (auth.method) {
@@ -45,7 +45,7 @@ export function challengeFields(
     case 'text':
       return ['response'];
     case 'dynamic':
-      return ['username', 'response'];
+      return ['response'];
     case 'static':
       return ['username', 'password', 'response'];
     default:
@@ -101,10 +101,14 @@ export function BrowserChallenge({ auth }: { auth: AuthState }) {
 
 export default function AuthDialog({
   connection,
+  locked,
+  retryStatus,
   close,
   refresh,
 }: {
-  connection: { id: string; name: string; protocol: string };
+  connection: { id: string; name: string; protocol: string; revision: string };
+  locked: boolean;
+  retryStatus?: () => void;
   close: () => void;
   refresh: () => void;
 }) {
@@ -112,8 +116,10 @@ export default function AuthDialog({
   const [method, setMethod] = useState('password');
   const [error, setError] = useState('');
   const [pending, setPending] = useState(false);
+  const [readbackRequired, setReadbackRequired] = useState(false);
   const [form] = Form.useForm<Values>();
-  const { id, protocol } = connection;
+  const { id, protocol, revision } = connection;
+  const actionDisabled = locked || pending || readbackRequired;
   const fields = challengeFields(protocol, auth, method);
   const showsMethods =
     protocol === 'forti' &&
@@ -131,14 +137,25 @@ export default function AuthDialog({
         auth?.method !== 'text';
 
   async function invoke(command: string, fields: Record<string, unknown> = {}) {
+    if (locked || pending || (readbackRequired && command !== 'connection.auth-status')) return;
     setPending(true);
     setError('');
     try {
-      const next = await operation<AuthState | null>(command, { id, ...fields });
+      const next = await operation(authSchema.nullable(), command, {
+        id,
+        expected_revision: revision,
+        ...fields,
+      });
       setAuth(next ?? undefined);
+      setReadbackRequired(false);
       refresh();
     } catch (error) {
       setError(error instanceof Error ? error.message : 'VPN sign-in failed.');
+      if (error instanceof OperationError && error.readbackRequired) {
+        setReadbackRequired(true);
+        setAuth(undefined);
+        refresh();
+      }
     } finally {
       form.resetFields();
       setPending(false);
@@ -165,9 +182,16 @@ export default function AuthDialog({
       open
       title={`VPN sign-in · ${connection.name}`}
       footer={
-        <Button disabled={pending} onClick={close}>
-          Close
-        </Button>
+        <Space wrap>
+          {retryStatus && (
+            <Button disabled={pending} onClick={retryStatus}>
+              Refresh status
+            </Button>
+          )}
+          <Button disabled={pending} onClick={close}>
+            Close
+          </Button>
+        </Space>
       }
       onCancel={close}
       keyboard={!pending}
@@ -188,11 +212,14 @@ export default function AuthDialog({
           </>
         )}
         <Space wrap>
-          <Button disabled={pending} onClick={() => void invoke('connection.auth-status')}>
+          <Button
+            disabled={locked || pending}
+            onClick={() => void invoke('connection.auth-status')}
+          >
             Check sign-in
           </Button>
           {protocol !== 'wireguard' && (
-            <Button disabled={pending} onClick={() => void invoke('connection.login')}>
+            <Button disabled={actionDisabled} onClick={() => void invoke('connection.login')}>
               {protocol === 'netbird' ? 'Start browser sign-in' : 'Start or resume sign-in'}
             </Button>
           )}
@@ -200,20 +227,20 @@ export default function AuthDialog({
             title="Restart this VPN session?"
             onConfirm={() => invoke('connection.restart')}
           >
-            <Button disabled={pending}>Restart VPN</Button>
+            <Button disabled={actionDisabled}>Restart VPN</Button>
           </Popconfirm>
           <Popconfirm
             title="Disconnect this VPN session?"
             onConfirm={() => invoke('connection.logout')}
           >
-            <Button disabled={pending}>Disconnect</Button>
+            <Button disabled={actionDisabled}>Disconnect</Button>
           </Popconfirm>
           {protocol !== 'wireguard' && (
             <Popconfirm
               title="Forget saved VPN credentials or enrollment?"
               onConfirm={() => invoke('connection.forget-auth')}
             >
-              <Button disabled={pending}>Forget sign-in</Button>
+              <Button disabled={actionDisabled}>Forget sign-in</Button>
             </Popconfirm>
           )}
         </Space>
@@ -223,7 +250,7 @@ export default function AuthDialog({
             <Select
               aria-label="Forti login method"
               value={method}
-              disabled={pending}
+              disabled={actionDisabled}
               options={auth.methods?.map((value) => ({ value, label: value }))}
               onChange={(value) => {
                 form.resetFields();
@@ -237,12 +264,10 @@ export default function AuthDialog({
             form={form}
             layout="vertical"
             onFinish={finish}
-            disabled={pending || expired}
+            disabled={actionDisabled || expired}
           >
             {fields.map((field) => {
-              const optional =
-                (field === 'private_key_password' && protocol === 'forti') ||
-                (field === 'username' && auth?.method === 'dynamic');
+              const optional = field === 'private_key_password' && protocol === 'forti';
               return (
                 <Form.Item
                   key={field}
@@ -263,7 +288,12 @@ export default function AuthDialog({
                 <Checkbox>Remember base credentials on the gateway</Checkbox>
               </Form.Item>
             )}
-            <Button type="primary" htmlType="submit" loading={pending}>
+            <Button
+              type="primary"
+              htmlType="submit"
+              loading={pending}
+              disabled={actionDisabled || expired}
+            >
               Submit sign-in
             </Button>
           </Form>

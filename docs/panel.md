@@ -57,18 +57,21 @@ resource URL, required capabilities and the health thresholds for automatic
 selection. Transport and DNS probes use the same JSON format as the CLI.
 When an edit conflicts with a newer revision, refresh and reopen the object.
 
-Save changes to the desired configuration. Open **Preview routing** to inspect
-the destinations, eligibility and ingress before choosing **Apply reviewed
+Save changes to the desired configuration. **Preview routing** compares it with
+the last working revision. Review rule additions and removals, group and
+connection changes, eligibility and ingress before choosing **Apply reviewed
 routing**. An applied result can be partial or blocked. The status card shows
-the last observed revision and any mismatch. Use **Recover routing** when
-the service reports interrupted application. Refresh status after an
-unconfirmed response before submitting another operation.
+the last observed revision and any mismatch. Use **Recover routing** when the
+service reports an interrupted apply. If a reply is unconfirmed, refresh status
+and reopen the editor or create a new preview before retrying.
 
 ## Native VPN sign-in
 
 Apply the current profile before opening its sign-in controls. Use
 **Check sign-in** to read the current challenge or **Start or resume sign-in**
 to initiate the connection. The panel shows the input requested by the adapter.
+If the connection changes while the dialog is open, refresh status and reopen
+sign-in before entering credentials for the updated connection.
 
 - OpenVPN accepts the configured account, key passphrase and supported
   password or text challenges. Browser authentication uses the link supplied

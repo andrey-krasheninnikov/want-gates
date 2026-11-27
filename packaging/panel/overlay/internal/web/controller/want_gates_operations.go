@@ -30,11 +30,11 @@ var wantGatesOperations = map[string]wantGatesOperation{
 	"connection.update":      {"id expected_revision group_id name profile dns allowed_capabilities", 5 * time.Second},
 	"connection.delete":      {"id expected_revision", 5 * time.Second},
 	"connection.adapter":     {"protocol", 20 * time.Second},
-	"connection.auth-status": {"id", 5 * time.Second},
-	"connection.login":       {"id credentials remember", 40 * time.Second},
-	"connection.logout":      {"id", 40 * time.Second},
-	"connection.restart":     {"id", 40 * time.Second},
-	"connection.forget-auth": {"id", 40 * time.Second},
+	"connection.auth-status": {"id expected_revision", 5 * time.Second},
+	"connection.login":       {"id expected_revision credentials remember", 40 * time.Second},
+	"connection.logout":      {"id expected_revision", 40 * time.Second},
+	"connection.restart":     {"id expected_revision", 40 * time.Second},
+	"connection.forget-auth": {"id expected_revision", 40 * time.Second},
 	"rule.create":            {"group_id destination", 5 * time.Second},
 	"rule.update":            {"id expected_revision group_id destination", 5 * time.Second},
 	"rule.delete":            {"id expected_revision", 5 * time.Second},
@@ -48,16 +48,25 @@ type wantGatesEligibility struct {
 	Requires string `json:"requires,omitempty"`
 }
 
+type wantGatesChange struct {
+	Kind   string   `json:"kind"`
+	ID     string   `json:"id"`
+	Before []string `json:"before"`
+	After  []string `json:"after"`
+}
+
 type wantGatesPreview struct {
-	PlanID               string                                     `json:"plan_id"`
-	DesiredRevision      wantGatesRevision                          `json:"desired_revision"`
-	Ingress              []string                                   `json:"ingress"`
-	Rules                []wantGatesRule                            `json:"rules"`
-	Eligibility          map[string]map[string]wantGatesEligibility `json:"eligibility"`
-	PreparedConnections  []string                                   `json:"prepared_connections"`
-	Unmatched            string                                     `json:"unmatched"`
-	Unverified           string                                     `json:"unverified"`
-	SessionsMayInterrupt bool                                       `json:"sessions_may_interrupt"`
+	PlanID                  string                                     `json:"plan_id"`
+	DesiredRevision         *wantGatesRevision                         `json:"desired_revision"`
+	Ingress                 []string                                   `json:"ingress"`
+	Rules                   []wantGatesRule                            `json:"rules"`
+	Eligibility             map[string]map[string]wantGatesEligibility `json:"eligibility"`
+	BaseRevision            *wantGatesRevision                         `json:"base_revision"`
+	Changes                 []wantGatesChange                          `json:"changes"`
+	PreparedConnectionCount int                                        `json:"prepared_connection_count"`
+	Unmatched               string                                     `json:"unmatched"`
+	Unverified              string                                     `json:"unverified"`
+	SessionsMayInterrupt    bool                                       `json:"sessions_may_interrupt"`
 }
 
 type wantGatesApply struct {
@@ -131,13 +140,23 @@ func wantGatesOperationRequest(c *gin.Context, command string, fields string) (m
 	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
 		return nil, errWantGatesReply
 	}
+	if slices.Contains(allowed, "expected_revision") && request["expected_revision"] == nil {
+		return nil, errWantGatesReply
+	}
+	if command == "routing.preview" {
+		request["summary"] = true
+	}
 	return request, nil
 }
 
 func publicWantGatesError(command, detail string) (int, string) {
 	switch {
+	case strings.HasPrefix(detail, "configuration saved; unused profile cleanup failed"):
+		return http.StatusConflict, "The configuration was saved. Profile cleanup failed. Close the form and refresh status before another edit."
+	case strings.HasPrefix(detail, "configuration saved but durability is uncertain"):
+		return http.StatusServiceUnavailable, "The configuration may be saved. Storage could not confirm durability. Refresh status before retrying."
 	case strings.Contains(detail, "revision conflict"):
-		return http.StatusConflict, "This object changed. Refresh its current settings and submit again."
+		return http.StatusConflict, "This object changed. Refresh status and reopen it before submitting again."
 	case strings.Contains(detail, "routing operation in progress"):
 		return http.StatusConflict, "A routing operation is in progress. Refresh routing status when it finishes."
 	case strings.Contains(detail, "drift"), strings.Contains(detail, "changed since preview"), strings.Contains(detail, "create a new preview"), strings.Contains(detail, "preview again"):
@@ -156,6 +175,8 @@ func publicWantGatesError(command, detail string) (int, string) {
 		return http.StatusConflict, "Preview and apply the current connection profile before opening native authentication."
 	case strings.Contains(detail, "challenge"), strings.Contains(detail, "expired"):
 		return http.StatusConflict, "Refresh the authentication challenge and check the required fields."
+	case strings.Contains(detail, "native runtime transport unavailable"):
+		return http.StatusServiceUnavailable, "The native service reply could not be confirmed. Check sign-in before retrying."
 	case strings.Contains(detail, "runtime unavailable"):
 		return http.StatusServiceUnavailable, "The native service is unavailable."
 	case strings.HasPrefix(command, "routing."):
@@ -169,12 +190,22 @@ func wantGatesOperationData(command string, data json.RawMessage) (any, error) {
 	switch command {
 	case "routing.preview":
 		var view wantGatesPreview
-		err := json.Unmarshal(data, &view)
-		return view, err
+		if err := json.Unmarshal(data, &view); err != nil {
+			return nil, err
+		}
+		if view.PlanID == "" || view.DesiredRevision == nil || view.Changes == nil {
+			return nil, errWantGatesReply
+		}
+		return view, nil
 	case "routing.apply", "routing.recover":
 		var view wantGatesApply
-		err := json.Unmarshal(data, &view)
-		return view, err
+		if err := json.Unmarshal(data, &view); err != nil {
+			return nil, err
+		}
+		if view.PlanID == "" || view.State == "" {
+			return nil, errWantGatesReply
+		}
+		return view, nil
 	case "connection.adapter":
 		var view struct {
 			Available bool   `json:"available"`
@@ -186,6 +217,9 @@ func wantGatesOperationData(command string, data json.RawMessage) (any, error) {
 		var view wantGatesAuth
 		if err := json.Unmarshal(data, &view); err != nil {
 			return nil, err
+		}
+		if view.Authentication == "" {
+			return nil, errWantGatesReply
 		}
 		if link, err := url.Parse(view.URL); err != nil || link.Scheme != "https" || link.Hostname() == "" || link.User != nil {
 			view.URL = ""
@@ -237,7 +271,7 @@ func wantGatesMutate(c *gin.Context) {
 	}
 	if reply.Error != "" {
 		status, message := publicWantGatesError(command, reply.Error)
-		c.JSON(status, gin.H{"success": false, "msg": message})
+		c.JSON(status, gin.H{"success": false, "msg": message, "readback_required": strings.HasPrefix(reply.Error, "configuration saved")})
 		return
 	}
 	data, err := wantGatesOperationData(command, reply.Data)

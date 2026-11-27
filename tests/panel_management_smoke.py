@@ -69,6 +69,8 @@ def acceptance(stand):
 
     assert peer() == before, "saving changed live routing"
     preview = operation("routing.preview")
+    assert preview["base_revision"] is None
+    assert any(change["before"] is None and change["kind"] == "rule" for change in preview["changes"])
     assert preview["desired_revision"] == desired["routing"]["desired_revision"]
     assert preview["rules"][0]["destination"] == "10.220.0.0/24"
     assert peer() == before, "preview changed live routing"
@@ -110,7 +112,16 @@ def acceptance(stand):
     pending = status(stand, csrf)["routing"]
     assert pending["desired_revision"] != pending["last_observation"]["running_revision"]
     assert peer() == "10.211.0.1"
+    applied_rule = live["rules"][0]
+    operation("rule.delete", {"id": applied_rule["id"], "expected_revision": applied_rule["revision"]})
     preview = operation("routing.preview")
+    assert preview["base_revision"] == live["routing"]["last_observation"]["running_revision"]
+    removed = next(change for change in preview["changes"] if change["id"] == applied_rule["id"])
+    assert removed["before"][0] == "10.220.0.0/24" and removed["after"] is None
+    changed_group = next(change for change in preview["changes"] if change["id"] == group["id"])
+    assert changed_group["before"][0] == "Browser managed"
+    assert changed_group["after"][0] == "Edited group"
+    assert peer() == "10.211.0.1"
 
     settings = stand["api"]("xray/", {})
     if isinstance(settings, str):

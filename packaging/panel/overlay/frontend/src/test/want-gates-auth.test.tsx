@@ -1,8 +1,14 @@
-import { render, screen } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { describe, expect, it, vi } from 'vitest';
 
-import { BrowserChallenge, challengeFields } from '@/pages/want-gates/AuthDialog';
+import { httpRequest } from '@/api/http-init';
+import AuthDialog, { BrowserChallenge, challengeFields } from '@/pages/want-gates/AuthDialog';
 import type { AuthState } from '@/pages/want-gates/operations';
+
+vi.mock('@/api/http-init', async (original) => ({
+  ...(await original<typeof import('@/api/http-init')>()),
+  httpRequest: vi.fn(),
+}));
 
 const pending: AuthState = {
   authentication: 'challenge_required',
@@ -21,17 +27,57 @@ describe('Want Gates native challenges', () => {
     expect(challengeFields('openvpn', { ...pending, method: 'private_key' })).toEqual([
       'private_key_password',
     ]);
-    expect(challengeFields('openvpn', { ...pending, method: 'dynamic' })).toEqual([
-      'username',
-      'response',
-    ]);
+    expect(challengeFields('openvpn', { ...pending, method: 'dynamic' })).toEqual(['response']);
     expect(challengeFields('forti', { ...pending, method: 'text' })).toEqual(['response']);
-    expect(challengeFields('forti', pending, 'cookie')).toEqual(['cookie']);
+    expect(challengeFields('forti', pending, 'cookie')).toEqual(['cookie', 'private_key_password']);
     expect(challengeFields('forti', pending, 'certificate')).toEqual(['private_key_password']);
     expect(
       challengeFields('netbird', { ...pending, authentication: 'credentials_required' }),
     ).toEqual(['setup_key']);
     expect(challengeFields('wireguard')).toEqual([]);
+  });
+
+  it('submits the dynamic response with the opened connection revision', async () => {
+    const request = vi.mocked(httpRequest);
+    const result = { ok: true, status: 200, statusText: 'OK' };
+    request
+      .mockResolvedValueOnce({
+        ...result,
+        data: { success: true, obj: { ...pending, method: 'dynamic' } },
+      })
+      .mockResolvedValueOnce({
+        ...result,
+        data: {
+          success: true,
+          obj: { authentication: 'authenticating', expires_at: null, remembered: false },
+        },
+      });
+    render(
+      <AuthDialog
+        connection={{ id: 'c1', name: 'Test connection', protocol: 'openvpn', revision: '9' }}
+        locked={false}
+        close={() => undefined}
+        refresh={() => undefined}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Check sign-in' }));
+    fireEvent.change(await screen.findByLabelText('Challenge response'), {
+      target: { value: 'TEST-OTP' },
+    });
+    expect(screen.queryByLabelText('Username')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Submit sign-in' }));
+    await waitFor(() =>
+      expect(request).toHaveBeenLastCalledWith(
+        'POST',
+        '/panel/api/want-gates/operations/connection.login',
+        {
+          id: 'c1',
+          expected_revision: '9',
+          credentials: { challenge_id: 'current', response: 'TEST-OTP' },
+        },
+        expect.anything(),
+      ),
+    );
   });
 
   it('renders provider links with the matching device code or forwarded callback', () => {

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -22,6 +23,7 @@ func TestWantGatesOperationRejectsUnlistedFieldsAndKeepsExactRevision(t *testing
 		`{"command":"panel.configure"}`,
 		`{"name":"a","name":"b"}`,
 		`{"expected_revision":2}`,
+		`{"id":"g1","name":"Group"}`,
 		`{"name":"a"} {"name":"b"}`,
 	} {
 		if _, err := read(body); err == nil {
@@ -31,6 +33,27 @@ func TestWantGatesOperationRejectsUnlistedFieldsAndKeepsExactRevision(t *testing
 	request, err := read(`{"id":"g1","expected_revision":"18446744073709551615","name":"Group"}`)
 	if err != nil || request["expected_revision"] != uint64(18446744073709551615) {
 		t.Fatal("operation lost the submitted revision")
+	}
+}
+
+func TestWantGatesMapsUnconfirmedResults(t *testing.T) {
+	for _, example := range []struct {
+		command string
+		detail  string
+		status  int
+		message string
+	}{
+		{"connection.login", "native runtime transport unavailable", http.StatusServiceUnavailable, "could not be confirmed"},
+		{"connection.update", "configuration saved but durability is uncertain", http.StatusServiceUnavailable, "may be saved"},
+		{"connection.update", "configuration saved; unused profile cleanup failed", http.StatusConflict, "was saved"},
+	} {
+		status, message := publicWantGatesError(example.command, example.detail)
+		if status != example.status || !strings.Contains(message, example.message) {
+			t.Fatalf("incorrect result status or message for %s", example.command)
+		}
+	}
+	if _, err := wantGatesOperationData("routing.apply", json.RawMessage(`{"plan_id":"test"}`)); err == nil {
+		t.Fatal("accepted an apply result without its state")
 	}
 }
 

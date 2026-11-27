@@ -195,10 +195,15 @@ export default function WantGatesPage() {
               </Button>
               {query.isPending && <p role="status">Loading Want Gates status</p>}
               {query.isError && <Alert type="error" title={query.error.message} showIcon />}
-              {!query.isError && query.data && (
+              {query.data && (
                 <>
-                  <Management state={query.data} refresh={() => void query.refetch()} />
-                  <WantGatesStatus state={query.data} />
+                  <Management
+                    state={query.data}
+                    refreshing={query.isFetching}
+                    statusUnavailable={query.isError}
+                    refresh={() => void query.refetch({ cancelRefetch: false })}
+                  />
+                  {!query.isError && <WantGatesStatus state={query.data} />}
                 </>
               )}
             </Space>
