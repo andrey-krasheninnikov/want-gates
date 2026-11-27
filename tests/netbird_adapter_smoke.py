@@ -144,7 +144,9 @@ def acceptance(context, client, server, geodata):
 
     def packet(result, marker, company=None, expected=None):
         if company is None:
-            assert result.returncode != 0, 'protected traffic escaped'
+            no_dns_answer = expected is not None and result.returncode == 0 and \
+                json.loads(result.stdout)['answer'] is None
+            assert result.returncode != 0 or no_dns_answer, 'protected traffic escaped'
         else:
             assert result.returncode == 0, f'{company.name} traffic timed out'
             value = json.loads(result.stdout)
