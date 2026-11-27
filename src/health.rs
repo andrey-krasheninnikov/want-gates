@@ -228,6 +228,11 @@ impl Observation {
         self.results = results;
     }
     pub fn describe(&self) -> serde_json::Value {
-        serde_json::json!({"state":if !self.fresh{"unknown"}else if self.available{if self.failures>0{"suspect"}else{"healthy"}}else if self.successes>0{"recovering"}else if self.was_down{"unhealthy"}else{"checking"},"eligible":self.available&&self.fresh,"reason":self.reason,"successes":self.successes,"failures":self.failures,"observed_at":self.observed_at,"results":self.results})
+        let results: std::collections::BTreeMap<_, _> = self
+            .results
+            .iter()
+            .map(|(key, value)| (key, capability::public_reason(value)))
+            .collect();
+        serde_json::json!({"state":if !self.fresh{"unknown"}else if self.available{if self.failures>0{"suspect"}else{"healthy"}}else if self.successes>0{"recovering"}else if self.was_down{"unhealthy"}else{"checking"},"eligible":self.available&&self.fresh,"reason":capability::public_reason(&self.reason),"successes":self.successes,"failures":self.failures,"observed_at":self.observed_at,"results":results})
     }
 }

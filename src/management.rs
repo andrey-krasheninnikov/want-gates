@@ -28,6 +28,8 @@ pub fn run(kind: &str, mut args: impl Iterator<Item = OsString>) -> io::Result<(
         ("rule", "list") => &["--group"],
         ("panel", "configure") => &["--file"],
         ("panel", "preflight") | ("routing", "preview" | "status" | "apply" | "recover") => &[],
+        ("routing", "diagnose") => &["--capability", "--probe"],
+        ("routing", "logs") => &["--limit"],
         ("rule", "show" | "delete") => &[],
         ("group", "list" | "show" | "delete") => &[],
         ("connection", "import") => &[
@@ -57,11 +59,15 @@ pub fn run(kind: &str, mut args: impl Iterator<Item = OsString>) -> io::Result<(
             | "logout"
             | "restart"
             | "forget-auth"
+            | "diagnose"
     ) {
-        Some(
-            args.next()
-                .ok_or_else(|| invalid("object ID is required"))?,
-        )
+        Some(args.next().ok_or_else(|| {
+            invalid(if action == "diagnose" {
+                "destination is required"
+            } else {
+                "object ID is required"
+            })
+        })?)
     } else {
         None
     };
@@ -79,7 +85,7 @@ pub fn run(kind: &str, mut args: impl Iterator<Item = OsString>) -> io::Result<(
         if option != "--socket" && !allowed.contains(&option.as_str()) {
             return Err(invalid("unknown option; run wgates --help"));
         }
-        if option == "--remember" {
+        if matches!(option.as_str(), "--remember" | "--probe") {
             if options.insert(option, OsString::from("true")).is_some() {
                 return Err(invalid("duplicate option"));
             }
@@ -102,9 +108,15 @@ pub fn run(kind: &str, mut args: impl Iterator<Item = OsString>) -> io::Result<(
     if let Some(id) = id {
         request[if matches!(action, "apply" | "recover") {
             "plan_id"
+        } else if action == "diagnose" {
+            "destination"
         } else {
             "id"
-        }] = json!(id.to_str().ok_or_else(|| invalid("invalid object ID"))?);
+        }] = json!(id.to_str().ok_or_else(|| invalid(if action == "diagnose" {
+            "invalid destination"
+        } else {
+            "invalid object ID"
+        }))?);
     }
     for (option, field) in [
         ("--name", "name"),
@@ -114,6 +126,7 @@ pub fn run(kind: &str, mut args: impl Iterator<Item = OsString>) -> io::Result<(
         ("--destination", "destination"),
         ("--primary", "primary"),
         ("--dns", "dns"),
+        ("--capability", "capability"),
     ] {
         if let Some(value) = options.get(option) {
             request[field] = json!(
@@ -125,6 +138,14 @@ pub fn run(kind: &str, mut args: impl Iterator<Item = OsString>) -> io::Result<(
     }
     if kind == "group" && action == "create" && request.get("name").is_none() {
         return Err(invalid("--name is required"));
+    }
+    if let Some(value) = options.get("--limit") {
+        request["limit"] = json!(
+            value
+                .to_str()
+                .and_then(|limit| limit.parse::<u64>().ok())
+                .ok_or_else(|| invalid("invalid log limit"))?
+        );
     }
     if let Some(value) = options.get("--capabilities") {
         request["allowed_capabilities"] = json!(crate::capability::parse(
@@ -246,6 +267,9 @@ pub fn run(kind: &str, mut args: impl Iterator<Item = OsString>) -> io::Result<(
                 source
             });
         }
+    }
+    if options.contains_key("--probe") {
+        request["probe"] = json!(true);
     }
     if options.contains_key("--remember") {
         if request.get("credentials").is_none() {

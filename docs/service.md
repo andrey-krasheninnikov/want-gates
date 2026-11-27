@@ -226,6 +226,12 @@ same pagination fields as other lists and an optional `group_id`.
 `panel.configure` takes a `settings` object containing `url` and `token`.
 `panel.preflight`, `routing.preview`, and `routing.status` have no extra fields.
 `routing.apply` and `routing.recover` require `plan_id`.
+`routing.diagnose` requires string `destination` and `capability`, with
+optional boolean `probe`. It returns `desired`, nullable `last_observed`,
+the corresponding revisions, `runtime`, and the separate `probe` result.
+`routing.logs` accepts an optional integer `limit` from 1 to 128. It returns
+the newest events first with `observed_at` in Unix seconds, `operation`, and
+`outcome`. These commands use the existing control socket permissions.
 
 Native authentication and lifecycle commands require `id` and completed routing
 preparation. `connection.login` optionally takes `credentials` (the current

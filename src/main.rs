@@ -56,6 +56,8 @@ Usage:
   wgates panel configure --file PATH|-
   wgates panel preflight
   wgates routing preview|status
+  wgates routing diagnose HOST_OR_IP --capability tcp_ipv4|udp_ipv4|tcp_ipv6|udp_ipv6 [--probe]
+  wgates routing logs [--limit N]
   wgates routing apply PLAN_ID|recover PLAN_ID
   wgates --version
 

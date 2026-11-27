@@ -45,6 +45,36 @@ rejected. More-specific prefixes take
 priority, including their blocking rules. IPv4-mapped IPv6 notation is rejected;
 use IPv4 notation instead.
 
+## Diagnose a destination
+
+```sh
+wgates routing diagnose v4.corp.test --capability tcp_ipv4
+wgates routing diagnose 10.20.30.40 --capability udp_ipv4 --probe
+wgates routing logs --limit 20
+```
+
+Diagnose uses the same domain and CIDR precedence as routing. Specify one of
+`tcp_ipv4`, `udp_ipv4`, `tcp_ipv6`, or `udp_ipv6`. An IP literal must use
+the requested family. The response shows the desired decision and the last
+observed decision, with the matching rule, ordered connection candidates,
+capability limits, authentication state, DNS behavior, and health results.
+A decision is unmatched, assigned to a group, or blocked. The observed
+revision and `runtime` field show whether the saved policy changed or the
+service is busy, unapplied, unverified, or awaiting recovery.
+
+The default diagnosis is a policy lookup. With `--probe`, the service checks
+a configured resource through the last observed selected connection. It uses
+the group's applicable healthcheck or the connection probes already configured
+for that group. The probe result is separate from the routing decision and
+uses the configured targets. It is skipped if the applied revision or
+selection is unavailable. Diagnosis and probing leave the saved configuration
+and observations in place.
+
+Logs return recent operations and outcomes with timestamps. The service
+retains the latest 128 events in memory and returns 20 by default. Restarting
+the control service starts an empty log. Status and logs use reason codes
+for failures and omit profile secrets, panel tokens, and native client output.
+
 ## Domain rules and connection DNS
 
 ```sh
