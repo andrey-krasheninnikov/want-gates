@@ -217,7 +217,7 @@ pub(crate) fn executable(path: &Path) -> io::Result<PathBuf> {
     }
     Ok(path)
 }
-fn command(program: &str, args: &[&str]) -> io::Result<String> {
+pub(crate) fn command(program: &str, args: &[&str]) -> io::Result<String> {
     command_input(program, args, Stdio::null())
 }
 fn bootstrap_addresses(host: &str) -> io::Result<Vec<IpAddr>> {
@@ -228,7 +228,7 @@ fn bootstrap_addresses(host: &str) -> io::Result<Vec<IpAddr>> {
         .filter_map(|line| line.split_whitespace().next()?.parse().ok())
         .collect())
 }
-pub(crate) fn command_input(program: &str, args: &[&str], stdin: Stdio) -> io::Result<String> {
+fn command_input(program: &str, args: &[&str], stdin: Stdio) -> io::Result<String> {
     let mut child = Command::new(program)
         .args(args)
         .env_clear()

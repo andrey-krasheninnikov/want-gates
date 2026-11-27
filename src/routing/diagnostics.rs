@@ -6,7 +6,7 @@ use crate::policy::{Network, Rule, domain_name};
 use crate::store::{self, Config};
 use serde_json::{Value, json};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     io,
     net::IpAddr,
     path::Path,
@@ -52,6 +52,7 @@ pub(super) fn event_outcome(result: &io::Result<Value>) -> &'static str {
         Some("restored_runtime_unverified") => "restored_runtime_unverified",
         _ if data["probe"]["state"] == "failed" => "failed",
         _ if data["probe"]["state"] == "skipped" => "skipped",
+        _ if data["probe"]["state"] == "unverified" => "unverified",
         _ => "completed",
     }
 }
@@ -195,8 +196,10 @@ fn candidates(
                             .is_none_or(|v| v != "verified")
                         {
                             record
-                                .results
+                                .admitted
                                 .get(capability)
+                                .or_else(|| record.results.get(capability))
+                                .filter(|reason| reason.as_str() != "verified")
                                 .map_or("not_checked", |reason| {
                                     crate::capability::public_reason(reason)
                                 })
@@ -204,8 +207,10 @@ fn candidates(
                             && record.admitted.get("dns").is_none_or(|v| v != "verified")
                         {
                             record
-                                .results
+                                .admitted
                                 .get("dns")
+                                .or_else(|| record.results.get("dns"))
+                                .filter(|reason| reason.as_str() != "verified")
                                 .map_or("dns_transport_unverified", |reason| {
                                     crate::capability::public_reason(reason)
                                 })
@@ -380,33 +385,17 @@ fn run_probe(
     let client = crate::panel::Client::new(settings, stopping)
         .map_err(|_| "panel_configuration_unavailable")?;
     let status = client.running().map_err(|_| "panel_unavailable")?;
-    let outbound = LiveOutbound::new(xray, &working.snapshot.template, connection)?;
-    outbound.verify()?;
-    if crate::native::is_native(&connection.protocol) {
-        let observations =
-            crate::native::observe(native, &working.native).map_err(|_| "native_unavailable")?;
-        if let Some(reason) = crate::native::readiness(connection, &observations) {
-            return Err(reason);
-        }
-        if observations
-            .get(id)
-            .is_some_and(|now| now.reason == crate::native::NETBIRD_CONFIRMING_ROUTES)
-        {
-            return Err(crate::native::NETBIRD_CONFIRMING_ROUTES);
-        }
-        if !working
-            .native_observations
-            .get(id)
-            .zip(observations.get(id))
-            .is_some_and(|(before, now)| {
-                now.admitted && before.session == now.session && before.dns == now.dns
-            })
-        {
-            return Err("native_context_changed");
-        }
+    let tag = crate::native::diagnostic_tag(connection);
+    let verify_handler = || verify_handler(xray, working, &tag);
+    let native_before = if crate::native::is_native(&connection.protocol) {
+        let observation = native_context(native, working, connection)?;
         super::check_native_xray(native, &status, json!([]))
             .map_err(|_| "native_stack_unverified")?;
-    }
+        Some(observation)
+    } else {
+        None
+    };
+    verify_handler()?;
 
     let (source, result) = if use_health {
         (
@@ -419,8 +408,27 @@ fn run_probe(
             crate::probe::connection(&client, &config, connection, &working.proxy),
         )
     };
-    outbound.verify()?;
-    client.running().map_err(|_| "panel_unavailable")?;
+    let confirmed = verify_handler()
+        .and_then(|()| {
+            client
+                .running()
+                .map(|_| ())
+                .map_err(|_| "panel_unavailable")
+        })
+        .and_then(|()| {
+            if let Some(before) = native_before {
+                let after = native_context(native, working, connection)?;
+                if before.netbird_routes_revision != after.netbird_routes_revision
+                    || before.authentication != after.authentication
+                {
+                    return Err("native_context_changed");
+                }
+            }
+            Ok(())
+        });
+    if let Err(reason) = confirmed {
+        return Ok(json!({"state":"unverified","reason":reason,"source":source}));
+    }
     let Ok(result) = result else {
         return Ok(json!({"state":"failed","reason":"probe_failed"}));
     };
@@ -438,115 +446,116 @@ fn run_probe(
     )
 }
 
-struct LiveOutbound {
-    #[cfg(target_os = "linux")]
-    binary: std::path::PathBuf,
-    #[cfg(target_os = "linux")]
-    address: String,
-    #[cfg(target_os = "linux")]
-    expected: Value,
+fn native_context(
+    native: &crate::native::Client,
+    working: &Working,
+    connection: &crate::store::Connection,
+) -> Result<crate::native::Observation, &'static str> {
+    let observations =
+        crate::native::observe(native, &working.native).map_err(|_| "native_unavailable")?;
+    if let Some(reason) = crate::native::readiness(connection, &observations) {
+        return Err(reason);
+    }
+    let now = observations
+        .get(&connection.id)
+        .ok_or("native_unavailable")?;
+    if now.reason == crate::native::NETBIRD_CONFIRMING_ROUTES {
+        return Err(crate::native::NETBIRD_CONFIRMING_ROUTES);
+    }
+    if !now.admitted
+        || working
+            .native_observations
+            .get(&connection.id)
+            .is_none_or(|before| before.session != now.session || before.dns != now.dns)
+    {
+        return Err("native_context_changed");
+    }
+    Ok(now.clone())
 }
 
-impl LiveOutbound {
-    fn new(
-        binary: &Path,
-        template: &Value,
-        connection: &crate::store::Connection,
-    ) -> Result<Self, &'static str> {
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (binary, template, connection);
-            Err("probe_context_unavailable")
-        }
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::{fd::OwnedFd, unix::net::UnixStream};
-            use std::process::Stdio;
-            use std::time::Duration;
-
-            let unavailable = "probe_context_unavailable";
-            let binary = crate::native_runtime::executable(binary).map_err(|_| unavailable)?;
-            let program = binary.to_str().ok_or(unavailable)?;
-            let port = template["inbounds"]
-                .as_array()
-                .and_then(|inbounds| inbounds.iter().find(|inbound| inbound["tag"] == "api"))
-                .and_then(|inbound| inbound["port"].as_u64())
-                .and_then(|port| u16::try_from(port).ok())
-                .filter(|port| *port != 0)
-                .ok_or(unavailable)?;
-            let tag = crate::native::diagnostic_tag(connection);
-            let outbound = template["outbounds"]
-                .as_array()
-                .and_then(|outbounds| outbounds.iter().find(|outbound| outbound["tag"] == tag))
-                .ok_or(unavailable)?;
-            // Keep the private outbound out of files and process arguments.
-            let payload = json!({"outbounds":[outbound]});
-            let (input, writer) = UnixStream::pair().map_err(|_| unavailable)?;
-            writer
-                .set_write_timeout(Some(Duration::from_secs(5)))
-                .map_err(|_| unavailable)?;
-            let output = std::thread::scope(|scope| {
-                let write = scope.spawn(move || serde_json::to_writer(writer, &payload));
-                let output = crate::native_runtime::command_input(
-                    program,
-                    &["convert", "pb", "-d", "-t", "stdin:"],
-                    Stdio::from(OwnedFd::from(input)),
-                );
-                write
-                    .join()
-                    .map_err(|_| unavailable)?
-                    .map_err(|_| unavailable)?;
-                output.map_err(|_| unavailable)
-            })?;
-            let expected = Self::json(&output)?["outbound"]
-                .as_array()
-                .and_then(|outbounds| outbounds.first())
-                .filter(|outbound| outbound["tag"] == tag)
-                .cloned()
-                .ok_or(unavailable)?;
-            Ok(Self {
-                binary,
-                address: format!("127.0.0.1:{port}"),
-                expected,
-            })
-        }
+fn live_handlers(binary: &Path, template: &Value) -> Result<Value, &'static str> {
+    let unavailable = "probe_context_unavailable";
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (binary, template);
+        Err(unavailable)
     }
-
     #[cfg(target_os = "linux")]
-    fn json(output: &str) -> Result<Value, &'static str> {
-        // Xray can print a config-loading message before its JSON document.
-        let start = if output.starts_with('{') {
-            0
-        } else {
-            output.find("\n{").ok_or("probe_context_unavailable")? + 1
-        };
-        serde_json::from_str(&output[start..]).map_err(|_| "probe_context_unavailable")
-    }
-
-    fn verify(&self) -> Result<(), &'static str> {
-        #[cfg(not(target_os = "linux"))]
-        return Err("probe_context_unavailable");
-
-        #[cfg(target_os = "linux")]
-        {
-            let unavailable = "probe_context_unavailable";
-            let output = crate::native_runtime::command_input(
-                self.binary.to_str().ok_or(unavailable)?,
-                &["api", "lso", "-s", &self.address, "-t", "3"],
-                std::process::Stdio::null(),
-            )
-            .map_err(|_| unavailable)?;
-            let actual = Self::json(&output)?;
-            let matches = actual["outbounds"]
-                .as_array()
-                .ok_or(unavailable)?
-                .iter()
-                .filter(|outbound| outbound["tag"] == self.expected["tag"]);
-            if matches.eq(std::iter::once(&self.expected)) {
-                Ok(())
-            } else {
-                Err("panel_drift")
-            }
+    {
+        let binary = crate::native_runtime::executable(binary).map_err(|_| unavailable)?;
+        let port = template["inbounds"]
+            .as_array()
+            .and_then(|inbounds| inbounds.iter().find(|inbound| inbound["tag"] == "api"))
+            .and_then(|inbound| inbound["port"].as_u64())
+            .and_then(|port| u16::try_from(port).ok())
+            .filter(|port| *port != 0)
+            .ok_or(unavailable)?;
+        let output = crate::native_runtime::command(
+            binary.to_str().ok_or(unavailable)?,
+            &["api", "lso", "-s", &format!("127.0.0.1:{port}"), "-t", "3"],
+        )
+        .map_err(|_| unavailable)?;
+        let document: Value = serde_json::from_str(&output).map_err(|_| unavailable)?;
+        if !document["outbounds"].is_array() {
+            return Err(unavailable);
         }
+        Ok(document)
     }
+}
+
+fn handler_binding(saved: &Value, live: &Value) -> Option<String> {
+    let mut matches = live["outbounds"]
+        .as_array()?
+        .iter()
+        .filter(|handler| handler["tag"] == saved["tag"]);
+    let actual = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    super::digest(&json!([saved, actual])).ok()
+}
+
+pub(super) fn capture_handlers(
+    binary: &Path,
+    client: &crate::panel::Client,
+    snapshot: &crate::panel::Snapshot,
+) -> io::Result<BTreeMap<String, String>> {
+    let Some(outbounds) = snapshot.template["outbounds"].as_array() else {
+        return Ok(BTreeMap::new());
+    };
+    let Ok(live) = live_handlers(binary, &snapshot.template) else {
+        return Ok(BTreeMap::new());
+    };
+    // Apply already verifies the saved template. Recheck it after sampling the handlers.
+    match client.read() {
+        Ok(current) if current != *snapshot => {
+            return Err(invalid("observed panel drift after traffic verification"));
+        }
+        Err(_) => return Ok(BTreeMap::new()),
+        _ => {}
+    }
+    Ok(outbounds
+        .iter()
+        .filter_map(|saved| {
+            let tag = saved["tag"]
+                .as_str()
+                .filter(|tag| tag.starts_with(super::PREFIX))?;
+            handler_binding(saved, &live).map(|binding| (tag.to_owned(), binding))
+        })
+        .collect())
+}
+
+fn verify_handler(binary: &Path, working: &Working, tag: &str) -> Result<(), &'static str> {
+    let unavailable = "probe_context_unavailable";
+    let expected = working.probe_handlers.get(tag).ok_or(unavailable)?;
+    let template = &working.snapshot.template;
+    let saved = template["outbounds"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["tag"] == tag))
+        .ok_or(unavailable)?;
+    let live = live_handlers(binary, template)?;
+    if handler_binding(saved, &live).as_ref() != Some(expected) {
+        return Err("panel_drift");
+    }
+    Ok(())
 }

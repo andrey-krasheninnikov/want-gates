@@ -103,6 +103,7 @@ pub fn public_reason(reason: &str) -> &str {
         | "tls_failed"
         | "authenticated"
         | "authenticating"
+        | "connecting"
         | "credentials_required"
         | "challenge_required"
         | "browser_required"

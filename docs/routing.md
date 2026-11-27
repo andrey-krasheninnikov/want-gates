@@ -69,10 +69,11 @@ a configured resource through the last observed selected connection. It uses
 the group's applicable healthcheck or the connection probes already configured
 for that group. The probe result is separate from the routing decision and
 uses the configured targets. It is skipped if the applied revision or
-selection is unavailable. On Linux, the service compares the selected outbound
-with the running Xray handler before and after the probe. Drift and unavailable
-handler inspection prevent a confirmed result. The service uses the installed
-Xray executable. Set `wgates serve --xray PATH` for a custom installation.
+selection is unavailable. On Linux, apply records a hash of each managed Xray
+handler. Diagnostics checks the selected handler before and after the probe.
+If a previous apply did not capture a handler, preview and apply to record it.
+A context change after a probe leaves the result unverified. The service uses
+the installed Xray executable. Set `wgates serve --xray PATH` for a custom installation.
 Diagnosis and probing leave the saved configuration and observations in place.
 
 Logs return recent operations and outcomes with timestamps. The service

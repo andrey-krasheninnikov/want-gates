@@ -81,6 +81,8 @@ struct Working {
     native_observations: BTreeMap<String, crate::native::Observation>,
     #[serde(default)]
     native_retired: crate::native::Generations,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    probe_handlers: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -866,8 +868,9 @@ impl Service {
         let command = command.to_owned();
         let request = request.clone();
         let stopping = self.stopping.clone();
+        let xray = self.xray.clone();
         self.launch(stream, command.clone(), move || {
-            execute(&root, &command, &request, input, stopping, &native)
+            execute(&root, &command, &request, input, stopping, &native, &xray)
         })
     }
 
@@ -932,6 +935,7 @@ fn execute(
     mut input: Input,
     stopping: Arc<AtomicBool>,
     native: &crate::native::Client,
+    xray: &Path,
 ) -> io::Result<Value> {
     if matches!(
         command,
@@ -1449,6 +1453,7 @@ fn execute(
             selected,
             health,
             health_error: None,
+            probe_handlers: diagnostics::capture_handlers(xray, &client, &final_snapshot)?,
             native: input.native.clone(),
             native_observations,
             native_retired: journal
