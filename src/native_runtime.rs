@@ -697,6 +697,24 @@ impl Runtime {
             record.prepared.id, record.prepared.profile_digest
         ))
     }
+    fn check_xray_metadata(&self) -> io::Result<()> {
+        if self.xray_metadata.is_none() {
+            return Ok(());
+        }
+        let current_xray = fs::metadata(&self.xray)?;
+        if self.xray_metadata.as_ref().is_some_and(|loaded| {
+            loaded.dev() != current_xray.dev()
+                || loaded.ino() != current_xray.ino()
+                || loaded.len() != current_xray.len()
+                || loaded.mtime() != current_xray.mtime()
+                || loaded.mtime_nsec() != current_xray.mtime_nsec()
+        }) {
+            return Err(invalid(
+                "Native Xray changed. Restart wgates-native.service",
+            ));
+        }
+        Ok(())
+    }
     fn preflight(&self, protocols: &[String]) -> io::Result<Value> {
         for path in [
             "/usr/sbin/ip",
@@ -712,18 +730,7 @@ impl Runtime {
             let (name, version) = self.client_version(protocol)?;
             versions.insert(name.into(), json!(version));
         }
-        let current_xray = fs::metadata(&self.xray)?;
-        if self.xray_metadata.as_ref().is_some_and(|loaded| {
-            loaded.dev() != current_xray.dev()
-                || loaded.ino() != current_xray.ino()
-                || loaded.len() != current_xray.len()
-                || loaded.mtime() != current_xray.mtime()
-                || loaded.mtime_nsec() != current_xray.mtime_nsec()
-        }) {
-            return Err(invalid(
-                "native Xray changed; restart wgates-native.service",
-            ));
-        }
+        self.check_xray_metadata()?;
         let version_output = command(
             self.xray
                 .to_str()
@@ -2077,6 +2084,9 @@ impl Runtime {
                     return Err(invalid(
                         "native session changed; repeat resource verification",
                     ));
+                }
+                if admitted {
+                    self.check_xray_metadata()?;
                 }
                 i.admitted_session = None;
                 if authenticated

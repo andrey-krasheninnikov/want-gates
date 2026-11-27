@@ -296,6 +296,7 @@ recover() {
                 rm -- "$destination.wgates-new" || return 1
             fi
         done
+        systemctl daemon-reload && check_units || return 1
         for unit in "${units[@]}"; do
             [[ -f $pending/new/$unit ]] || continue
             if [[ $(systemctl show -p LoadState --value "$unit") != not-found ]]; then
@@ -406,6 +407,8 @@ if [[ -n $archive || -n $digest ]]; then
     printf 'Verified wgates %s release archive for %s\n' "$release" "$architecture"
 fi
 [[ $mode == install ]] || exit 0
+systemctl daemon-reload
+check_units || fail 'unit ownership check failed'
 
 check_identity() {
     local account service_gid service_home service_shell
@@ -499,6 +502,7 @@ for i in "${!files[@]}"; do
     hash=$(sha256sum -- "$workspace/new/$file")
     printf '%s  %s\n' "${hash%% *}" "$destination" >> "$workspace/receipt"
 done
+check_units || fail 'unit ownership check failed'
 for unit in "${units[@]}"; do
     if systemctl is-active --quiet "$unit"; then touch "$workspace/active/$unit"; fi
     state=$(systemctl is-enabled "$unit" 2>/dev/null || true)
@@ -528,9 +532,12 @@ systemd-sysusers /usr/lib/sysusers.d/wgates.conf
 check_identity
 systemctl daemon-reload
 check_units || fail 'unit ownership check failed'
-if ((native)); then systemctl enable wgates-native.service; fi
-systemctl enable --now wgates.service
-if ((!native)) && [[ -f $pending/active/wgates-native.service ]]; then
+if ((native)) && [[ ! -f $pending/enabled/wgates-native.service ]]; then
+    systemctl enable wgates-native.service
+fi
+if [[ ! -f $pending/enabled/wgates.service ]]; then systemctl enable wgates.service; fi
+systemctl start wgates.service
+if ((native)) || [[ -f $pending/active/wgates-native.service ]]; then
     systemctl start wgates-native.service
 fi
 wait_ready || fail 'wgates did not reach control-service readiness'

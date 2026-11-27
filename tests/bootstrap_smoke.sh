@@ -15,7 +15,9 @@ unit=/etc/systemd/system/wgates.service
 fixture_unit=/run/systemd/system/x-ui.service
 custom_unit=/run/systemd/system/wgates.service
 override_dir=/run/systemd/system/wgates.service.d
-for owned in /usr/local/x-ui "$fixture_unit" "$custom_unit" "$override_dir" "$binary" "$unit" \
+custom_wants=/etc/systemd/system/wgates-bootstrap-fixture.target.wants
+default_link=/etc/systemd/system/multi-user.target.wants/wgates.service
+for owned in /usr/local/x-ui "$fixture_unit" "$custom_unit" "$override_dir" "$custom_wants" "$default_link" "$binary" "$unit" \
     /etc/systemd/system/wgates-native.service /usr/lib/sysusers.d/wgates.conf \
     /var/lib/wgates /var/lib/wgates-install /var/lib/wgates-native; do
     [[ ! -e $owned && ! -L $owned ]] || { echo "Fixture path already exists: $owned"; exit 1; }
@@ -35,7 +37,7 @@ cleanup() {
     systemctl disable --now wgates-native.service wgates.service >/dev/null 2>&1 || true
     systemctl stop x-ui.service || true
     rm -f -- "$unit" /etc/systemd/system/wgates-native.service "$fixture_unit" "$custom_unit" "$binary" /usr/lib/sysusers.d/wgates.conf
-    rm -rf -- "$override_dir"
+    rm -rf -- "$override_dir" "$custom_wants"
     systemctl daemon-reload
     rm -rf -- /usr/local/x-ui /var/lib/wgates /var/lib/wgates-install /var/lib/wgates-native "$tmp"
     if getent passwd wgates >/dev/null; then userdel wgates; fi
@@ -127,9 +129,15 @@ if runuser -u nobody -- wgates status >"$tmp/result" 2>&1; then
     echo 'An unauthorized caller could read the control socket.' >&2
     exit 1
 fi
+systemctl disable wgates.service
+mkdir -- "$custom_wants"
+ln -s -- "$unit" "$custom_wants/wgates.service"
+systemctl daemon-reload
+systemctl is-enabled --quiet wgates.service
 service_pid=$(systemctl show -p MainPID --value wgates.service)
 "$script" install --archive "$archive" --sha256 "$digest"
 [[ $(systemctl show -p MainPID --value wgates.service) == "$service_pid" ]]
+[[ -L $custom_wants/wgates.service && ! -e $default_link ]]
 
 mkdir "$tmp/changed"
 tar -xzf "$archive" -C "$tmp/changed"
@@ -168,6 +176,7 @@ if "$script" install --archive "$tmp/bad.tar.gz" --sha256 "${bad%% *}" >"$tmp/re
 grep -q 'Restored the previous wgates files and service state' "$tmp/result"
 [[ ! -e /var/lib/wgates-install/pending ]]
 cmp -- "$repo/packaging/systemd/wgates.service" "$unit"
+[[ -L $custom_wants/wgates.service && ! -e $default_link ]]
 wgates group list | cmp - "$tmp/groups"
 
 # Interrupt a second attempt after the replacement was staged. The next install
@@ -184,13 +193,19 @@ kill -KILL "$installer"
 wait "$installer" 2>/dev/null || test "$?" = 137
 # Let any in-flight systemd command release the installer's lock.
 flock -w 20 /var/lib/wgates-install/lock true
+# Recreate the previous live service before testing the unregistered override.
+install -m 0644 -- "$repo/packaging/systemd/wgates.service" "$unit"
+systemctl daemon-reload
+systemctl reset-failed wgates.service 2>/dev/null || true
+systemctl start wgates.service
+service_pid=$(systemctl show -p MainPID --value wgates.service)
 mkdir -- "$override_dir"
 printf '[Service]\nPrivateTmp=yes\n' > "$override_dir/override.conf"
-systemctl daemon-reload
 if "$script" install --archive "$archive" --sha256 "$digest" > "$tmp/result" 2>&1; then exit 1; fi
 grep -q 'Inspect the overrides for wgates.service' "$tmp/result"
 [[ -f $override_dir/override.conf && -d /var/lib/wgates-install/pending ]]
-cmp -s "$unit" "$tmp/changed/wgates.service"
+[[ $(systemctl show -p MainPID --value wgates.service) == "$service_pid" ]]
+wgates group list | cmp - "$tmp/groups"
 rm -- "$override_dir/override.conf"
 rmdir -- "$override_dir"
 systemctl daemon-reload

@@ -1360,6 +1360,9 @@ fn execute(
         if final_snapshot != candidate {
             submit(root, &client, &mut journal, &final_snapshot)?;
         }
+        if !input.native.is_empty() {
+            check_native_xray(native, &client.status()?, json!([]))?;
+        }
         crate::native::admit(
             native,
             &input.native,
@@ -1780,11 +1783,21 @@ fn recover(
         (|| -> io::Result<()> {
         let observations = crate::native::observe(native, &previous.native)?;
         if observations.iter().any(|(id,state)|previous.native_observations.get(id).is_none_or(|old|old.session!=state.session || old.dns!=state.dns)) { return Err(invalid("previous native session changed; resource verification requires a fresh preview and apply")); }
-        crate::native::admit(native, &previous.native, &observations, &previous.effective_config(), &previous.matrix)?;
+        let effective = previous.effective_config();
+        if observations.iter().any(|(id, state)| {
+            crate::native::should_admit(id, state, &effective, &previous.matrix)
+        }) && let Err(error) = client
+            .status()
+            .and_then(|status| check_native_xray(native, &status, json!([])))
+        {
+            crate::native::admit(native, &previous.native, &observations, &effective, &Matrix::new())?;
+            return Err(error);
+        }
+        crate::native::admit(native, &previous.native, &observations, &effective, &previous.matrix)?;
         verify(
             client,
             &journal.plan.base,
-            &previous.effective_config(),
+            &effective,
             &previous.proxy,
             &previous.matrix,
             &journal.plan.ingress,
@@ -2334,12 +2347,14 @@ fn health_cycle(
         return Ok(());
     }
     let effective = effective_config(&config, &selected);
-    if working
-        .native_observations
-        .iter()
-        .any(|(id, state)| crate::native::should_admit(id, state, &effective, &matrix))
+    if working.native_observations.iter().any(|(id, state)| {
+        !state.admitted && crate::native::should_admit(id, state, &effective, &matrix)
+    }) && let Err(error) = check_native_xray(native, &client.running()?, json!([]))
     {
-        check_native_xray(native, &client.running()?, json!([]))?;
+        if crate::native::unavailable(&error) {
+            return Ok(());
+        }
+        return Err(error);
     }
     let input = Input {
         config: effective.clone(),
