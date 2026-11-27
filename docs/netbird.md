@@ -25,10 +25,20 @@ Create a NetBird profile:
 
 Use `"mode": "private"` and omit `exit_network_id` for private networks. Exit
 mode selects only the advertised NetBird network ID in `exit_network_id`.
-Publish exit routes to these peers with Auto Apply disabled. Use IP/CIDR
-resources for protected destinations. Want Gates deselects advertised domain
-resources. Use an explicit `--dns` resolver and health targets that the
-connection can reach through its selected routes.
+Enroll exit-mode peers into a dedicated NetBird distribution group and publish
+only the configured exit to that group. Leave Auto Apply disabled. Give
+unrelated routes distinct network IDs and let NetBird create the IPv6 companion
+for the same exit. Keep exit-mode peers out of private route distribution and
+Network resource policies, including broad policies that use `All` as a
+source. When both modes share an account, use a separate policy source group
+for private-mode peers. NetBird can install newly advertised private routes
+before Want Gates reads the updated network list.
+[NetBird exit node configuration](https://docs.netbird.io/use-cases/remote-access/exit-nodes)
+
+Use IP/CIDR resources for protected private-mode destinations. Want Gates
+deselects advertised domain resources. Use an explicit `--dns` resolver and
+health targets reachable through the selected routes. For traffic that must
+use the exit, choose destinations outside the NetBird overlay addresses.
 
 The HTTPS management endpoint is included automatically. List any separate
 signal, relay, and device authorization or token endpoints, with their exact

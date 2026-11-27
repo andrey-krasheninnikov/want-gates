@@ -213,6 +213,7 @@ def acceptance(context, client, server, geodata):
         status = lambda: observations(connection)
         fixture.wait_for('NetBird ready for enrollment', status,
                          lambda v: v['authentication'] == 'credentials_required')
+        existing_peers = {peer['id'] for peer in company.api('/peers')}
         if device:
             data('connection', 'login', connection)
             fixture.wait_for('NetBird device challenge', status,
@@ -237,6 +238,13 @@ def acceptance(context, client, server, geodata):
             setup_key = company.setup_key(f'gateway-{connection}-{secrets.token_hex(4)}')
             redacted.append(setup_key)
             data('connection', 'login', connection, '--file', '-', payload=dict(setup_key=setup_key))
+        peer = fixture.wait_for('enrolled NetBird peer', lambda: next((
+            peer for peer in company.api('/peers') if peer['id'] not in existing_peers
+            and peer['name'].startswith(f'wgates-{connection}-')
+        ), None))
+        mode = next(mode for mode, identifier in company.connections.items() if identifier == connection)
+        company.api(f'/groups/{company.route_groups[mode]}',
+                    dict(name=f'Want Gates {mode}', peers=[peer['id']]), method='PUT')
         try:
             fixture.wait_for(f'{company.name} NetBird login', status,
                              lambda v: v['authentication'] == 'authenticated')
@@ -365,6 +373,13 @@ def acceptance(context, client, server, geodata):
         records = inventory()
         assert len(records) == 4 and len({record['namespace'] for record in records.values()}) == 4
         for company in companies:
+            generation = records[company.connections['exit']]['prepared']['generation']
+            socket = runtime / generation / 'netbird' / 'json.sock'
+            response = stand.checked('curl', '--disable', '--silent', '--show-error', '--fail',
+                                     '--noproxy', '*', '--max-time', '5', '--unix-socket', str(socket),
+                                     '--header', 'Content-Type: application/json', '--data', '{}',
+                                     'http://localhost/daemon.DaemonService/ListNetworks')
+            assert {route['ID'] for route in json.loads(response.stdout)['routes']} == {'exit'}
             traffic(company, 'private')
             protected_dns(company)
             traffic(company, 'exit', allowed=False)

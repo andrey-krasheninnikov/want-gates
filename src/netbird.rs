@@ -95,8 +95,11 @@ impl Profile {
             .to_owned();
         match (self.mode, self.exit_network_id.as_deref()) {
             (Mode::Private, None) => {}
+            (Mode::Private, Some(_)) => {
+                return Err(invalid("omit exit_network_id in NetBird private mode"));
+            }
             (Mode::Exit, Some(id)) if network_id(id) => {}
-            _ => {
+            (Mode::Exit, _) => {
                 return Err(invalid(
                     "NetBird exit mode requires exactly one valid exit network ID",
                 ));

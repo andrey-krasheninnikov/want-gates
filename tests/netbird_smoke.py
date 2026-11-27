@@ -263,6 +263,10 @@ class Company:
         assert set(peers) == expected_peers, 'control plane peer inventory differs'
         self.peer = peers.get('gateway')
         group = next(group['id'] for group in self.api('/groups') if group['name'] == 'All')
+        self.route_groups = {}
+        for mode in ('private', 'exit'):
+            self.route_groups[mode] = group if self.bridge else self.api(
+                '/groups', dict(name=f'Want Gates {mode}', peers=[]))['id']
         resource_group = self.api('/groups', dict(name='Private LAN', peers=[]))['id']
         network = self.api('/networks', dict(name='private', description='Company LAN'))['id']
         self.private_network = network
@@ -274,16 +278,16 @@ class Company:
                 name=cidr, address=cidr, enabled=True, groups=[resource_group]))
         self.api('/policies', dict(name='Private LAN', enabled=True, rules=[dict(
             name='Private LAN', enabled=True, action='accept', protocol='all',
-            bidirectional=False, sources=[group], destinations=[resource_group])]))
+            bidirectional=False, sources=[self.route_groups['private']], destinations=[resource_group])]))
         self.api('/routes', dict(description='Test exit', network_id='exit', enabled=True,
                                  peer=peers['router'], network='0.0.0.0/0', metric=100,
-                                 masquerade=True, groups=[group], keep_route=True,
+                                 masquerade=True, groups=[self.route_groups['exit']], keep_route=True,
                                  skip_auto_apply=True))
 
-    def api(self, endpoint, payload=None, pending=False):
+    def api(self, endpoint, payload=None, pending=False, method=None):
         result = stand.run('ip', 'netns', 'exec', self.gateway, sys.executable, __file__,
                            '--api', self.url + '/api' + endpoint, str(self.work / 'cert.pem'),
-                           input=json.dumps(dict(payload=payload, token=self.token)), timeout=8)
+                           input=json.dumps(dict(payload=payload, token=self.token, method=method)), timeout=8)
         if not result.returncode:
             status, value = json.loads(result.stdout)
             if 200 <= status < 300:
@@ -359,7 +363,8 @@ class Company:
 def api_request(url, cert):
     arguments = json.load(sys.stdin)
     body = json.dumps(arguments['payload']).encode() if arguments['payload'] is not None else None
-    request = Request(url, data=body, headers={'Content-Type': 'application/json'})
+    request = Request(url, data=body, headers={'Content-Type': 'application/json'},
+                      method=arguments.get('method'))
     if arguments['token']:
         request.add_header('Authorization', 'Token ' + arguments['token'])
     opener = build_opener(ProxyHandler({}), HTTPSHandler(context=ssl.create_default_context(cafile=cert)))

@@ -56,7 +56,11 @@ fn netbird_profiles_are_private_and_verified_only_at_runtime() {
         let output = import(&service, "Rejected");
         assert!(!output.status.success());
         assert!(output.stdout.is_empty());
-        assert!(!String::from_utf8_lossy(&output.stderr).contains("private-marker"));
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(!error.contains("private-marker"));
+        if rejected["mode"] == "private" && rejected.get("exit_network_id").is_some() {
+            assert!(error.contains("omit exit_network_id in NetBird private mode"));
+        }
     }
     std::fs::write(&path, profile.to_string()).unwrap();
     let private = data(import(&service, "Private"));
