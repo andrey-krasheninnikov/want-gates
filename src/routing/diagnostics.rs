@@ -4,6 +4,7 @@ use super::{
 use crate::invalid;
 use crate::policy::{Network, Rule, domain_name};
 use crate::store::{self, Config};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -386,7 +387,7 @@ fn run_probe(
         .map_err(|_| "panel_configuration_unavailable")?;
     let status = client.running().map_err(|_| "panel_unavailable")?;
     let tag = crate::native::diagnostic_tag(connection);
-    let verify_handler = || verify_handler(xray, working, &tag);
+    let verify_handler = || verify_handler(root, xray, working, &tag);
     let native_before = if crate::native::is_native(&connection.protocol) {
         let observation = native_context(native, working, connection)?;
         super::check_native_xray(native, &status, json!([]))
@@ -490,9 +491,11 @@ fn live_handlers(binary: &Path, template: &Value) -> Result<Value, &'static str>
             .and_then(|port| u16::try_from(port).ok())
             .filter(|port| *port != 0)
             .ok_or(unavailable)?;
-        let output = crate::native_runtime::command(
+        let output = crate::native_runtime::command_input_with_limit(
             binary.to_str().ok_or(unavailable)?,
             &["api", "lso", "-s", &format!("127.0.0.1:{port}"), "-t", "3"],
+            std::process::Stdio::null(),
+            crate::panel::MAX_PANEL,
         )
         .map_err(|_| unavailable)?;
         let document: Value = serde_json::from_str(&output).map_err(|_| unavailable)?;
@@ -545,9 +548,35 @@ pub(super) fn capture_handlers(
         .collect())
 }
 
-fn verify_handler(binary: &Path, working: &Working, tag: &str) -> Result<(), &'static str> {
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProbeHandlers {
+    plan_id: String,
+    handlers: BTreeMap<String, String>,
+}
+
+pub(super) fn save_handlers(root: &Path, plan_id: &str, handlers: BTreeMap<String, String>) {
+    // Keep diagnostic metadata outside snapshots consumed by earlier versions.
+    let evidence = ProbeHandlers {
+        plan_id: plan_id.to_owned(),
+        handlers,
+    };
+    let _ = store::private_write(&root.join("probe-handlers.json"), &evidence);
+}
+
+fn verify_handler(
+    root: &Path,
+    binary: &Path,
+    working: &Working,
+    tag: &str,
+) -> Result<(), &'static str> {
     let unavailable = "probe_context_unavailable";
-    let expected = working.probe_handlers.get(tag).ok_or(unavailable)?;
+    let evidence: ProbeHandlers =
+        super::read(&root.join("probe-handlers.json")).map_err(|_| unavailable)?;
+    if evidence.plan_id != working.plan_id {
+        return Err(unavailable);
+    }
+    let expected = evidence.handlers.get(tag).ok_or(unavailable)?;
     let template = &working.snapshot.template;
     let saved = template["outbounds"]
         .as_array()

@@ -17,7 +17,7 @@ cargo build --locked --release
 
 Commands:
 
-- `wgates serve [--socket PATH] [--state-dir PATH] [--native-socket PATH]` runs the service.
+- `wgates serve [--socket PATH] [--state-dir PATH] [--native-socket PATH] [--xray PATH]` runs the service.
 - `wgates status [--socket PATH]` queries the service and prints one JSON object.
 - `wgates --version` prints the CLI version.
 

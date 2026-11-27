@@ -72,6 +72,8 @@ uses the configured targets. It is skipped if the applied revision or
 selection is unavailable. On Linux, apply records a hash of each managed Xray
 handler. Diagnostics checks the selected handler before and after the probe.
 If a previous apply did not capture a handler, preview and apply to record it.
+The handler inventory must fit Xray's API limit and the 16 MiB local read limit.
+If the inventory cannot be read, the diagnostic still shows policy decisions.
 A context change after a probe leaves the result unverified. The service uses
 the installed Xray executable. Set `wgates serve --xray PATH` for a custom installation.
 Diagnosis and probing leave the saved configuration and observations in place.

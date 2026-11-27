@@ -81,8 +81,6 @@ struct Working {
     native_observations: BTreeMap<String, crate::native::Observation>,
     #[serde(default)]
     native_retired: crate::native::Generations,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    probe_handlers: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1441,6 +1439,7 @@ fn execute(
         {
             check_native_xray(native, &client.wait_running()?, json!([]))?;
         }
+        let probe_handlers = diagnostics::capture_handlers(xray, &client, &final_snapshot)?;
         let mut working = Working {
             plan_id: journal.plan.id.clone(),
             config: input.config.clone(),
@@ -1453,7 +1452,6 @@ fn execute(
             selected,
             health,
             health_error: None,
-            probe_handlers: diagnostics::capture_handlers(xray, &client, &final_snapshot)?,
             native: input.native.clone(),
             native_observations,
             native_retired: journal
@@ -1529,6 +1527,7 @@ fn execute(
             );
         }
         private_write(&root.join("status.json"), &report)?;
+        diagnostics::save_handlers(root, &working.plan_id, probe_handlers);
         Ok(report)
     })();
     match result {

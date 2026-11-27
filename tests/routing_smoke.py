@@ -479,6 +479,11 @@ with urllib.request.urlopen(req,timeout=10) as response: print(response.read().d
             summary=control('connection','show',connection)['data']
             assert summary['runtime']=='applied' and set(summary['capabilities'])=={'tcp_ipv4','udp_ipv4','tcp_ipv6','udp_ipv6'}
         print('real 3x-ui apply verified TCP/UDP over IPv4/IPv6 for both groups')
+        routing_state=state/'routing'
+        assert 'probe_handlers' not in json.loads((routing_state/'working.json').read_text())
+        evidence=json.loads((routing_state/'probe-handlers.json').read_text())
+        assert evidence['plan_id']==applied['plan_id']
+        assert 'wgates-out-'+connections['a'] in evidence['handlers']
         before_diagnose=api('xray/',{})
         diagnostic=control('routing','diagnose','10.220.0.10','--capability','tcp_ipv4','--probe')['data']
         assert diagnostic['runtime']=='last_observed',diagnostic
