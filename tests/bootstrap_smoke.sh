@@ -134,6 +134,10 @@ if runuser -u nobody -- wgates status >"$tmp/result" 2>&1; then
     exit 1
 fi
 systemctl disable wgates.service
+service_pid=$(systemctl show -p MainPID --value wgates.service)
+"$script" install --archive "$archive" --sha256 "$digest"
+[[ $(systemctl is-enabled wgates.service || true) == disabled ]]
+[[ $(systemctl show -p MainPID --value wgates.service) == "$service_pid" ]]
 mkdir -- "$custom_wants"
 ln -s -- "$unit" "$custom_wants/wgates.service"
 systemctl daemon-reload

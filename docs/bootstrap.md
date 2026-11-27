@@ -35,7 +35,8 @@ The installer verifies the package before changing service files or
 installing dependencies. It uses /var/lib/wgates-install for staging and
 reconciles any interrupted installation there first.
 The initial install creates the wgates system account and enables
-wgates.service. Root and members of the wgates group can use its socket.
+wgates.service. Later installs preserve the control service's boot setting.
+Root and members of the wgates group can use its socket.
 Follow [panel configuration](routing.md#configure-and-preview) to add the
 operator's panel API credentials and run wgates panel preflight.
 Control-service readiness does not establish route, DNS or VPN health.

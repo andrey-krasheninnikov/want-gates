@@ -499,7 +499,6 @@ if ((!native)) && absent "${destinations[3]}"; then
 fi
 absent "$root/receipt.wgates-new" || fail 'unexpected installation receipt staging file'
 mkdir -- "$workspace/old" "$workspace/active" "$workspace/enabled" "$workspace/enable"
-touch "$workspace/enable/wgates.service"
 if ((native)); then touch "$workspace/enable/wgates-native.service"; fi
 changed=0
 for i in "${!files[@]}"; do
@@ -521,6 +520,7 @@ for i in "${!files[@]}"; do
     hash=$(sha256sum -- "$workspace/new/$file")
     printf '%s  %s\n' "${hash%% *}" "$destination" >> "$workspace/receipt"
 done
+if [[ ! -f $workspace/old/wgates.service ]]; then touch "$workspace/enable/wgates.service"; fi
 check_units || fail 'unit ownership check failed'
 for unit in "${units[@]}"; do
     if systemctl is-active --quiet "$unit"; then touch "$workspace/active/$unit"; fi
