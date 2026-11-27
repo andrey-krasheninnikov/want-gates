@@ -266,11 +266,13 @@ impl Store {
             return Err(error);
         }
         self.config = config;
-        File::open(&self.root)?.sync_all().map_err(|_| {
-            io::Error::other(
-                "configuration saved but durability is uncertain; inspect state before retrying",
-            )
-        })
+        File::open(&self.root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| {
+                io::Error::other(
+                    "configuration saved but durability is uncertain; inspect state before retrying",
+                )
+            })
     }
 
     pub fn dispatch(&mut self, request: &Value) -> io::Result<Value> {

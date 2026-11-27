@@ -15,6 +15,21 @@ const group = object.extend({
   name: z.string(),
   primary: z.string().nullable(),
   fallbacks: names,
+  probes: z.record(z.string(), z.unknown()).nullable(),
+  healthcheck: z
+    .object({
+      target: z.string(),
+      required_capabilities: z.array(z.string()),
+      interval_seconds: z.number(),
+      timeout_seconds: z.number(),
+      failure_threshold: z.number(),
+      recovery_threshold: z.number(),
+      expected_status: z.number().nullable(),
+      ca_pem: z.string().nullable(),
+      send_hex: z.string().nullable(),
+      expect_hex: z.string().nullable(),
+    })
+    .nullable(),
   last_observed_selection: z
     .object({ id: z.string(), name: z.string(), protocol: z.string() })
     .nullable(),
@@ -43,6 +58,7 @@ const snapshot = z.object({
     desired_revision: z.string(),
     busy: z.boolean(),
     recovery_required: z.boolean(),
+    recovery_plan_id: z.string().nullable(),
     health_error: z.string().nullable(),
     last_observation: z.object({
       state: z.string(),

@@ -65,7 +65,7 @@ impl Network {
     }
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Probes {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -79,7 +79,7 @@ pub struct Probes {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub udp_ipv6: Option<DnsProbe>,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpProbe {
     pub url: String,
@@ -89,7 +89,7 @@ pub struct HttpProbe {
 fn status_ok() -> u16 {
     200
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DnsProbe {
     pub server: String,
@@ -144,7 +144,7 @@ impl DnsProbe {
         Ok(address)
     }
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NameProbe {
     pub query_name: String,

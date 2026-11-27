@@ -17,6 +17,7 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 
 mod diagnostics;
+mod preview;
 
 const PREFIX: &str = "wgates-";
 pub const PROBE_TAG: &str = "wgates-probe";
@@ -744,14 +745,18 @@ impl Service {
         let command = store::text(&request["command"])?;
         let fields: &[&str] = match command {
             "panel.configure" => &["settings"],
-            "panel.preflight" | "routing.preview" => &[],
-            "routing.status" => &["summary"],
+            "panel.preflight" => &[],
+            "routing.preview" | "routing.status" => &["summary"],
             "routing.apply" | "routing.recover" => &["plan_id"],
             "routing.diagnose" => &["destination", "capability", "probe"],
             "routing.logs" => &["limit"],
             "connection.verify" => &["id"],
-            "connection.login" => &["id", "credentials", "remember"],
-            "connection.logout" | "connection.restart" | "connection.forget-auth" => &["id"],
+            "connection.login" => &["id", "expected_revision", "credentials", "remember"],
+            "connection.adapter" => &["protocol"],
+            "connection.auth-status"
+            | "connection.logout"
+            | "connection.restart"
+            | "connection.forget-auth" => &["id", "expected_revision"],
             _ => return Err(invalid("unsupported routing command")),
         };
         if request.as_object().is_none_or(|m| {
@@ -763,6 +768,7 @@ impl Service {
         if matches!(
             command,
             "connection.login"
+                | "connection.auth-status"
                 | "connection.logout"
                 | "connection.restart"
                 | "connection.forget-auth"
@@ -774,6 +780,14 @@ impl Service {
                 .iter()
                 .find(|c| request["id"] == c.id)
                 .ok_or_else(|| invalid("connection not found"))?;
+            if request
+                .get("expected_revision")
+                .is_some_and(|revision| revision.as_u64() != Some(connection.revision))
+            {
+                return Err(invalid(
+                    "revision conflict; inspect the connection and retry",
+                ));
+            }
             if !crate::native::is_native(&connection.protocol) {
                 return Err(invalid(
                     "native session operations require OpenVPN, Forti, WireGuard or NetBird",
@@ -966,9 +980,35 @@ fn execute(
     native: &crate::native::Client,
     xray: &Path,
 ) -> io::Result<Value> {
+    if command == "connection.adapter" {
+        let protocol = store::text(&request["protocol"])?;
+        if protocol == "vless" {
+            return Ok(json!({"available":true,"reason":"VLESS is available"}));
+        }
+        if !crate::native::is_native(protocol) {
+            return Ok(
+                json!({"available":false,"reason":"This protocol has no Want Gates adapter"}),
+            );
+        }
+        return Ok(
+            match native.call(json!({"command":"preflight","protocols":[protocol]})) {
+                Ok(_) => json!({"available":true,"reason":"Native prerequisites are available"}),
+                Err(err) if crate::native::unavailable(&err) => {
+                    json!({"available":false,"reason":"The native service is unavailable"})
+                }
+                Err(_) => {
+                    json!({"available":false,"reason":"Native prerequisites are unavailable. Check the adapter and Xray installation"})
+                }
+            },
+        );
+    }
     if matches!(
         command,
-        "connection.login" | "connection.logout" | "connection.restart" | "connection.forget-auth"
+        "connection.login"
+            | "connection.auth-status"
+            | "connection.logout"
+            | "connection.restart"
+            | "connection.forget-auth"
     ) {
         let working: Working = read(&root.join("working.json"))?;
         let prepared = working
@@ -1059,6 +1099,11 @@ fn execute(
         );
     }
     if command == "routing.preview" {
+        let summary = request.get("summary").map_or(Ok(false), |value| {
+            value
+                .as_bool()
+                .ok_or_else(|| invalid("summary must be a boolean"))
+        })?;
         if let Some(journal) = optional::<Journal>(&root.join("journal.json"))?
             && pending(&journal)
         {
@@ -1155,6 +1200,9 @@ fn execute(
             native_intents,
         };
         private_write(&root.join("plan.json"), &plan)?;
+        if summary {
+            return Ok(preview::summary(&plan, previous.as_ref()));
+        }
         return Ok(
             json!({"plan_id":plan.id,"desired_revision":plan.input.config.revision,"ingress":plan.ingress,"rules":plan.input.config.rules,
             "dns":crate::domain::describe(&plan.input.config),"panel_dns_rules":plan.candidate.template["routing"]["rules"].as_array().map(|a|a.iter().filter(|v|v["ruleTag"]=="xui-dns-allow").collect::<Vec<_>>()),"capabilities":"conditional_on_runtime_probes","prepared_connections":plan.input.config.connections.iter().map(|c|&c.id).collect::<Vec<_>>(),"eligibility":eligibility(&plan.input.config),"automatic_groups":plan.input.config.groups.iter().filter(|g|g.healthcheck.is_some()).map(|g|json!({"group_id":g.id,"primary":g.primary,"fallbacks":g.fallbacks,"healthcheck":g.healthcheck})).collect::<Vec<_>>(),"unmatched":"direct","unverified":"blocked","sessions_may_interrupt":true}),
